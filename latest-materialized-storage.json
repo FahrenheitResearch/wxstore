@@ -1,0 +1,42 @@
+[
+    {
+        "path":  "hrrr\\20260405_18z\\dewpoint_depression_2m.zarr",
+        "mb":  6.48,
+        "bytes":  6794701
+    },
+    {
+        "path":  "hrrr\\20260405_18z\\vpd_2m.zarr",
+        "mb":  14.843,
+        "bytes":  15563586
+    },
+    {
+        "path":  "hrrr\\20260405_18z\\heat_index_2m.zarr",
+        "mb":  6.029,
+        "bytes":  6321374
+    },
+    {
+        "path":  "gfs\\20260405_12z\\dewpoint_depression_2m.zarr",
+        "mb":  3.494,
+        "bytes":  3663682
+    },
+    {
+        "path":  "gfs\\20260405_12z\\vpd_2m.zarr",
+        "mb":  8.51,
+        "bytes":  8923701
+    },
+    {
+        "path":  "gfs\\20260405_12z\\heat_index_2m.zarr",
+        "mb":  3.67,
+        "bytes":  3848107
+    },
+    {
+        "path":  "ecmwf_ifs\\20260411_12z\\dewpoint_depression_2m.zarr",
+        "mb":  2.851,
+        "bytes":  2989920
+    },
+    {
+        "path":  "ecmwf_ens\\20260412_00z\\members\\001\\dewpoint_depression_2m.zarr",
+        "mb":  1.429,
+        "bytes":  1498451
+    }
+]

@@ -1,0 +1,226 @@
+[
+    {
+        "elapsed_ms":  1356,
+        "error_count":  0,
+        "errors":  [
+
+                   ],
+        "hours":  [
+                      0,
+                      1,
+                      2
+                  ],
+        "member":  null,
+        "model":  "hrrr",
+        "run":  "20260405_18z",
+        "schema":  "wxstore.materialize_spatial.report.v1",
+        "wrote":  [
+                      {
+                          "bytes":  16384,
+                          "elapsed_ms":  157,
+                          "hour":  0,
+                          "path":  "C:\\Users\\drew\\open-rust-wx\\data\\spatial\\hrrr\\20260405_18z\\dewpoint_depression_2m.zarr\\data",
+                          "product":  "dewpoint_depression_2m"
+                      },
+                      {
+                          "bytes":  32768,
+                          "elapsed_ms":  166,
+                          "hour":  1,
+                          "path":  "C:\\Users\\drew\\open-rust-wx\\data\\spatial\\hrrr\\20260405_18z\\dewpoint_depression_2m.zarr\\data",
+                          "product":  "dewpoint_depression_2m"
+                      },
+                      {
+                          "bytes":  49152,
+                          "elapsed_ms":  162,
+                          "hour":  2,
+                          "path":  "C:\\Users\\drew\\open-rust-wx\\data\\spatial\\hrrr\\20260405_18z\\dewpoint_depression_2m.zarr\\data",
+                          "product":  "dewpoint_depression_2m"
+                      },
+                      {
+                          "bytes":  16384,
+                          "elapsed_ms":  178,
+                          "hour":  0,
+                          "path":  "C:\\Users\\drew\\open-rust-wx\\data\\spatial\\hrrr\\20260405_18z\\vpd_2m.zarr\\data",
+                          "product":  "vpd_2m"
+                      },
+                      {
+                          "bytes":  32768,
+                          "elapsed_ms":  176,
+                          "hour":  1,
+                          "path":  "C:\\Users\\drew\\open-rust-wx\\data\\spatial\\hrrr\\20260405_18z\\vpd_2m.zarr\\data",
+                          "product":  "vpd_2m"
+                      },
+                      {
+                          "bytes":  49152,
+                          "elapsed_ms":  180,
+                          "hour":  2,
+                          "path":  "C:\\Users\\drew\\open-rust-wx\\data\\spatial\\hrrr\\20260405_18z\\vpd_2m.zarr\\data",
+                          "product":  "vpd_2m"
+                      },
+                      {
+                          "bytes":  16384,
+                          "elapsed_ms":  114,
+                          "hour":  0,
+                          "path":  "C:\\Users\\drew\\open-rust-wx\\data\\spatial\\hrrr\\20260405_18z\\heat_index_2m.zarr\\data",
+                          "product":  "heat_index_2m"
+                      },
+                      {
+                          "bytes":  32768,
+                          "elapsed_ms":  107,
+                          "hour":  1,
+                          "path":  "C:\\Users\\drew\\open-rust-wx\\data\\spatial\\hrrr\\20260405_18z\\heat_index_2m.zarr\\data",
+                          "product":  "heat_index_2m"
+                      },
+                      {
+                          "bytes":  49152,
+                          "elapsed_ms":  109,
+                          "hour":  2,
+                          "path":  "C:\\Users\\drew\\open-rust-wx\\data\\spatial\\hrrr\\20260405_18z\\heat_index_2m.zarr\\data",
+                          "product":  "heat_index_2m"
+                      }
+                  ],
+        "wrote_count":  9,
+        "case":  "hrrr"
+    },
+    {
+        "elapsed_ms":  721,
+        "error_count":  0,
+        "errors":  [
+
+                   ],
+        "hours":  [
+                      0,
+                      1,
+                      2
+                  ],
+        "member":  null,
+        "model":  "gfs",
+        "run":  "20260405_12z",
+        "schema":  "wxstore.materialize_spatial.report.v1",
+        "wrote":  [
+                      {
+                          "bytes":  4096,
+                          "elapsed_ms":  89,
+                          "hour":  0,
+                          "path":  "C:\\Users\\drew\\open-rust-wx\\data\\spatial\\gfs\\20260405_12z\\dewpoint_depression_2m.zarr\\data",
+                          "product":  "dewpoint_depression_2m"
+                      },
+                      {
+                          "bytes":  12288,
+                          "elapsed_ms":  88,
+                          "hour":  1,
+                          "path":  "C:\\Users\\drew\\open-rust-wx\\data\\spatial\\gfs\\20260405_12z\\dewpoint_depression_2m.zarr\\data",
+                          "product":  "dewpoint_depression_2m"
+                      },
+                      {
+                          "bytes":  20480,
+                          "elapsed_ms":  91,
+                          "hour":  2,
+                          "path":  "C:\\Users\\drew\\open-rust-wx\\data\\spatial\\gfs\\20260405_12z\\dewpoint_depression_2m.zarr\\data",
+                          "product":  "dewpoint_depression_2m"
+                      },
+                      {
+                          "bytes":  4096,
+                          "elapsed_ms":  88,
+                          "hour":  0,
+                          "path":  "C:\\Users\\drew\\open-rust-wx\\data\\spatial\\gfs\\20260405_12z\\vpd_2m.zarr\\data",
+                          "product":  "vpd_2m"
+                      },
+                      {
+                          "bytes":  12288,
+                          "elapsed_ms":  89,
+                          "hour":  1,
+                          "path":  "C:\\Users\\drew\\open-rust-wx\\data\\spatial\\gfs\\20260405_12z\\vpd_2m.zarr\\data",
+                          "product":  "vpd_2m"
+                      },
+                      {
+                          "bytes":  20480,
+                          "elapsed_ms":  91,
+                          "hour":  2,
+                          "path":  "C:\\Users\\drew\\open-rust-wx\\data\\spatial\\gfs\\20260405_12z\\vpd_2m.zarr\\data",
+                          "product":  "vpd_2m"
+                      },
+                      {
+                          "bytes":  4096,
+                          "elapsed_ms":  59,
+                          "hour":  0,
+                          "path":  "C:\\Users\\drew\\open-rust-wx\\data\\spatial\\gfs\\20260405_12z\\heat_index_2m.zarr\\data",
+                          "product":  "heat_index_2m"
+                      },
+                      {
+                          "bytes":  12288,
+                          "elapsed_ms":  59,
+                          "hour":  1,
+                          "path":  "C:\\Users\\drew\\open-rust-wx\\data\\spatial\\gfs\\20260405_12z\\heat_index_2m.zarr\\data",
+                          "product":  "heat_index_2m"
+                      },
+                      {
+                          "bytes":  20480,
+                          "elapsed_ms":  62,
+                          "hour":  2,
+                          "path":  "C:\\Users\\drew\\open-rust-wx\\data\\spatial\\gfs\\20260405_12z\\heat_index_2m.zarr\\data",
+                          "product":  "heat_index_2m"
+                      }
+                  ],
+        "wrote_count":  9,
+        "case":  "gfs"
+    },
+    {
+        "elapsed_ms":  195,
+        "error_count":  0,
+        "errors":  [
+
+                   ],
+        "hours":  [
+                      0,
+                      3
+                  ],
+        "member":  null,
+        "model":  "ecmwf_ifs",
+        "run":  "20260411_12z",
+        "schema":  "wxstore.materialize_spatial.report.v1",
+        "wrote":  [
+                      {
+                          "bytes":  4096,
+                          "elapsed_ms":  98,
+                          "hour":  0,
+                          "path":  "C:\\Users\\drew\\open-rust-wx\\data\\spatial\\ecmwf_ifs\\20260411_12z\\dewpoint_depression_2m.zarr\\data",
+                          "product":  "dewpoint_depression_2m"
+                      },
+                      {
+                          "bytes":  12288,
+                          "elapsed_ms":  96,
+                          "hour":  3,
+                          "path":  "C:\\Users\\drew\\open-rust-wx\\data\\spatial\\ecmwf_ifs\\20260411_12z\\dewpoint_depression_2m.zarr\\data",
+                          "product":  "dewpoint_depression_2m"
+                      }
+                  ],
+        "wrote_count":  2,
+        "case":  "ecmwf_ifs"
+    },
+    {
+        "elapsed_ms":  91,
+        "error_count":  0,
+        "errors":  [
+
+                   ],
+        "hours":  [
+                      3
+                  ],
+        "member":  "001",
+        "model":  "ecmwf_ens",
+        "run":  "20260412_00z",
+        "schema":  "wxstore.materialize_spatial.report.v1",
+        "wrote":  [
+                      {
+                          "bytes":  4096,
+                          "elapsed_ms":  91,
+                          "hour":  3,
+                          "path":  "C:\\Users\\drew\\open-rust-wx\\data\\spatial\\ecmwf_ens\\20260412_00z\\members\\001\\dewpoint_depression_2m.zarr\\data",
+                          "product":  "dewpoint_depression_2m"
+                      }
+                  ],
+        "wrote_count":  1,
+        "case":  "ecmwf_ens"
+    }
+]

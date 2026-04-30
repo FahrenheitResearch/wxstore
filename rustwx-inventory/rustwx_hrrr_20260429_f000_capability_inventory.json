@@ -1,0 +1,1894 @@
+{
+  "model": "hrrr",
+  "date_yyyymmdd": "20260429",
+  "forecast_hour": 0,
+  "smoke_probe": {
+    "planned_product": "nat",
+    "native_file_family": "wrfnat",
+    "notes": [
+      "rustwx-models resolves HRRR product `nat` to `wrfnat` URLs.",
+      "wxsection_ref smoke loading uses MASSDEN on hybrid levels from wrfnat, with hybrid pressure for vertical placement.",
+      "wxsection_ref also has a COLMD extraction path for column-integrated smoke."
+    ],
+    "sources": [
+      {
+        "source": "nomads",
+        "source_priority": 1,
+        "idx_available": true,
+        "latest_cycle_yyyymmdd": "20260429",
+        "latest_cycle_hour_utc": 23,
+        "grib_url": "https://nomads.ncep.noaa.gov/pub/data/nccf/com/hrrr/prod/hrrr.20260429/conus/hrrr.t23z.wrfnatf00.grib2",
+        "idx_url": "https://nomads.ncep.noaa.gov/pub/data/nccf/com/hrrr/prod/hrrr.20260429/conus/hrrr.t23z.wrfnatf00.grib2.idx",
+        "availability_probe_url": "https://nomads.ncep.noaa.gov/pub/data/nccf/com/hrrr/prod/hrrr.20260429/conus/hrrr.t23z.wrfnatf00.grib2.idx",
+        "available": true,
+        "error": null
+      },
+      {
+        "source": "aws",
+        "source_priority": 2,
+        "idx_available": true,
+        "latest_cycle_yyyymmdd": "20260429",
+        "latest_cycle_hour_utc": 23,
+        "grib_url": "https://noaa-hrrr-bdp-pds.s3.amazonaws.com/hrrr.20260429/conus/hrrr.t23z.wrfnatf00.grib2",
+        "idx_url": "https://noaa-hrrr-bdp-pds.s3.amazonaws.com/hrrr.20260429/conus/hrrr.t23z.wrfnatf00.grib2.idx",
+        "availability_probe_url": "https://noaa-hrrr-bdp-pds.s3.amazonaws.com/hrrr.20260429/conus/hrrr.t23z.wrfnatf00.grib2.idx",
+        "available": true,
+        "error": null
+      },
+      {
+        "source": "google",
+        "source_priority": 3,
+        "idx_available": true,
+        "latest_cycle_yyyymmdd": "20260429",
+        "latest_cycle_hour_utc": 23,
+        "grib_url": "https://storage.googleapis.com/high-resolution-rapid-refresh/hrrr.20260429/conus/hrrr.t23z.wrfnatf00.grib2",
+        "idx_url": "https://storage.googleapis.com/high-resolution-rapid-refresh/hrrr.20260429/conus/hrrr.t23z.wrfnatf00.grib2.idx",
+        "availability_probe_url": "https://storage.googleapis.com/high-resolution-rapid-refresh/hrrr.20260429/conus/hrrr.t23z.wrfnatf00.grib2.idx",
+        "available": true,
+        "error": null
+      },
+      {
+        "source": "azure",
+        "source_priority": 4,
+        "idx_available": false,
+        "latest_cycle_yyyymmdd": "20260429",
+        "latest_cycle_hour_utc": 23,
+        "grib_url": "https://noaahrrr.blob.core.windows.net/hrrr/hrrr.20260429/conus/hrrr.t23z.wrfnatf00.grib2",
+        "idx_url": null,
+        "availability_probe_url": "https://noaahrrr.blob.core.windows.net/hrrr/hrrr.20260429/conus/hrrr.t23z.wrfnatf00.grib2",
+        "available": true,
+        "error": null
+      }
+    ]
+  },
+  "map_inventory": {
+    "direct": {
+      "available_count": 52,
+      "blocked_count": 1,
+      "available": [
+        {
+          "slug": "10m_wind_gusts",
+          "title": "10m AGL Wind Gusts",
+          "render_style": "weather_wind_gust",
+          "source_routes": [
+            "direct_native_exact"
+          ],
+          "notes": []
+        },
+        {
+          "slug": "1km_reflectivity",
+          "title": "1km AGL Reflectivity",
+          "render_style": "weather_radar_reflectivity",
+          "source_routes": [
+            "direct_native_exact"
+          ],
+          "notes": []
+        },
+        {
+          "slug": "200mb_absolute_vorticity_height_winds",
+          "title": "200mb Absolute Vorticity / Height / Winds",
+          "render_style": "weather_vorticity",
+          "source_routes": [
+            "direct_native_exact"
+          ],
+          "notes": []
+        },
+        {
+          "slug": "200mb_height_winds",
+          "title": "200mb Height / Winds",
+          "render_style": "weather_height",
+          "source_routes": [
+            "direct_native_exact"
+          ],
+          "notes": []
+        },
+        {
+          "slug": "200mb_rh_height_winds",
+          "title": "200mb RH / Height / Winds",
+          "render_style": "weather_rh",
+          "source_routes": [
+            "direct_native_exact"
+          ],
+          "notes": []
+        },
+        {
+          "slug": "200mb_temperature_height_winds",
+          "title": "200mb Temperature / Height / Winds",
+          "render_style": "weather_temperature",
+          "source_routes": [
+            "direct_native_exact"
+          ],
+          "notes": []
+        },
+        {
+          "slug": "250mb_height_winds",
+          "title": "250mb Height / Winds",
+          "render_style": "weather_height",
+          "source_routes": [
+            "direct_native_exact"
+          ],
+          "notes": []
+        },
+        {
+          "slug": "250mb_temperature_height_winds",
+          "title": "250mb Temperature / Height / Winds",
+          "render_style": "weather_temperature",
+          "source_routes": [
+            "direct_native_exact"
+          ],
+          "notes": []
+        },
+        {
+          "slug": "2m_dewpoint",
+          "title": "2m AGL Dewpoint",
+          "render_style": "weather_dewpoint",
+          "source_routes": [
+            "direct_native_exact"
+          ],
+          "notes": []
+        },
+        {
+          "slug": "2m_dewpoint_10m_winds",
+          "title": "2m AGL Dewpoint / 10m Winds",
+          "render_style": "weather_dewpoint",
+          "source_routes": [
+            "direct_native_exact"
+          ],
+          "notes": []
+        },
+        {
+          "slug": "2m_relative_humidity",
+          "title": "2m AGL Relative Humidity",
+          "render_style": "weather_rh",
+          "source_routes": [
+            "direct_native_exact"
+          ],
+          "notes": []
+        },
+        {
+          "slug": "2m_relative_humidity_10m_winds",
+          "title": "2m AGL Relative Humidity / 10m Winds",
+          "render_style": "weather_rh",
+          "source_routes": [
+            "direct_native_exact"
+          ],
+          "notes": []
+        },
+        {
+          "slug": "2m_temperature",
+          "title": "2m AGL Temperature",
+          "render_style": "weather_temperature",
+          "source_routes": [
+            "direct_native_exact"
+          ],
+          "notes": []
+        },
+        {
+          "slug": "2m_temperature_10m_winds",
+          "title": "2m AGL Temperature / 10m Winds",
+          "render_style": "weather_temperature",
+          "source_routes": [
+            "direct_native_exact"
+          ],
+          "notes": []
+        },
+        {
+          "slug": "300mb_absolute_vorticity_height_winds",
+          "title": "300mb Absolute Vorticity / Height / Winds",
+          "render_style": "weather_vorticity",
+          "source_routes": [
+            "direct_native_exact"
+          ],
+          "notes": []
+        },
+        {
+          "slug": "300mb_height_winds",
+          "title": "300mb Height / Winds",
+          "render_style": "weather_height",
+          "source_routes": [
+            "direct_native_exact"
+          ],
+          "notes": []
+        },
+        {
+          "slug": "300mb_rh_height_winds",
+          "title": "300mb RH / Height / Winds",
+          "render_style": "weather_rh",
+          "source_routes": [
+            "direct_native_exact"
+          ],
+          "notes": []
+        },
+        {
+          "slug": "300mb_temperature_height_winds",
+          "title": "300mb Temperature / Height / Winds",
+          "render_style": "weather_temperature",
+          "source_routes": [
+            "direct_native_exact"
+          ],
+          "notes": []
+        },
+        {
+          "slug": "500mb_absolute_vorticity_height_winds",
+          "title": "500mb Absolute Vorticity / Height / Winds",
+          "render_style": "weather_vorticity",
+          "source_routes": [
+            "direct_native_exact"
+          ],
+          "notes": []
+        },
+        {
+          "slug": "500mb_height_winds",
+          "title": "500mb Height / Winds",
+          "render_style": "weather_height",
+          "source_routes": [
+            "direct_native_exact"
+          ],
+          "notes": []
+        },
+        {
+          "slug": "500mb_rh_height_winds",
+          "title": "500mb RH / Height / Winds",
+          "render_style": "weather_rh",
+          "source_routes": [
+            "direct_native_exact"
+          ],
+          "notes": []
+        },
+        {
+          "slug": "500mb_temperature_height_winds",
+          "title": "500mb Temperature / Height / Winds",
+          "render_style": "weather_temperature",
+          "source_routes": [
+            "direct_native_exact"
+          ],
+          "notes": []
+        },
+        {
+          "slug": "700mb_absolute_vorticity_height_winds",
+          "title": "700mb Absolute Vorticity / Height / Winds",
+          "render_style": "weather_vorticity",
+          "source_routes": [
+            "direct_native_exact"
+          ],
+          "notes": []
+        },
+        {
+          "slug": "700mb_dewpoint_height_winds",
+          "title": "700mb Dewpoint / Height / Winds",
+          "render_style": "weather_dewpoint",
+          "source_routes": [
+            "direct_native_exact"
+          ],
+          "notes": []
+        },
+        {
+          "slug": "700mb_height_winds",
+          "title": "700mb Height / Winds",
+          "render_style": "weather_height",
+          "source_routes": [
+            "direct_native_exact"
+          ],
+          "notes": []
+        },
+        {
+          "slug": "700mb_rh_height_winds",
+          "title": "700mb RH / Height / Winds",
+          "render_style": "weather_rh",
+          "source_routes": [
+            "direct_native_exact"
+          ],
+          "notes": []
+        },
+        {
+          "slug": "700mb_temperature_height_winds",
+          "title": "700mb Temperature / Height / Winds",
+          "render_style": "weather_temperature",
+          "source_routes": [
+            "direct_native_exact"
+          ],
+          "notes": []
+        },
+        {
+          "slug": "850mb_absolute_vorticity_height_winds",
+          "title": "850mb Absolute Vorticity / Height / Winds",
+          "render_style": "weather_vorticity",
+          "source_routes": [
+            "direct_native_exact"
+          ],
+          "notes": []
+        },
+        {
+          "slug": "850mb_dewpoint_height_winds",
+          "title": "850mb Dewpoint / Height / Winds",
+          "render_style": "weather_dewpoint",
+          "source_routes": [
+            "direct_native_exact"
+          ],
+          "notes": []
+        },
+        {
+          "slug": "850mb_height_winds",
+          "title": "850mb Height / Winds",
+          "render_style": "weather_height",
+          "source_routes": [
+            "direct_native_exact"
+          ],
+          "notes": []
+        },
+        {
+          "slug": "850mb_rh_height_winds",
+          "title": "850mb RH / Height / Winds",
+          "render_style": "weather_rh",
+          "source_routes": [
+            "direct_native_exact"
+          ],
+          "notes": []
+        },
+        {
+          "slug": "850mb_temperature_height_winds",
+          "title": "850mb Temperature / Height / Winds",
+          "render_style": "weather_temperature",
+          "source_routes": [
+            "direct_native_exact"
+          ],
+          "notes": []
+        },
+        {
+          "slug": "categorical_freezing_rain",
+          "title": "Categorical Freezing Rain",
+          "render_style": "weather_categorical",
+          "source_routes": [
+            "direct_native_exact"
+          ],
+          "notes": []
+        },
+        {
+          "slug": "categorical_ice_pellets",
+          "title": "Categorical Ice Pellets",
+          "render_style": "weather_categorical",
+          "source_routes": [
+            "direct_native_exact"
+          ],
+          "notes": []
+        },
+        {
+          "slug": "categorical_rain",
+          "title": "Categorical Rain",
+          "render_style": "weather_categorical",
+          "source_routes": [
+            "direct_native_exact"
+          ],
+          "notes": []
+        },
+        {
+          "slug": "categorical_snow",
+          "title": "Categorical Snow",
+          "render_style": "weather_categorical",
+          "source_routes": [
+            "direct_native_exact"
+          ],
+          "notes": []
+        },
+        {
+          "slug": "cloud_cover",
+          "title": "Cloud Cover",
+          "render_style": "weather_cloud_cover",
+          "source_routes": [
+            "direct_native_exact"
+          ],
+          "notes": []
+        },
+        {
+          "slug": "cloud_cover_levels",
+          "title": "Cloud Cover, Levels",
+          "render_style": "weather_panel_grid",
+          "source_routes": [
+            "direct_native_composite_exact"
+          ],
+          "notes": [
+            "Rendered as an honest HRRR direct composite panel over low, middle, and high cloud-cover component fields"
+          ]
+        },
+        {
+          "slug": "composite_reflectivity",
+          "title": "Composite Reflectivity",
+          "render_style": "weather_reflectivity",
+          "source_routes": [
+            "direct_native_exact"
+          ],
+          "notes": []
+        },
+        {
+          "slug": "composite_reflectivity_uh",
+          "title": "Composite Reflectivity / UH",
+          "render_style": "weather_reflectivity",
+          "source_routes": [
+            "direct_native_composite_exact"
+          ],
+          "notes": []
+        },
+        {
+          "slug": "high_cloud_cover",
+          "title": "High Cloud Cover",
+          "render_style": "weather_cloud_cover",
+          "source_routes": [
+            "direct_native_exact"
+          ],
+          "notes": []
+        },
+        {
+          "slug": "low_cloud_cover",
+          "title": "Low Cloud Cover",
+          "render_style": "weather_cloud_cover",
+          "source_routes": [
+            "direct_native_exact"
+          ],
+          "notes": []
+        },
+        {
+          "slug": "middle_cloud_cover",
+          "title": "Middle Cloud Cover",
+          "render_style": "weather_cloud_cover",
+          "source_routes": [
+            "direct_native_exact"
+          ],
+          "notes": []
+        },
+        {
+          "slug": "mslp_10m_winds",
+          "title": "MSLP / 10m Winds",
+          "render_style": "weather_pressure",
+          "source_routes": [
+            "direct_native_exact"
+          ],
+          "notes": []
+        },
+        {
+          "slug": "precipitable_water",
+          "title": "Precipitable Water",
+          "render_style": "weather_precipitable_water",
+          "source_routes": [
+            "direct_native_exact"
+          ],
+          "notes": []
+        },
+        {
+          "slug": "precipitation_type",
+          "title": "Precipitation Type",
+          "render_style": "weather_panel_grid",
+          "source_routes": [
+            "direct_native_composite_exact"
+          ],
+          "notes": [
+            "Rendered as an honest HRRR direct composite panel over categorical rain, freezing-rain, ice-pellet, and snow phase flags"
+          ]
+        },
+        {
+          "slug": "simulated_ir_satellite",
+          "title": "Simulated IR Satellite",
+          "render_style": "weather_satellite",
+          "source_routes": [
+            "direct_native_exact"
+          ],
+          "notes": []
+        },
+        {
+          "slug": "smoke_column",
+          "title": "Column-Integrated Smoke",
+          "render_style": "weather_temperature",
+          "source_routes": [
+            "direct_native_exact"
+          ],
+          "notes": []
+        },
+        {
+          "slug": "smoke_pm25_native",
+          "title": "PM2.5 Smoke",
+          "render_style": "weather_temperature",
+          "source_routes": [
+            "direct_native_exact"
+          ],
+          "notes": []
+        },
+        {
+          "slug": "total_qpf",
+          "title": "Total QPF",
+          "render_style": "weather_qpf",
+          "source_routes": [
+            "direct_native_exact"
+          ],
+          "notes": []
+        },
+        {
+          "slug": "uh_2to5km",
+          "title": "Updraft Helicity 2-5 km",
+          "render_style": "weather_uh",
+          "source_routes": [
+            "direct_native_exact"
+          ],
+          "notes": []
+        },
+        {
+          "slug": "visibility",
+          "title": "Visibility",
+          "render_style": "weather_visibility",
+          "source_routes": [
+            "direct_native_exact"
+          ],
+          "notes": []
+        }
+      ],
+      "blocked": [
+        {
+          "slug": "lightning_flash_density",
+          "title": "Lightning Flash Density",
+          "render_style": "weather_lightning",
+          "source_routes": [],
+          "notes": []
+        }
+      ]
+    },
+    "derived": {
+      "available_count": 44,
+      "blocked_count": 3,
+      "available": [
+        {
+          "slug": "apparent_temperature_2m",
+          "title": "2 m Apparent Temperature",
+          "render_style": null,
+          "source_routes": [
+            "canonical_derived"
+          ],
+          "notes": []
+        },
+        {
+          "slug": "bulk_shear_0_1km",
+          "title": "0-1 km Bulk Shear",
+          "render_style": null,
+          "source_routes": [
+            "canonical_derived"
+          ],
+          "notes": []
+        },
+        {
+          "slug": "bulk_shear_0_6km",
+          "title": "0-6 km Bulk Shear",
+          "render_style": null,
+          "source_routes": [
+            "canonical_derived"
+          ],
+          "notes": []
+        },
+        {
+          "slug": "dewpoint_depression_2m",
+          "title": "2 m Dewpoint Depression",
+          "render_style": null,
+          "source_routes": [
+            "canonical_derived"
+          ],
+          "notes": []
+        },
+        {
+          "slug": "ecape_ehi_0_1km",
+          "title": "ECAPE EHI 0-1 km (EXP)",
+          "render_style": null,
+          "source_routes": [
+            "canonical_derived"
+          ],
+          "notes": [
+            "Current proof/product runner labels this as a proxy or experimental diagnostic"
+          ]
+        },
+        {
+          "slug": "ecape_ehi_0_3km",
+          "title": "ECAPE EHI 0-3 km (EXP)",
+          "render_style": null,
+          "source_routes": [
+            "canonical_derived"
+          ],
+          "notes": [
+            "Current proof/product runner labels this as a proxy or experimental diagnostic"
+          ]
+        },
+        {
+          "slug": "ecape_scp",
+          "title": "ECAPE SCP (EXP)",
+          "render_style": null,
+          "source_routes": [
+            "canonical_derived"
+          ],
+          "notes": [
+            "Current proof/product runner labels this as a proxy or experimental diagnostic"
+          ]
+        },
+        {
+          "slug": "ecape_stp",
+          "title": "ECAPE STP (EXP)",
+          "render_style": null,
+          "source_routes": [
+            "canonical_derived"
+          ],
+          "notes": [
+            "Current proof/product runner labels this as a proxy or experimental diagnostic"
+          ]
+        },
+        {
+          "slug": "ehi_0_1km",
+          "title": "EHI 0-1 km",
+          "render_style": null,
+          "source_routes": [
+            "canonical_derived"
+          ],
+          "notes": [
+            "Depth-specific EHI using sbCAPE with 0-1 km SRH; not an effective-layer diagnostic"
+          ]
+        },
+        {
+          "slug": "ehi_0_3km",
+          "title": "EHI 0-3 km",
+          "render_style": null,
+          "source_routes": [
+            "canonical_derived"
+          ],
+          "notes": [
+            "Depth-specific EHI using sbCAPE with 0-3 km SRH; not an effective-layer diagnostic"
+          ]
+        },
+        {
+          "slug": "fire_weather_composite",
+          "title": "Fire Weather Composite",
+          "render_style": null,
+          "source_routes": [
+            "canonical_derived"
+          ],
+          "notes": []
+        },
+        {
+          "slug": "heat_index_2m",
+          "title": "2 m Heat Index",
+          "render_style": null,
+          "source_routes": [
+            "canonical_derived"
+          ],
+          "notes": [
+            "Legacy plot-recipe slug from the big list. HRRR support lives in the derived lane, not as a native/direct GRIB recipe."
+          ]
+        },
+        {
+          "slug": "lapse_rate_0_3km",
+          "title": "0-3 km Lapse Rate",
+          "render_style": null,
+          "source_routes": [
+            "canonical_derived"
+          ],
+          "notes": []
+        },
+        {
+          "slug": "lapse_rate_700_500",
+          "title": "700-500 mb Virtual Temperature Lapse Rate",
+          "render_style": null,
+          "source_routes": [
+            "canonical_derived"
+          ],
+          "notes": []
+        },
+        {
+          "slug": "lifted_index",
+          "title": "Surface-Based Lifted Index",
+          "render_style": null,
+          "source_routes": [
+            "canonical_derived",
+            "native_exact"
+          ],
+          "notes": []
+        },
+        {
+          "slug": "ml_ecape_derived_cape_ratio",
+          "title": "ML ECAPE / Derived CAPE Ratio (EXP)",
+          "render_style": null,
+          "source_routes": [
+            "canonical_derived"
+          ],
+          "notes": [
+            "Current proof/product runner labels this as a proxy or experimental diagnostic"
+          ]
+        },
+        {
+          "slug": "ml_ecape_native_cape_ratio",
+          "title": "ML ECAPE / Native CAPE Ratio (EXP)",
+          "render_style": null,
+          "source_routes": [
+            "canonical_derived"
+          ],
+          "notes": [
+            "Current proof/product runner labels this as a proxy or experimental diagnostic"
+          ]
+        },
+        {
+          "slug": "mlcape",
+          "title": "MLCAPE",
+          "render_style": null,
+          "source_routes": [
+            "canonical_derived",
+            "native_proxy"
+          ],
+          "notes": []
+        },
+        {
+          "slug": "mlcin",
+          "title": "MLCIN",
+          "render_style": null,
+          "source_routes": [
+            "canonical_derived",
+            "native_proxy"
+          ],
+          "notes": []
+        },
+        {
+          "slug": "mlecape",
+          "title": "MLECAPE",
+          "render_style": null,
+          "source_routes": [
+            "canonical_derived"
+          ],
+          "notes": []
+        },
+        {
+          "slug": "mlecin",
+          "title": "MLECIN",
+          "render_style": null,
+          "source_routes": [
+            "canonical_derived"
+          ],
+          "notes": []
+        },
+        {
+          "slug": "mu_ecape_derived_cape_ratio",
+          "title": "MU ECAPE / Derived CAPE Ratio (EXP)",
+          "render_style": null,
+          "source_routes": [
+            "canonical_derived"
+          ],
+          "notes": [
+            "Current proof/product runner labels this as a proxy or experimental diagnostic"
+          ]
+        },
+        {
+          "slug": "mu_ecape_native_cape_ratio",
+          "title": "MU ECAPE / Native CAPE Ratio (EXP)",
+          "render_style": null,
+          "source_routes": [
+            "canonical_derived"
+          ],
+          "notes": [
+            "Current proof/product runner labels this as a proxy or experimental diagnostic"
+          ]
+        },
+        {
+          "slug": "mucape",
+          "title": "MUCAPE",
+          "render_style": null,
+          "source_routes": [
+            "canonical_derived",
+            "native_proxy"
+          ],
+          "notes": []
+        },
+        {
+          "slug": "mucin",
+          "title": "MUCIN",
+          "render_style": null,
+          "source_routes": [
+            "canonical_derived",
+            "native_proxy"
+          ],
+          "notes": []
+        },
+        {
+          "slug": "muecape",
+          "title": "MUECAPE",
+          "render_style": null,
+          "source_routes": [
+            "canonical_derived"
+          ],
+          "notes": []
+        },
+        {
+          "slug": "sb_ecape_derived_cape_ratio",
+          "title": "SB ECAPE / Derived CAPE Ratio (EXP)",
+          "render_style": null,
+          "source_routes": [
+            "canonical_derived"
+          ],
+          "notes": [
+            "Current proof/product runner labels this as a proxy or experimental diagnostic"
+          ]
+        },
+        {
+          "slug": "sb_ecape_native_cape_ratio",
+          "title": "SB ECAPE / Native CAPE Ratio (EXP)",
+          "render_style": null,
+          "source_routes": [
+            "canonical_derived"
+          ],
+          "notes": [
+            "Current proof/product runner labels this as a proxy or experimental diagnostic"
+          ]
+        },
+        {
+          "slug": "sbcape",
+          "title": "SBCAPE",
+          "render_style": null,
+          "source_routes": [
+            "canonical_derived",
+            "native_exact"
+          ],
+          "notes": []
+        },
+        {
+          "slug": "sbcin",
+          "title": "SBCIN",
+          "render_style": null,
+          "source_routes": [
+            "canonical_derived",
+            "native_exact"
+          ],
+          "notes": []
+        },
+        {
+          "slug": "sbecape",
+          "title": "SBECAPE",
+          "render_style": null,
+          "source_routes": [
+            "canonical_derived"
+          ],
+          "notes": []
+        },
+        {
+          "slug": "sbecin",
+          "title": "SBECIN",
+          "render_style": null,
+          "source_routes": [
+            "canonical_derived"
+          ],
+          "notes": []
+        },
+        {
+          "slug": "sblcl",
+          "title": "SBLCL",
+          "render_style": null,
+          "source_routes": [
+            "canonical_derived",
+            "native_exact"
+          ],
+          "notes": []
+        },
+        {
+          "slug": "sbncape",
+          "title": "SBNCAPE",
+          "render_style": null,
+          "source_routes": [
+            "canonical_derived"
+          ],
+          "notes": []
+        },
+        {
+          "slug": "scp_mu_0_3km_0_6km_proxy",
+          "title": "SCP (MU / 0-3 km / 0-6 km PROXY)",
+          "render_style": null,
+          "source_routes": [
+            "canonical_derived"
+          ],
+          "notes": [
+            "Uses muCAPE with 0-3 km SRH and 0-6 km bulk shear; kept explicit because effective-layer SCP is still blocked",
+            "Current proof/product runner labels this as a proxy or experimental diagnostic"
+          ]
+        },
+        {
+          "slug": "srh_0_1km",
+          "title": "0-1 km SRH",
+          "render_style": null,
+          "source_routes": [
+            "canonical_derived"
+          ],
+          "notes": []
+        },
+        {
+          "slug": "srh_0_3km",
+          "title": "0-3 km SRH",
+          "render_style": null,
+          "source_routes": [
+            "canonical_derived"
+          ],
+          "notes": []
+        },
+        {
+          "slug": "stp_fixed",
+          "title": "STP (FIXED)",
+          "render_style": null,
+          "source_routes": [
+            "canonical_derived"
+          ],
+          "notes": []
+        },
+        {
+          "slug": "temperature_advection_700mb",
+          "title": "700 mb Temperature Advection",
+          "render_style": null,
+          "source_routes": [
+            "canonical_derived"
+          ],
+          "notes": []
+        },
+        {
+          "slug": "temperature_advection_850mb",
+          "title": "850 mb Temperature Advection",
+          "render_style": null,
+          "source_routes": [
+            "canonical_derived"
+          ],
+          "notes": []
+        },
+        {
+          "slug": "theta_e_2m_10m_winds",
+          "title": "2 m Theta-e, 10 m Wind Barbs",
+          "render_style": null,
+          "source_routes": [
+            "canonical_derived"
+          ],
+          "notes": [
+            "Legacy plot-recipe slug from the big list. HRRR support lives in the derived lane, not as a native/direct GRIB recipe."
+          ]
+        },
+        {
+          "slug": "vpd_2m",
+          "title": "2 m Vapor Pressure Deficit",
+          "render_style": null,
+          "source_routes": [
+            "canonical_derived"
+          ],
+          "notes": []
+        },
+        {
+          "slug": "wetbulb_2m",
+          "title": "2 m Wet-Bulb Temperature",
+          "render_style": null,
+          "source_routes": [
+            "canonical_derived"
+          ],
+          "notes": []
+        },
+        {
+          "slug": "wind_chill_2m",
+          "title": "2 m Wind Chill",
+          "render_style": null,
+          "source_routes": [
+            "canonical_derived"
+          ],
+          "notes": [
+            "Legacy plot-recipe slug from the big list. HRRR support lives in the derived lane, not as a native/direct GRIB recipe."
+          ]
+        }
+      ],
+      "blocked": [
+        {
+          "slug": "scp",
+          "title": "SCP",
+          "render_style": null,
+          "source_routes": [],
+          "notes": []
+        },
+        {
+          "slug": "scp_effective",
+          "title": "SCP (EFFECTIVE)",
+          "render_style": null,
+          "source_routes": [],
+          "notes": []
+        },
+        {
+          "slug": "stp_effective",
+          "title": "STP (EFFECTIVE)",
+          "render_style": null,
+          "source_routes": [],
+          "notes": []
+        }
+      ]
+    },
+    "heavy": {
+      "available_count": 1,
+      "blocked_count": 0,
+      "available": [
+        {
+          "slug": "severe_proof_panel",
+          "title": "Severe Map Set",
+          "render_style": "weather_map_family",
+          "source_routes": [
+            "canonical_derived"
+          ],
+          "notes": [
+            "Bundled severe map family",
+            "Generic gridded severe map path for supported built-in models",
+            "Keeps fixed-depth SCP proxy diagnostics until effective-layer SRH and EBWD are wired"
+          ]
+        }
+      ],
+      "blocked": []
+    },
+    "windowed": {
+      "available_count": 49,
+      "blocked_count": 0,
+      "available": [
+        {
+          "slug": "10m_wind_0_24h_max",
+          "title": "10 m Wind Speed (0-24 h max)",
+          "render_style": "weather_winds",
+          "source_routes": [
+            "cheap_derived"
+          ],
+          "notes": [
+            "Extended-cycle fixed 24 h max of native hourly 10 m wind-speed maxima from F001..F024",
+            "Backed by HRRR statistical time-window metadata surfaced through grib-core"
+          ]
+        },
+        {
+          "slug": "10m_wind_0_48h_max",
+          "title": "10 m Wind Speed (0-48 h max)",
+          "render_style": "weather_winds",
+          "source_routes": [
+            "cheap_derived"
+          ],
+          "notes": [
+            "Extended-cycle fixed 48 h max of native hourly 10 m wind-speed maxima from F001..F048",
+            "Backed by HRRR statistical time-window metadata surfaced through grib-core"
+          ]
+        },
+        {
+          "slug": "10m_wind_1h_max",
+          "title": "10 m Wind Speed (1 h max)",
+          "render_style": "weather_winds",
+          "source_routes": [
+            "cheap_derived"
+          ],
+          "notes": [
+            "Native 10 m wind-speed 1-hour maximum ending at the requested forecast hour",
+            "Backed by HRRR statistical time-window metadata surfaced through grib-core"
+          ]
+        },
+        {
+          "slug": "10m_wind_24_48h_max",
+          "title": "10 m Wind Speed (24-48 h max)",
+          "render_style": "weather_winds",
+          "source_routes": [
+            "cheap_derived"
+          ],
+          "notes": [
+            "Extended-cycle fixed 24 h max of native hourly 10 m wind-speed maxima from F025..F048",
+            "Backed by HRRR statistical time-window metadata surfaced through grib-core"
+          ]
+        },
+        {
+          "slug": "10m_wind_run_max",
+          "title": "10 m Wind Speed (run max)",
+          "render_style": "weather_winds",
+          "source_routes": [
+            "cheap_derived"
+          ],
+          "notes": [
+            "Run max of native hourly 10 m wind-speed maxima from F001..Fend",
+            "Backed by HRRR statistical time-window metadata surfaced through grib-core"
+          ]
+        },
+        {
+          "slug": "2m_dewpoint_0_24h_max",
+          "title": "2 m Dewpoint (0-24 h max)",
+          "render_style": "weather_dewpoint",
+          "source_routes": [
+            "cheap_derived"
+          ],
+          "notes": [
+            "Extended-cycle fixed 24 h max of hourly 2 m dewpoint snapshots from F001..F024",
+            "Computed from hourly HRRR 2 m surface snapshots pulled from wrfsfc idx subsets; fixed windows are pointwise max/min/range reductions"
+          ]
+        },
+        {
+          "slug": "2m_dewpoint_0_24h_min",
+          "title": "2 m Dewpoint (0-24 h min)",
+          "render_style": "weather_dewpoint",
+          "source_routes": [
+            "cheap_derived"
+          ],
+          "notes": [
+            "Extended-cycle fixed 24 h min of hourly 2 m dewpoint snapshots from F001..F024",
+            "Computed from hourly HRRR 2 m surface snapshots pulled from wrfsfc idx subsets; fixed windows are pointwise max/min/range reductions"
+          ]
+        },
+        {
+          "slug": "2m_dewpoint_0_24h_range",
+          "title": "2 m Dewpoint Range (0-24 h)",
+          "render_style": "weather_dewpoint",
+          "source_routes": [
+            "cheap_derived"
+          ],
+          "notes": [
+            "Extended-cycle fixed 24 h max-minus-min range of hourly 2 m dewpoint snapshots from F001..F024",
+            "Computed from hourly HRRR 2 m surface snapshots pulled from wrfsfc idx subsets; fixed windows are pointwise max/min/range reductions"
+          ]
+        },
+        {
+          "slug": "2m_dewpoint_0_48h_max",
+          "title": "2 m Dewpoint (0-48 h max)",
+          "render_style": "weather_dewpoint",
+          "source_routes": [
+            "cheap_derived"
+          ],
+          "notes": [
+            "Extended-cycle fixed 48 h max of hourly 2 m dewpoint snapshots from F001..F048",
+            "Computed from hourly HRRR 2 m surface snapshots pulled from wrfsfc idx subsets; fixed windows are pointwise max/min/range reductions"
+          ]
+        },
+        {
+          "slug": "2m_dewpoint_0_48h_min",
+          "title": "2 m Dewpoint (0-48 h min)",
+          "render_style": "weather_dewpoint",
+          "source_routes": [
+            "cheap_derived"
+          ],
+          "notes": [
+            "Extended-cycle fixed 48 h min of hourly 2 m dewpoint snapshots from F001..F048",
+            "Computed from hourly HRRR 2 m surface snapshots pulled from wrfsfc idx subsets; fixed windows are pointwise max/min/range reductions"
+          ]
+        },
+        {
+          "slug": "2m_dewpoint_0_48h_range",
+          "title": "2 m Dewpoint Range (0-48 h)",
+          "render_style": "weather_dewpoint",
+          "source_routes": [
+            "cheap_derived"
+          ],
+          "notes": [
+            "Extended-cycle fixed 48 h max-minus-min range of hourly 2 m dewpoint snapshots from F001..F048",
+            "Computed from hourly HRRR 2 m surface snapshots pulled from wrfsfc idx subsets; fixed windows are pointwise max/min/range reductions"
+          ]
+        },
+        {
+          "slug": "2m_dewpoint_24_48h_max",
+          "title": "2 m Dewpoint (24-48 h max)",
+          "render_style": "weather_dewpoint",
+          "source_routes": [
+            "cheap_derived"
+          ],
+          "notes": [
+            "Extended-cycle fixed 24 h max of hourly 2 m dewpoint snapshots from F025..F048",
+            "Computed from hourly HRRR 2 m surface snapshots pulled from wrfsfc idx subsets; fixed windows are pointwise max/min/range reductions"
+          ]
+        },
+        {
+          "slug": "2m_dewpoint_24_48h_min",
+          "title": "2 m Dewpoint (24-48 h min)",
+          "render_style": "weather_dewpoint",
+          "source_routes": [
+            "cheap_derived"
+          ],
+          "notes": [
+            "Extended-cycle fixed 24 h min of hourly 2 m dewpoint snapshots from F025..F048",
+            "Computed from hourly HRRR 2 m surface snapshots pulled from wrfsfc idx subsets; fixed windows are pointwise max/min/range reductions"
+          ]
+        },
+        {
+          "slug": "2m_dewpoint_24_48h_range",
+          "title": "2 m Dewpoint Range (24-48 h)",
+          "render_style": "weather_dewpoint",
+          "source_routes": [
+            "cheap_derived"
+          ],
+          "notes": [
+            "Extended-cycle fixed 24 h max-minus-min range of hourly 2 m dewpoint snapshots from F025..F048",
+            "Computed from hourly HRRR 2 m surface snapshots pulled from wrfsfc idx subsets; fixed windows are pointwise max/min/range reductions"
+          ]
+        },
+        {
+          "slug": "2m_rh_0_24h_max",
+          "title": "2 m Relative Humidity (0-24 h max)",
+          "render_style": "weather_rh",
+          "source_routes": [
+            "cheap_derived"
+          ],
+          "notes": [
+            "Extended-cycle fixed 24 h max of hourly 2 m relative humidity snapshots from F001..F024",
+            "Computed from hourly HRRR 2 m surface snapshots pulled from wrfsfc idx subsets; fixed windows are pointwise max/min/range reductions"
+          ]
+        },
+        {
+          "slug": "2m_rh_0_24h_min",
+          "title": "2 m Relative Humidity (0-24 h min)",
+          "render_style": "weather_rh",
+          "source_routes": [
+            "cheap_derived"
+          ],
+          "notes": [
+            "Extended-cycle fixed 24 h min of hourly 2 m relative humidity snapshots from F001..F024",
+            "Computed from hourly HRRR 2 m surface snapshots pulled from wrfsfc idx subsets; fixed windows are pointwise max/min/range reductions"
+          ]
+        },
+        {
+          "slug": "2m_rh_0_24h_range",
+          "title": "2 m Relative Humidity Range (0-24 h)",
+          "render_style": "weather_rh",
+          "source_routes": [
+            "cheap_derived"
+          ],
+          "notes": [
+            "Extended-cycle fixed 24 h max-minus-min range of hourly 2 m relative humidity snapshots from F001..F024",
+            "Computed from hourly HRRR 2 m surface snapshots pulled from wrfsfc idx subsets; fixed windows are pointwise max/min/range reductions"
+          ]
+        },
+        {
+          "slug": "2m_rh_0_48h_max",
+          "title": "2 m Relative Humidity (0-48 h max)",
+          "render_style": "weather_rh",
+          "source_routes": [
+            "cheap_derived"
+          ],
+          "notes": [
+            "Extended-cycle fixed 48 h max of hourly 2 m relative humidity snapshots from F001..F048",
+            "Computed from hourly HRRR 2 m surface snapshots pulled from wrfsfc idx subsets; fixed windows are pointwise max/min/range reductions"
+          ]
+        },
+        {
+          "slug": "2m_rh_0_48h_min",
+          "title": "2 m Relative Humidity (0-48 h min)",
+          "render_style": "weather_rh",
+          "source_routes": [
+            "cheap_derived"
+          ],
+          "notes": [
+            "Extended-cycle fixed 48 h min of hourly 2 m relative humidity snapshots from F001..F048",
+            "Computed from hourly HRRR 2 m surface snapshots pulled from wrfsfc idx subsets; fixed windows are pointwise max/min/range reductions"
+          ]
+        },
+        {
+          "slug": "2m_rh_0_48h_range",
+          "title": "2 m Relative Humidity Range (0-48 h)",
+          "render_style": "weather_rh",
+          "source_routes": [
+            "cheap_derived"
+          ],
+          "notes": [
+            "Extended-cycle fixed 48 h max-minus-min range of hourly 2 m relative humidity snapshots from F001..F048",
+            "Computed from hourly HRRR 2 m surface snapshots pulled from wrfsfc idx subsets; fixed windows are pointwise max/min/range reductions"
+          ]
+        },
+        {
+          "slug": "2m_rh_24_48h_max",
+          "title": "2 m Relative Humidity (24-48 h max)",
+          "render_style": "weather_rh",
+          "source_routes": [
+            "cheap_derived"
+          ],
+          "notes": [
+            "Extended-cycle fixed 24 h max of hourly 2 m relative humidity snapshots from F025..F048",
+            "Computed from hourly HRRR 2 m surface snapshots pulled from wrfsfc idx subsets; fixed windows are pointwise max/min/range reductions"
+          ]
+        },
+        {
+          "slug": "2m_rh_24_48h_min",
+          "title": "2 m Relative Humidity (24-48 h min)",
+          "render_style": "weather_rh",
+          "source_routes": [
+            "cheap_derived"
+          ],
+          "notes": [
+            "Extended-cycle fixed 24 h min of hourly 2 m relative humidity snapshots from F025..F048",
+            "Computed from hourly HRRR 2 m surface snapshots pulled from wrfsfc idx subsets; fixed windows are pointwise max/min/range reductions"
+          ]
+        },
+        {
+          "slug": "2m_rh_24_48h_range",
+          "title": "2 m Relative Humidity Range (24-48 h)",
+          "render_style": "weather_rh",
+          "source_routes": [
+            "cheap_derived"
+          ],
+          "notes": [
+            "Extended-cycle fixed 24 h max-minus-min range of hourly 2 m relative humidity snapshots from F025..F048",
+            "Computed from hourly HRRR 2 m surface snapshots pulled from wrfsfc idx subsets; fixed windows are pointwise max/min/range reductions"
+          ]
+        },
+        {
+          "slug": "2m_temp_0_24h_max",
+          "title": "2 m Temperature (0-24 h max)",
+          "render_style": "weather_temperature",
+          "source_routes": [
+            "cheap_derived"
+          ],
+          "notes": [
+            "Extended-cycle fixed 24 h max of hourly 2 m temperature snapshots from F001..F024",
+            "Computed from hourly HRRR 2 m surface snapshots pulled from wrfsfc idx subsets; fixed windows are pointwise max/min/range reductions"
+          ]
+        },
+        {
+          "slug": "2m_temp_0_24h_min",
+          "title": "2 m Temperature (0-24 h min)",
+          "render_style": "weather_temperature",
+          "source_routes": [
+            "cheap_derived"
+          ],
+          "notes": [
+            "Extended-cycle fixed 24 h min of hourly 2 m temperature snapshots from F001..F024",
+            "Computed from hourly HRRR 2 m surface snapshots pulled from wrfsfc idx subsets; fixed windows are pointwise max/min/range reductions"
+          ]
+        },
+        {
+          "slug": "2m_temp_0_24h_range",
+          "title": "2 m Temperature Range (0-24 h)",
+          "render_style": "weather_temperature",
+          "source_routes": [
+            "cheap_derived"
+          ],
+          "notes": [
+            "Extended-cycle fixed 24 h max-minus-min range of hourly 2 m temperature snapshots from F001..F024",
+            "Computed from hourly HRRR 2 m surface snapshots pulled from wrfsfc idx subsets; fixed windows are pointwise max/min/range reductions"
+          ]
+        },
+        {
+          "slug": "2m_temp_0_48h_max",
+          "title": "2 m Temperature (0-48 h max)",
+          "render_style": "weather_temperature",
+          "source_routes": [
+            "cheap_derived"
+          ],
+          "notes": [
+            "Extended-cycle fixed 48 h max of hourly 2 m temperature snapshots from F001..F048",
+            "Computed from hourly HRRR 2 m surface snapshots pulled from wrfsfc idx subsets; fixed windows are pointwise max/min/range reductions"
+          ]
+        },
+        {
+          "slug": "2m_temp_0_48h_min",
+          "title": "2 m Temperature (0-48 h min)",
+          "render_style": "weather_temperature",
+          "source_routes": [
+            "cheap_derived"
+          ],
+          "notes": [
+            "Extended-cycle fixed 48 h min of hourly 2 m temperature snapshots from F001..F048",
+            "Computed from hourly HRRR 2 m surface snapshots pulled from wrfsfc idx subsets; fixed windows are pointwise max/min/range reductions"
+          ]
+        },
+        {
+          "slug": "2m_temp_0_48h_range",
+          "title": "2 m Temperature Range (0-48 h)",
+          "render_style": "weather_temperature",
+          "source_routes": [
+            "cheap_derived"
+          ],
+          "notes": [
+            "Extended-cycle fixed 48 h max-minus-min range of hourly 2 m temperature snapshots from F001..F048",
+            "Computed from hourly HRRR 2 m surface snapshots pulled from wrfsfc idx subsets; fixed windows are pointwise max/min/range reductions"
+          ]
+        },
+        {
+          "slug": "2m_temp_24_48h_max",
+          "title": "2 m Temperature (24-48 h max)",
+          "render_style": "weather_temperature",
+          "source_routes": [
+            "cheap_derived"
+          ],
+          "notes": [
+            "Extended-cycle fixed 24 h max of hourly 2 m temperature snapshots from F025..F048",
+            "Computed from hourly HRRR 2 m surface snapshots pulled from wrfsfc idx subsets; fixed windows are pointwise max/min/range reductions"
+          ]
+        },
+        {
+          "slug": "2m_temp_24_48h_min",
+          "title": "2 m Temperature (24-48 h min)",
+          "render_style": "weather_temperature",
+          "source_routes": [
+            "cheap_derived"
+          ],
+          "notes": [
+            "Extended-cycle fixed 24 h min of hourly 2 m temperature snapshots from F025..F048",
+            "Computed from hourly HRRR 2 m surface snapshots pulled from wrfsfc idx subsets; fixed windows are pointwise max/min/range reductions"
+          ]
+        },
+        {
+          "slug": "2m_temp_24_48h_range",
+          "title": "2 m Temperature Range (24-48 h)",
+          "render_style": "weather_temperature",
+          "source_routes": [
+            "cheap_derived"
+          ],
+          "notes": [
+            "Extended-cycle fixed 24 h max-minus-min range of hourly 2 m temperature snapshots from F025..F048",
+            "Computed from hourly HRRR 2 m surface snapshots pulled from wrfsfc idx subsets; fixed windows are pointwise max/min/range reductions"
+          ]
+        },
+        {
+          "slug": "2m_vpd_0_24h_max",
+          "title": "2 m Vapor Pressure Deficit (0-24 h max)",
+          "render_style": "weather_vpd",
+          "source_routes": [
+            "cheap_derived"
+          ],
+          "notes": [
+            "Extended-cycle fixed 24 h max of hourly 2 m vapor pressure deficit snapshots from F001..F024",
+            "Computed from hourly HRRR 2 m surface snapshots pulled from wrfsfc idx subsets; fixed windows are pointwise max/min/range reductions"
+          ]
+        },
+        {
+          "slug": "2m_vpd_0_24h_min",
+          "title": "2 m Vapor Pressure Deficit (0-24 h min)",
+          "render_style": "weather_vpd",
+          "source_routes": [
+            "cheap_derived"
+          ],
+          "notes": [
+            "Extended-cycle fixed 24 h min of hourly 2 m vapor pressure deficit snapshots from F001..F024",
+            "Computed from hourly HRRR 2 m surface snapshots pulled from wrfsfc idx subsets; fixed windows are pointwise max/min/range reductions"
+          ]
+        },
+        {
+          "slug": "2m_vpd_0_24h_range",
+          "title": "2 m Vapor Pressure Deficit Range (0-24 h)",
+          "render_style": "weather_vpd",
+          "source_routes": [
+            "cheap_derived"
+          ],
+          "notes": [
+            "Extended-cycle fixed 24 h max-minus-min range of hourly 2 m vapor pressure deficit snapshots from F001..F024",
+            "Computed from hourly HRRR 2 m surface snapshots pulled from wrfsfc idx subsets; fixed windows are pointwise max/min/range reductions"
+          ]
+        },
+        {
+          "slug": "2m_vpd_0_48h_max",
+          "title": "2 m Vapor Pressure Deficit (0-48 h max)",
+          "render_style": "weather_vpd",
+          "source_routes": [
+            "cheap_derived"
+          ],
+          "notes": [
+            "Extended-cycle fixed 48 h max of hourly 2 m vapor pressure deficit snapshots from F001..F048",
+            "Computed from hourly HRRR 2 m surface snapshots pulled from wrfsfc idx subsets; fixed windows are pointwise max/min/range reductions"
+          ]
+        },
+        {
+          "slug": "2m_vpd_0_48h_min",
+          "title": "2 m Vapor Pressure Deficit (0-48 h min)",
+          "render_style": "weather_vpd",
+          "source_routes": [
+            "cheap_derived"
+          ],
+          "notes": [
+            "Extended-cycle fixed 48 h min of hourly 2 m vapor pressure deficit snapshots from F001..F048",
+            "Computed from hourly HRRR 2 m surface snapshots pulled from wrfsfc idx subsets; fixed windows are pointwise max/min/range reductions"
+          ]
+        },
+        {
+          "slug": "2m_vpd_0_48h_range",
+          "title": "2 m Vapor Pressure Deficit Range (0-48 h)",
+          "render_style": "weather_vpd",
+          "source_routes": [
+            "cheap_derived"
+          ],
+          "notes": [
+            "Extended-cycle fixed 48 h max-minus-min range of hourly 2 m vapor pressure deficit snapshots from F001..F048",
+            "Computed from hourly HRRR 2 m surface snapshots pulled from wrfsfc idx subsets; fixed windows are pointwise max/min/range reductions"
+          ]
+        },
+        {
+          "slug": "2m_vpd_24_48h_max",
+          "title": "2 m Vapor Pressure Deficit (24-48 h max)",
+          "render_style": "weather_vpd",
+          "source_routes": [
+            "cheap_derived"
+          ],
+          "notes": [
+            "Extended-cycle fixed 24 h max of hourly 2 m vapor pressure deficit snapshots from F025..F048",
+            "Computed from hourly HRRR 2 m surface snapshots pulled from wrfsfc idx subsets; fixed windows are pointwise max/min/range reductions"
+          ]
+        },
+        {
+          "slug": "2m_vpd_24_48h_min",
+          "title": "2 m Vapor Pressure Deficit (24-48 h min)",
+          "render_style": "weather_vpd",
+          "source_routes": [
+            "cheap_derived"
+          ],
+          "notes": [
+            "Extended-cycle fixed 24 h min of hourly 2 m vapor pressure deficit snapshots from F025..F048",
+            "Computed from hourly HRRR 2 m surface snapshots pulled from wrfsfc idx subsets; fixed windows are pointwise max/min/range reductions"
+          ]
+        },
+        {
+          "slug": "2m_vpd_24_48h_range",
+          "title": "2 m Vapor Pressure Deficit Range (24-48 h)",
+          "render_style": "weather_vpd",
+          "source_routes": [
+            "cheap_derived"
+          ],
+          "notes": [
+            "Extended-cycle fixed 24 h max-minus-min range of hourly 2 m vapor pressure deficit snapshots from F025..F048",
+            "Computed from hourly HRRR 2 m surface snapshots pulled from wrfsfc idx subsets; fixed windows are pointwise max/min/range reductions"
+          ]
+        },
+        {
+          "slug": "qpf_12h",
+          "title": "12-h QPF",
+          "render_style": "weather_qpf",
+          "source_routes": [
+            "cheap_derived"
+          ],
+          "notes": [
+            "Uses direct 12-hour APCP from the ending hour when present, else sums hourly APCP increments",
+            "Backed by HRRR statistical time-window metadata surfaced through grib-core"
+          ]
+        },
+        {
+          "slug": "qpf_1h",
+          "title": "1-h QPF",
+          "render_style": "weather_qpf",
+          "source_routes": [
+            "cheap_derived"
+          ],
+          "notes": [
+            "1-h APCP accumulation ending at the requested forecast hour",
+            "Backed by HRRR statistical time-window metadata surfaced through grib-core",
+            "Legacy plot-recipe slug from the big list. The honest HRRR implementation is the 1-hour windowed APCP product; alias wiring belongs in the windowed lane rather than a fake native/direct recipe."
+          ]
+        },
+        {
+          "slug": "qpf_24h",
+          "title": "24-h QPF",
+          "render_style": "weather_qpf",
+          "source_routes": [
+            "cheap_derived"
+          ],
+          "notes": [
+            "Uses direct 24-hour APCP from the ending hour when present, else sums hourly APCP increments",
+            "Backed by HRRR statistical time-window metadata surfaced through grib-core"
+          ]
+        },
+        {
+          "slug": "qpf_6h",
+          "title": "6-h QPF",
+          "render_style": "weather_qpf",
+          "source_routes": [
+            "cheap_derived"
+          ],
+          "notes": [
+            "Uses direct 6-hour APCP from the ending hour when present, else sums hourly APCP increments",
+            "Backed by HRRR statistical time-window metadata surfaced through grib-core"
+          ]
+        },
+        {
+          "slug": "qpf_total",
+          "title": "Total QPF",
+          "render_style": "weather_qpf",
+          "source_routes": [
+            "cheap_derived"
+          ],
+          "notes": [
+            "Uses direct APCP from the ending hour when available, else sums all hourly APCP increments from F001..Fend",
+            "Backed by HRRR statistical time-window metadata surfaced through grib-core"
+          ]
+        },
+        {
+          "slug": "uh_2to5km_1h_max",
+          "title": "Updraft Helicity: 2-5 km AGL (1 h max)",
+          "render_style": "weather_uh",
+          "source_routes": [
+            "cheap_derived"
+          ],
+          "notes": [
+            "Native 2-5 km UH 1-hour max from HRRR wrfnat",
+            "Backed by HRRR statistical time-window metadata surfaced through grib-core"
+          ]
+        },
+        {
+          "slug": "uh_2to5km_3h_max",
+          "title": "Updraft Helicity: 2-5 km AGL (3 h max)",
+          "render_style": "weather_uh",
+          "source_routes": [
+            "cheap_derived"
+          ],
+          "notes": [
+            "Max of trailing native hourly 2-5 km UH maxima",
+            "Backed by HRRR statistical time-window metadata surfaced through grib-core"
+          ]
+        },
+        {
+          "slug": "uh_2to5km_run_max",
+          "title": "Updraft Helicity: 2-5 km AGL (run max)",
+          "render_style": "weather_uh",
+          "source_routes": [
+            "cheap_derived"
+          ],
+          "notes": [
+            "Run max of native hourly 2-5 km UH maxima from F001..Fend",
+            "Backed by HRRR statistical time-window metadata surfaced through grib-core"
+          ]
+        }
+      ],
+      "blocked": []
+    }
+  },
+  "cross_sections": {
+    "declared_count": 20,
+    "pressure_builder_count": 19,
+    "declared": [
+      {
+        "slug": "temperature",
+        "display_name": "Temperature",
+        "group": "Temperature & Moisture",
+        "units": "C",
+        "builder_supported": true
+      },
+      {
+        "slug": "wind_speed",
+        "display_name": "Wind Speed",
+        "group": "Wind & Dynamics",
+        "units": "kt",
+        "builder_supported": true
+      },
+      {
+        "slug": "theta_e",
+        "display_name": "Equivalent Potential Temperature",
+        "group": "Temperature & Moisture",
+        "units": "K",
+        "builder_supported": true
+      },
+      {
+        "slug": "rh",
+        "display_name": "Relative Humidity",
+        "group": "Temperature & Moisture",
+        "units": "%",
+        "builder_supported": true
+      },
+      {
+        "slug": "q",
+        "display_name": "Specific Humidity",
+        "group": "Temperature & Moisture",
+        "units": "g/kg",
+        "builder_supported": true
+      },
+      {
+        "slug": "omega",
+        "display_name": "Vertical Velocity",
+        "group": "Wind & Dynamics",
+        "units": "hPa/hr",
+        "builder_supported": true
+      },
+      {
+        "slug": "vorticity",
+        "display_name": "Absolute Vorticity",
+        "group": "Wind & Dynamics",
+        "units": "1e-5 s^-1",
+        "builder_supported": true
+      },
+      {
+        "slug": "shear",
+        "display_name": "Wind Shear",
+        "group": "Wind & Dynamics",
+        "units": "1e-3 s^-1",
+        "builder_supported": true
+      },
+      {
+        "slug": "lapse_rate",
+        "display_name": "Lapse Rate",
+        "group": "Clouds & Precip",
+        "units": "C/km",
+        "builder_supported": true
+      },
+      {
+        "slug": "cloud",
+        "display_name": "Cloud Water",
+        "group": "Clouds & Precip",
+        "units": "g/kg",
+        "builder_supported": true
+      },
+      {
+        "slug": "cloud_total",
+        "display_name": "Total Condensate",
+        "group": "Clouds & Precip",
+        "units": "g/kg",
+        "builder_supported": true
+      },
+      {
+        "slug": "wetbulb",
+        "display_name": "Wet-Bulb Temperature",
+        "group": "Temperature & Moisture",
+        "units": "C",
+        "builder_supported": true
+      },
+      {
+        "slug": "icing",
+        "display_name": "Icing Potential",
+        "group": "Clouds & Precip",
+        "units": "g/kg",
+        "builder_supported": true
+      },
+      {
+        "slug": "frontogenesis",
+        "display_name": "Frontogenesis",
+        "group": "Clouds & Precip",
+        "units": "K/100km/3hr",
+        "builder_supported": true
+      },
+      {
+        "slug": "smoke",
+        "display_name": "PM2.5 Smoke",
+        "group": "Hazards & Composites",
+        "units": "ug/m^3",
+        "builder_supported": false
+      },
+      {
+        "slug": "vpd",
+        "display_name": "Vapor Pressure Deficit",
+        "group": "Temperature & Moisture",
+        "units": "hPa",
+        "builder_supported": true
+      },
+      {
+        "slug": "dewpoint_dep",
+        "display_name": "Dewpoint Depression",
+        "group": "Temperature & Moisture",
+        "units": "C",
+        "builder_supported": true
+      },
+      {
+        "slug": "moisture_transport",
+        "display_name": "Moisture Transport",
+        "group": "Wind & Dynamics",
+        "units": "g*m/kg/s",
+        "builder_supported": true
+      },
+      {
+        "slug": "pv",
+        "display_name": "Potential Vorticity",
+        "group": "Wind & Dynamics",
+        "units": "PVU",
+        "builder_supported": true
+      },
+      {
+        "slug": "fire_wx",
+        "display_name": "Fire Weather",
+        "group": "Hazards & Composites",
+        "units": "RH% + wind",
+        "builder_supported": true
+      }
+    ]
+  },
+  "wxsection_map_candidates": [
+    {
+      "slug": "smoke_pm25_native",
+      "title": "PM2.5 Smoke",
+      "priority": "high",
+      "upstream_basis": "wxsection smoke style + HRRR wrfnat MASSDEN on hybrid levels",
+      "likely_inputs": [
+        "wrfnat MASSDEN (disc 0 / cat 20 / num 0)",
+        "hybrid pressure"
+      ],
+      "note": "Highest-value smoke add. Enables both plan-view smoke maps and true native-level smoke cross sections."
+    },
+    {
+      "slug": "smoke_column",
+      "title": "Column-Integrated Smoke",
+      "priority": "high",
+      "upstream_basis": "wxsection COLMD extraction path",
+      "likely_inputs": [
+        "wrfnat COLMD entire atmosphere"
+      ],
+      "note": "Cheaper overview smoke map if the column field is present in the native file."
+    },
+    {
+      "slug": "vpd_2m",
+      "title": "2m Vapor Pressure Deficit",
+      "priority": "high",
+      "upstream_basis": "wxsection fire-weather style family",
+      "likely_inputs": [
+        "2m temperature",
+        "2m RH or dewpoint"
+      ],
+      "note": "Useful fire-weather scalar and straightforward from current surface thermo fields."
+    },
+    {
+      "slug": "dewpoint_depression_2m",
+      "title": "2m Dewpoint Depression",
+      "priority": "medium",
+      "upstream_basis": "wxsection dry-layer diagnostics",
+      "likely_inputs": [
+        "2m temperature",
+        "2m dewpoint"
+      ],
+      "note": "Cheap diagnostic that pairs well with cloud-base / dryline style maps."
+    },
+    {
+      "slug": "fire_weather_composite",
+      "title": "Fire Weather Composite",
+      "priority": "high",
+      "upstream_basis": "wxsection fire_wx composite",
+      "likely_inputs": [
+        "2m RH",
+        "10m wind",
+        "VPD"
+      ],
+      "note": "Public-facing fire-weather composite candidate; likely best implemented as a clean derived lane product."
+    },
+    {
+      "slug": "omega_700mb",
+      "title": "700mb Omega",
+      "priority": "medium",
+      "upstream_basis": "wxsection omega style",
+      "likely_inputs": [
+        "pressure vertical velocity",
+        "700mb pressure level"
+      ],
+      "note": "Straight synoptic add once the vertical-velocity field is wired through grib extraction."
+    },
+    {
+      "slug": "wetbulb_2m",
+      "title": "2m Wet-Bulb Temperature",
+      "priority": "medium",
+      "upstream_basis": "wxsection wetbulb style",
+      "likely_inputs": [
+        "2m temperature",
+        "2m RH or dewpoint"
+      ],
+      "note": "Strong winter-weather / fire-weather crossover field and likely cheaper than many severe diagnostics."
+    },
+    {
+      "slug": "frontogenesis_700_850mb",
+      "title": "700-850mb Frontogenesis",
+      "priority": "medium",
+      "upstream_basis": "wxsection frontogenesis style",
+      "likely_inputs": [
+        "temperature gradient",
+        "wind deformation/confluence"
+      ],
+      "note": "Good winter-weather add, but needs a defensible derived implementation rather than a placeholder."
+    },
+    {
+      "slug": "moisture_transport_850mb",
+      "title": "850mb Moisture Transport",
+      "priority": "medium",
+      "upstream_basis": "wxsection moisture_transport style",
+      "likely_inputs": [
+        "specific humidity",
+        "wind speed"
+      ],
+      "note": "Simple, meteorologist-friendly plume diagnostic once specific humidity is exposed cleanly."
+    },
+    {
+      "slug": "potential_vorticity",
+      "title": "Potential Vorticity",
+      "priority": "low",
+      "upstream_basis": "wxsection pv style",
+      "likely_inputs": [
+        "theta",
+        "vorticity",
+        "pressure derivatives"
+      ],
+      "note": "More specialized and costlier, but valuable later for jet/tropopause work."
+    }
+  ]
+}

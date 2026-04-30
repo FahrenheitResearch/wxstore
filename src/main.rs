@@ -94,6 +94,7 @@ struct Cli {
 enum Command {
     Serve(ServeArgs),
     Inspect(InspectArgs),
+    MaterializeSpatial(MaterializeSpatialArgs),
 }
 
 #[derive(Parser, Clone)]
@@ -118,6 +119,22 @@ struct InspectArgs {
     diagnostic_store: Option<PathBuf>,
     #[arg(long)]
     spatial_root: Option<PathBuf>,
+}
+
+#[derive(Parser, Clone)]
+struct MaterializeSpatialArgs {
+    #[arg(long)]
+    spatial_root: PathBuf,
+    #[arg(long)]
+    model: String,
+    #[arg(long)]
+    run: String,
+    #[arg(long)]
+    member: Option<String>,
+    #[arg(long)]
+    products: String,
+    #[arg(long, default_value = "0-2")]
+    hours: String,
 }
 
 #[tokio::main]
@@ -147,6 +164,7 @@ async fn main() -> Result<()> {
             );
             Ok(())
         }
+        Command::MaterializeSpatial(args) => materialize_spatial(args),
     }
 }
 
@@ -173,6 +191,7 @@ async fn serve(args: ServeArgs) -> Result<()> {
         .route("/api/status", get(status))
         .route("/v1/models", get(models))
         .route("/v1/variables", get(variables))
+        .route("/v1/products", get(products))
         .route("/v1/grid", get(grid_field))
         .route("/v1/forecast", get(forecast))
         .route("/v1/latest/{model}/{domain}", get(latest))
@@ -195,6 +214,78 @@ async fn serve(args: ServeArgs) -> Result<()> {
     println!("WxStore listening on http://{addr}");
     let listener = tokio::net::TcpListener::bind(addr).await?;
     axum::serve(listener, app).await?;
+    Ok(())
+}
+
+fn materialize_spatial(args: MaterializeSpatialArgs) -> Result<()> {
+    let started = Instant::now();
+    let lane = SpatialLane::open(&args.spatial_root)?;
+    let products = split_csv(&args.products);
+    let hours = parse_hours_u32(&args.hours)?;
+    if products.is_empty() {
+        bail!("--products must list at least one product");
+    }
+    if hours.is_empty() {
+        bail!("--hours must list at least one hour");
+    }
+
+    let mut wrote = Vec::new();
+    let mut errors = Vec::new();
+    for product in products {
+        for hour in &hours {
+            let item_started = Instant::now();
+            match lane.read_grid(&args.model, &args.run, args.member.as_deref(), &product, *hour) {
+                Ok(grid) => {
+                    let path = match write_spatial_zarr_grid(
+                        &args.spatial_root,
+                        &args.model,
+                        &args.run,
+                        args.member.as_deref(),
+                        &product,
+                        *hour,
+                        &grid,
+                    ) {
+                        Ok(path) => path,
+                        Err(err) => {
+                            errors.push(json!({
+                                "product": product,
+                                "hour": hour,
+                                "error": err.to_string()
+                            }));
+                            continue;
+                        }
+                    };
+                    wrote.push(json!({
+                        "product": product,
+                        "hour": hour,
+                        "path": path,
+                        "bytes": fs::metadata(&path).map(|meta| meta.len()).unwrap_or(0),
+                        "elapsed_ms": item_started.elapsed().as_millis()
+                    }));
+                }
+                Err(err) => errors.push(json!({
+                    "product": product,
+                    "hour": hour,
+                    "error": err.to_string()
+                })),
+            }
+        }
+    }
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&json!({
+            "schema": "wxstore.materialize_spatial.report.v1",
+            "model": args.model,
+            "run": args.run,
+            "member": args.member,
+            "hours": hours,
+            "wrote_count": wrote.len(),
+            "error_count": errors.len(),
+            "elapsed_ms": started.elapsed().as_millis(),
+            "wrote": wrote,
+            "errors": errors
+        }))?
+    );
     Ok(())
 }
 
@@ -358,6 +449,59 @@ async fn variables(
     let run = spatial.resolve_run(&query.model, query.run.as_deref())?;
     let member = query.member.as_deref();
     Ok(Json(spatial.variables_json(&query.model, &run, member)?))
+}
+
+async fn products(State(state): State<Arc<AppState>>) -> Json<Value> {
+    let local_inventory = fs::read("rustwx-inventory/rustwx_hrrr_20260429_f000_capability_inventory.json")
+        .ok()
+        .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok());
+    Json(json!({
+        "schema": "wxstore.products.v1",
+        "service_products": {
+            "raw_grid_variables": state.spatial.as_deref().map(SpatialLane::models_json).unwrap_or_else(|| json!({"status": "unavailable"})),
+            "virtual_grid_products": {
+                "direct_aliases": [
+                    "2m_temperature",
+                    "2m_dewpoint",
+                    "2m_relative_humidity",
+                    "10m_wind_gusts",
+                    "total_qpf",
+                    "mslp_10m_winds",
+                    "visibility",
+                    "sbcape"
+                ],
+                "cheap_derived": [
+                    "dewpoint_depression_2m",
+                    "vpd_2m",
+                    "heat_index_2m",
+                    "wind_chill_2m",
+                    "apparent_temperature_2m",
+                    "wind_speed_10m",
+                    "wind_direction_10m"
+                ],
+                "windowed_patterns": [
+                    "2m_temp_0_24h_max",
+                    "2m_temp_0_24h_min",
+                    "2m_temp_0_24h_range",
+                    "2m_temp_0_48h_max",
+                    "2m_dewpoint_0_24h_max",
+                    "2m_rh_0_24h_min",
+                    "10m_wind_0_24h_max"
+                ]
+            },
+            "temporal_sounding": {
+                "model": state.profile.manifest.model,
+                "run_id": state.profile.manifest.run_id,
+                "variables": state.profile.variable_names(),
+                "hours": state.profile.manifest.forecast_hours,
+                "levels_hpa": state.profile.manifest.levels_hpa
+            }
+        },
+        "rustwx_hrrr_inventory": local_inventory.unwrap_or_else(|| json!({
+            "status": "not_generated",
+            "command": "cargo run --release -p rustwx-cli --bin hrrr_capability_inventory -- --date 20260429 --forecast-hour 0 --out-dir C:\\\\Users\\\\drew\\\\wxstore\\\\rustwx-inventory"
+        }))
+    }))
 }
 
 async fn grid_field(
@@ -1395,6 +1539,7 @@ struct ZarrCompressor {
 struct SpatialLane {
     root: PathBuf,
     grid_cache: RwLock<HashMap<String, Arc<SpatialGrid>>>,
+    array_exists_cache: RwLock<HashMap<String, bool>>,
 }
 
 #[derive(Clone)]
@@ -1424,6 +1569,7 @@ impl SpatialLane {
         Ok(Self {
             root: root.to_path_buf(),
             grid_cache: RwLock::new(HashMap::new()),
+            array_exists_cache: RwLock::new(HashMap::new()),
         })
     }
 
@@ -1599,6 +1745,26 @@ impl SpatialLane {
         variable: &str,
         forecast_hour: u32,
     ) -> Result<SpatialGrid> {
+        if self.array_exists(model, run, member, variable) {
+            return self.read_raw_grid(model, run, member, variable, forecast_hour);
+        }
+        if let Some(raw) = raw_variable_for_product(variable) {
+            return self.read_raw_grid(model, run, member, raw, forecast_hour);
+        }
+        if let Some(grid) = self.read_cheap_derived_grid(model, run, member, variable, forecast_hour)? {
+            return Ok(grid);
+        }
+        self.read_raw_grid(model, run, member, variable, forecast_hour)
+    }
+
+    fn read_raw_grid(
+        &self,
+        model: &str,
+        run: &str,
+        member: Option<&str>,
+        variable: &str,
+        forecast_hour: u32,
+    ) -> Result<SpatialGrid> {
         let member_key = member.unwrap_or("-");
         let cache_key = format!("{model}|{run}|{member_key}|{variable}|{forecast_hour}");
         if let Some(grid) = self
@@ -1750,6 +1916,192 @@ impl SpatialLane {
         }))
     }
 
+    fn read_cheap_derived_grid(
+        &self,
+        model: &str,
+        run: &str,
+        member: Option<&str>,
+        variable: &str,
+        forecast_hour: u32,
+    ) -> Result<Option<SpatialGrid>> {
+        let mk_grid = |template: &SpatialGrid, variable: &str, units: &str, values: Vec<f32>| SpatialGrid {
+            model: template.model.clone(),
+            run_id: template.run_id.clone(),
+            member: template.member.clone(),
+            variable: variable.to_string(),
+            units: units.to_string(),
+            forecast_hour,
+            nx: template.nx,
+            ny: template.ny,
+            values: Arc::new(values),
+        };
+
+        let result = match variable {
+            "dewpoint_depression_2m" => {
+                let t = self.read_raw_grid(model, run, member, "temperature_2m", forecast_hour)?;
+                let td = self.read_raw_grid(model, run, member, "dew_point_2m", forecast_hour)?;
+                let values = t
+                    .values
+                    .iter()
+                    .zip(td.values.iter())
+                    .map(|(t, td)| finite2(*t, *td).map_or(f32::NAN, |(t, td)| t - td))
+                    .collect();
+                Some(mk_grid(&t, variable, "degC", values))
+            }
+            "vpd_2m" => {
+                let t = self.read_raw_grid(model, run, member, "temperature_2m", forecast_hour)?;
+                let rh = self.read_raw_grid(model, run, member, "relative_humidity_2m", forecast_hour)?;
+                let values = t
+                    .values
+                    .iter()
+                    .zip(rh.values.iter())
+                    .map(|(t, rh)| finite2(*t, *rh).map_or(f32::NAN, |(t, rh)| vapor_pressure_deficit_kpa(t, rh)))
+                    .collect();
+                Some(mk_grid(&t, variable, "kPa", values))
+            }
+            "heat_index_2m" => {
+                let t = self.read_raw_grid(model, run, member, "temperature_2m", forecast_hour)?;
+                let rh = self.read_raw_grid(model, run, member, "relative_humidity_2m", forecast_hour)?;
+                let values = t
+                    .values
+                    .iter()
+                    .zip(rh.values.iter())
+                    .map(|(t, rh)| finite2(*t, *rh).map_or(f32::NAN, |(t, rh)| heat_index_c(t, rh)))
+                    .collect();
+                Some(mk_grid(&t, variable, "degC", values))
+            }
+            "wind_chill_2m" => {
+                let t = self.read_raw_grid(model, run, member, "temperature_2m", forecast_hour)?;
+                let wind = self.read_grid(model, run, member, "wind_speed_10m", forecast_hour)?;
+                let values = t
+                    .values
+                    .iter()
+                    .zip(wind.values.iter())
+                    .map(|(t, wind)| finite2(*t, *wind).map_or(f32::NAN, |(t, wind)| wind_chill_c(t, wind)))
+                    .collect();
+                Some(mk_grid(&t, variable, "degC", values))
+            }
+            "apparent_temperature_2m" => {
+                let t = self.read_raw_grid(model, run, member, "temperature_2m", forecast_hour)?;
+                let rh = self.read_raw_grid(model, run, member, "relative_humidity_2m", forecast_hour)?;
+                let wind = self.read_grid(model, run, member, "wind_speed_10m", forecast_hour)?;
+                let values = t
+                    .values
+                    .iter()
+                    .zip(rh.values.iter())
+                    .zip(wind.values.iter())
+                    .map(|((t, rh), wind)| finite3(*t, *rh, *wind).map_or(f32::NAN, |(t, rh, wind)| apparent_temperature_c(t, rh, wind)))
+                    .collect();
+                Some(mk_grid(&t, variable, "degC", values))
+            }
+            "wind_speed_10m" | "10m_wind_speed" => {
+                let u = self.read_raw_grid(model, run, member, "u_component_of_wind_10m", forecast_hour)?;
+                let v = self.read_raw_grid(model, run, member, "v_component_of_wind_10m", forecast_hour)?;
+                let values = u
+                    .values
+                    .iter()
+                    .zip(v.values.iter())
+                    .map(|(u, v)| finite2(*u, *v).map_or(f32::NAN, |(u, v)| (u * u + v * v).sqrt()))
+                    .collect();
+                Some(mk_grid(&u, variable, "m/s", values))
+            }
+            "wind_direction_10m" => {
+                let u = self.read_raw_grid(model, run, member, "u_component_of_wind_10m", forecast_hour)?;
+                let v = self.read_raw_grid(model, run, member, "v_component_of_wind_10m", forecast_hour)?;
+                let values = u
+                    .values
+                    .iter()
+                    .zip(v.values.iter())
+                    .map(|(u, v)| finite2(*u, *v).map_or(f32::NAN, |(u, v)| wind_direction_deg(u, v)))
+                    .collect();
+                Some(mk_grid(&u, variable, "deg", values))
+            }
+            _ => {
+                if let Some(window) = parse_windowed_product(variable) {
+                    Some(self.read_windowed_grid(model, run, member, variable, window)?)
+                } else {
+                    None
+                }
+            }
+        };
+        Ok(result)
+    }
+
+    fn read_windowed_grid(
+        &self,
+        model: &str,
+        run: &str,
+        member: Option<&str>,
+        variable: &str,
+        window: WindowedProduct,
+    ) -> Result<SpatialGrid> {
+        let hours = self.available_hours_for(model, run, member, window.raw_variable)?;
+        let selected = hours
+            .into_iter()
+            .filter(|hour| *hour >= window.start && *hour <= window.end)
+            .collect::<Vec<_>>();
+        if selected.is_empty() {
+            bail!("no available hours for windowed product '{variable}'");
+        }
+        let first = self.read_grid(model, run, member, window.raw_variable, selected[0])?;
+        let mut values = vec![match window.reducer {
+            WindowReducer::Min => f32::INFINITY,
+            WindowReducer::Max => f32::NEG_INFINITY,
+            WindowReducer::Range => f32::NAN,
+        }; first.values.len()];
+        let mut mins = if window.reducer == WindowReducer::Range {
+            vec![f32::INFINITY; first.values.len()]
+        } else {
+            Vec::new()
+        };
+        let mut maxs = if window.reducer == WindowReducer::Range {
+            vec![f32::NEG_INFINITY; first.values.len()]
+        } else {
+            Vec::new()
+        };
+        let mut valid = vec![false; first.values.len()];
+        for hour in selected {
+            let grid = self.read_grid(model, run, member, window.raw_variable, hour)?;
+            for (index, value) in grid.values.iter().copied().enumerate() {
+                if !value.is_finite() {
+                    continue;
+                }
+                valid[index] = true;
+                match window.reducer {
+                    WindowReducer::Min => values[index] = values[index].min(value),
+                    WindowReducer::Max => values[index] = values[index].max(value),
+                    WindowReducer::Range => {
+                        mins[index] = mins[index].min(value);
+                        maxs[index] = maxs[index].max(value);
+                    }
+                }
+            }
+        }
+        if window.reducer == WindowReducer::Range {
+            for index in 0..values.len() {
+                if valid[index] {
+                    values[index] = maxs[index] - mins[index];
+                }
+            }
+        }
+        for (index, value) in values.iter_mut().enumerate() {
+            if !valid[index] {
+                *value = f32::NAN;
+            }
+        }
+        Ok(SpatialGrid {
+            model: first.model,
+            run_id: first.run_id,
+            member: first.member,
+            variable: variable.to_string(),
+            units: units_for_variable(window.raw_variable).to_string(),
+            forecast_hour: window.end,
+            nx: first.nx,
+            ny: first.ny,
+            values: Arc::new(values),
+        })
+    }
+
     fn array_base(&self, model: &str, run: &str, member: Option<&str>) -> PathBuf {
         let run_path = self.root.join(model).join(run);
         if let Some(member) = member {
@@ -1783,6 +2135,23 @@ impl SpatialLane {
         }
         bail!("spatial variable '{variable}' is not available for {model}/{run}");
     }
+
+    fn array_exists(&self, model: &str, run: &str, member: Option<&str>, variable: &str) -> bool {
+        let key = format!("{}|{}|{}|{}", model, run, member.unwrap_or("-"), variable);
+        if let Some(value) = self
+            .array_exists_cache
+            .read()
+            .ok()
+            .and_then(|cache| cache.get(&key).copied())
+        {
+            return value;
+        }
+        let exists = self.array_dir(model, run, member, variable).is_ok();
+        if let Ok(mut cache) = self.array_exists_cache.write() {
+            cache.insert(key, exists);
+        }
+        exists
+    }
 }
 
 fn list_dirs(path: &Path) -> Vec<String> {
@@ -1806,6 +2175,93 @@ fn decompress_zlib(data: &[u8]) -> Result<Vec<u8>> {
     let mut decoded = Vec::new();
     decoder.read_to_end(&mut decoded)?;
     Ok(decoded)
+}
+
+fn write_spatial_zarr_grid(
+    root: &Path,
+    model: &str,
+    run: &str,
+    member: Option<&str>,
+    product: &str,
+    forecast_hour: u32,
+    grid: &SpatialGrid,
+) -> Result<PathBuf> {
+    let mut base = root.join(model).join(run);
+    if let Some(member) = member {
+        base = base.join("members").join(member);
+    }
+    let data_dir = base.join(format!("{product}.zarr")).join("data");
+    fs::create_dir_all(&data_dir)?;
+    let max_hour = forecast_hour as usize + 1;
+    let meta_path = data_dir.join(".zarray");
+    let existing_shape = if meta_path.is_file() {
+        serde_json::from_slice::<ZarrArrayMeta>(&fs::read(&meta_path)?)?.shape
+    } else {
+        Vec::new()
+    };
+    let shape_hour = existing_shape.first().copied().unwrap_or(0).max(max_hour);
+    let meta = json!({
+        "zarr_format": 2,
+        "shape": [shape_hour, grid.ny, grid.nx],
+        "chunks": [1, 256, 256],
+        "dtype": "<f4",
+        "compressor": {"id": "zlib", "level": 4},
+        "fill_value": "NaN",
+        "order": "C",
+        "filters": null
+    });
+    fs::write(&meta_path, serde_json::to_vec_pretty(&meta)?)?;
+    fs::write(
+        data_dir.join(".zattrs"),
+        serde_json::to_vec_pretty(&json!({
+            "schema": "wxstore.spatial_product.v1",
+            "model": model,
+            "run": run,
+            "member": member,
+            "product": product,
+            "units": grid.units,
+            "source": "wxstore_materialize_spatial",
+            "forecast_hour": forecast_hour
+        }))?,
+    )?;
+
+    let cy = 256usize.min(grid.ny);
+    let cx = 256usize.min(grid.nx);
+    let n_chunks_y = grid.ny.div_ceil(cy);
+    let n_chunks_x = grid.nx.div_ceil(cx);
+    for chunk_y in 0..n_chunks_y {
+        for chunk_x in 0..n_chunks_x {
+            let y0 = chunk_y * cy;
+            let x0 = chunk_x * cx;
+            let y1 = (y0 + cy).min(grid.ny);
+            let x1 = (x0 + cx).min(grid.nx);
+            let mut chunk = vec![f32::NAN; cy * cx];
+            for yy in 0..(y1 - y0) {
+                for xx in 0..(x1 - x0) {
+                    let src = (y0 + yy) * grid.nx + (x0 + xx);
+                    let dst = yy * cx + xx;
+                    chunk[dst] = grid.values[src];
+                }
+            }
+            let raw = chunk
+                .iter()
+                .flat_map(|value| value.to_le_bytes())
+                .collect::<Vec<_>>();
+            let compressed = compress_zlib(&raw, 4)?;
+            fs::write(data_dir.join(format!("{forecast_hour}.{chunk_y}.{chunk_x}")), compressed)?;
+        }
+    }
+    Ok(data_dir)
+}
+
+fn compress_zlib(data: &[u8], level: u32) -> Result<Vec<u8>> {
+    use flate2::write::ZlibEncoder;
+    use flate2::Compression;
+    use std::io::Write;
+
+    let mut encoder = ZlibEncoder::new(Vec::new(), Compression::new(level));
+    encoder.write_all(data)?;
+    Ok(encoder.finish()?)
 }
 
 fn locate_spatial_point(model: &str, nx: usize, ny: usize, lat: f64, lon: f64) -> Result<GridPoint> {
@@ -1881,6 +2337,131 @@ fn units_for_variable(variable: &str) -> &'static str {
         "visibility" => "m",
         _ => "unknown",
     }
+}
+
+fn raw_variable_for_product(product: &str) -> Option<&'static str> {
+    match product {
+        "2m_temperature" => Some("temperature_2m"),
+        "2m_dewpoint" => Some("dew_point_2m"),
+        "2m_relative_humidity" | "2m_rh" => Some("relative_humidity_2m"),
+        "10m_wind_gusts" => Some("wind_gusts_10m"),
+        "total_qpf" => Some("precipitation"),
+        "mslp" | "mean_sea_level_pressure" | "mslp_10m_winds" => Some("pressure_msl"),
+        "cloud_cover" => Some("cloud_cover"),
+        "low_cloud_cover" => Some("cloud_cover_low"),
+        "middle_cloud_cover" => Some("cloud_cover_mid"),
+        "high_cloud_cover" => Some("cloud_cover_high"),
+        "precipitable_water" => Some("precipitable_water"),
+        "visibility" => Some("visibility"),
+        "sbcape" | "cape" => Some("cape"),
+        "sbcin" | "convective_inhibition" => Some("convective_inhibition"),
+        "composite_reflectivity" => Some("composite_reflectivity"),
+        "shortwave_radiation" => Some("shortwave_radiation"),
+        _ => None,
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WindowReducer {
+    Min,
+    Max,
+    Range,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct WindowedProduct {
+    raw_variable: &'static str,
+    start: u32,
+    end: u32,
+    reducer: WindowReducer,
+}
+
+fn parse_windowed_product(product: &str) -> Option<WindowedProduct> {
+    let (raw_variable, prefix) = if let Some(rest) = product.strip_prefix("2m_temp_") {
+        ("temperature_2m", rest)
+    } else if let Some(rest) = product.strip_prefix("2m_dewpoint_") {
+        ("dew_point_2m", rest)
+    } else if let Some(rest) = product.strip_prefix("2m_rh_") {
+        ("relative_humidity_2m", rest)
+    } else if let Some(rest) = product.strip_prefix("10m_wind_") {
+        ("wind_speed_10m", rest)
+    } else {
+        return None;
+    };
+
+    let (window, reducer) = if let Some(window) = prefix.strip_suffix("_max") {
+        (window, WindowReducer::Max)
+    } else if let Some(window) = prefix.strip_suffix("_min") {
+        (window, WindowReducer::Min)
+    } else if let Some(window) = prefix.strip_suffix("_range") {
+        (window, WindowReducer::Range)
+    } else {
+        return None;
+    };
+
+    let (start, end) = match window {
+        "1h" => (0, 1),
+        "0_24h" => (0, 24),
+        "0_48h" => (0, 48),
+        "24_48h" => (24, 48),
+        "run" => (0, 255),
+        _ => return None,
+    };
+    Some(WindowedProduct {
+        raw_variable,
+        start,
+        end,
+        reducer,
+    })
+}
+
+fn finite2(a: f32, b: f32) -> Option<(f32, f32)> {
+    (a.is_finite() && b.is_finite()).then_some((a, b))
+}
+
+fn finite3(a: f32, b: f32, c: f32) -> Option<(f32, f32, f32)> {
+    (a.is_finite() && b.is_finite() && c.is_finite()).then_some((a, b, c))
+}
+
+fn vapor_pressure_deficit_kpa(temp_c: f32, rh_pct: f32) -> f32 {
+    let es = 0.6108 * ((17.27 * temp_c) / (temp_c + 237.3)).exp();
+    es * (1.0 - (rh_pct / 100.0).clamp(0.0, 1.5))
+}
+
+fn heat_index_c(temp_c: f32, rh_pct: f32) -> f32 {
+    let temp_f = temp_c * 9.0 / 5.0 + 32.0;
+    if temp_f < 80.0 {
+        return temp_c;
+    }
+    let r = rh_pct;
+    let hi_f = -42.379
+        + 2.049_015_3 * temp_f
+        + 10.143_331 * r
+        - 0.224_755_4 * temp_f * r
+        - 0.006_837_83 * temp_f * temp_f
+        - 0.054_817_17 * r * r
+        + 0.001_228_74 * temp_f * temp_f * r
+        + 0.000_852_82 * temp_f * r * r
+        - 0.000_001_99 * temp_f * temp_f * r * r;
+    (hi_f - 32.0) * 5.0 / 9.0
+}
+
+fn wind_chill_c(temp_c: f32, wind_ms: f32) -> f32 {
+    let wind_kmh = wind_ms * 3.6;
+    if temp_c > 10.0 || wind_kmh < 4.8 {
+        return temp_c;
+    }
+    13.12 + 0.6215 * temp_c - 11.37 * wind_kmh.powf(0.16) + 0.3965 * temp_c * wind_kmh.powf(0.16)
+}
+
+fn apparent_temperature_c(temp_c: f32, rh_pct: f32, wind_ms: f32) -> f32 {
+    let es_hpa = 6.105 * ((17.27 * temp_c) / (237.7 + temp_c)).exp() * (rh_pct / 100.0);
+    temp_c + 0.33 * es_hpa - 0.70 * wind_ms - 4.0
+}
+
+fn wind_direction_deg(u_ms: f32, v_ms: f32) -> f32 {
+    let direction = 270.0 - v_ms.atan2(u_ms).to_degrees();
+    direction.rem_euclid(360.0)
 }
 
 fn normalize_spatial_values(variable: &str, values: &mut [f32]) {

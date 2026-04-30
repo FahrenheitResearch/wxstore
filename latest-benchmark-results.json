@@ -98,5 +98,95 @@
         "p95_ms":  24.913,
         "p99_ms":  30.887,
         "avg_mb":  3.961
+    },
+    {
+        "case":  "hrrr_materialized_derived_3vars_3h",
+        "requests":  30000,
+        "failed":  0,
+        "rps":  207.97,
+        "p50_ms":  874.076,
+        "p95_ms":  1569.277,
+        "p99_ms":  1916.183,
+        "avg_bytes":  1077.6
+    },
+    {
+        "case":  "gfs_materialized_derived_3vars_3h",
+        "requests":  30000,
+        "failed":  0,
+        "rps":  433.474,
+        "p50_ms":  403.878,
+        "p95_ms":  828.641,
+        "p99_ms":  1145.472,
+        "avg_bytes":  1060.0
+    },
+    {
+        "case":  "hrrr_materialized_vpd_grid_f000_bin",
+        "requests":  300,
+        "failed":  0,
+        "rps":  312.337,
+        "p50_ms":  50.104,
+        "p95_ms":  63.305,
+        "p99_ms":  71.188,
+        "avg_bytes":  7621020
+    },
+    {
+        "case":  "hrrr_virtual_2m_temp_window_max_0_2_grid_bin",
+        "requests":  300,
+        "failed":  0,
+        "rps":  252.639,
+        "p50_ms":  61.488,
+        "p95_ms":  79.333,
+        "p99_ms":  89.648,
+        "avg_bytes":  7621029
+    },
+    {
+        "case":  "hrrr_materialized_derived_3vars_3h_fixed",
+        "requests":  30000,
+        "failed":  0,
+        "rps":  7117.846,
+        "p50_ms":  25.491,
+        "p95_ms":  43.335,
+        "p99_ms":  51.803,
+        "avg_bytes":  1076.7
+    },
+    {
+        "case":  "gfs_materialized_derived_3vars_3h_fixed",
+        "requests":  30000,
+        "failed":  0,
+        "rps":  6279.971,
+        "p50_ms":  21.156,
+        "p95_ms":  38.375,
+        "p99_ms":  45.826,
+        "avg_bytes":  1059.3
+    },
+    {
+        "case":  "hrrr_materialized_vpd_grid_f000_bin_fixed",
+        "requests":  300,
+        "failed":  0,
+        "rps":  475.231,
+        "p50_ms":  32.452,
+        "p95_ms":  43.855,
+        "p99_ms":  50.979,
+        "avg_bytes":  7621024
+    },
+    {
+        "case":  "hrrr_surface_3vars_3h_after_cache",
+        "requests":  30000,
+        "failed":  0,
+        "rps":  14592.621,
+        "p50_ms":  5.665,
+        "p95_ms":  7.036,
+        "p99_ms":  8.44,
+        "avg_bytes":  1062.0
+    },
+    {
+        "case":  "hrrr_materialized_derived_3vars_3h_after_cache",
+        "requests":  30000,
+        "failed":  0,
+        "rps":  19319.122,
+        "p50_ms":  5.739,
+        "p95_ms":  7.265,
+        "p99_ms":  22.876,
+        "avg_bytes":  1076.1
     }
 ]
