@@ -2,6 +2,124 @@
 
 Date: 2026-04-30
 
+## Rustwx Map Layer Bridge
+
+This pass added the direct rustwx -> WxStore map layer path:
+
+- `rustwx_grid_export` exports raw rustwx map products as f32 grids plus lat/lon grids, exact crop coordinates, bounds, provenance fetch identities, and blockers.
+- `wxstore import-rustwx-grids` imports those grids into native `.wxa` dense2d spatial arrays.
+- WxStore serves those `.wxa` grids as Mapbox-compatible temporal raster layers through `/v1/mapbox/layers`, `/v1/mapbox/tilejson`, and `/v1/mapbox/tiles`.
+- Final PNG tile bytes are cached in-process by immutable tile key, so repeated Mapbox/CDN traffic serves pre-encoded bytes.
+
+Proof command:
+
+```powershell
+cargo run -p rustwx-cli --bin rustwx_grid_export -- `
+  --model hrrr `
+  --date 20260429 `
+  --cycle 6 `
+  --forecast-hour 1 `
+  --source aws `
+  --region southwest `
+  --all-supported `
+  --out-dir C:\Users\drew\rustwx\proof\wxstore_grid_export_all `
+  --cache-dir C:\Users\drew\rustwx\proof\wxstore_grid_export_cache
+```
+
+Result:
+
+| Step | Result |
+| --- | ---: |
+| Exported products | 84 one-hour SW CONUS layers |
+| Expected blockers | 45, mostly f024/f048 window products requested at f001 plus composite direct products |
+| rustwx export elapsed | 322.159 s |
+| Downloaded source ranges | 95 chunks / 223.49 MB |
+| Raw f32 export directory | 97.37 MB |
+| WxStore WXA import elapsed | 3.118 s |
+| Native WXA spatial root size after f001 all-layer import | 30.36 MB |
+
+The `--all-supported` sweep excludes heavy ECAPE unless `--include-heavy` is passed. With `--include-heavy`, the exporter also includes the ECAPE family slugs (`sbecape`, `mlecape`, `muecape`, ECAPE/CAPE ratios, `sbncape`, `sbecin`, `mlecin`, `ecape_scp`, `ecape_ehi_0_1km`, `ecape_ehi_0_3km`, and `ecape_stp`). ECAPE is intentionally opt-in because it is much more expensive than ordinary direct/derived/windowed maps.
+
+Layer proof:
+
+```text
+GET /v1/variables?model=hrrr&run=20260429_hrrr_06z
+  -> 84 variables
+
+GET /v1/mapbox/layers/hrrr/20260429_hrrr_06z/stp_fixed?hours=1&palette=severe&range=0,5
+  -> bounds [-128.9484, 28.1077, -106.5824, 44.1221]
+
+GET /v1/mapbox/tiles/hrrr/20260429_hrrr_06z/stp_fixed/f001/4/2/6.png?palette=severe&range=0,5
+  -> 200 image/png, nonblank
+```
+
+Merge-on-import was also verified with f002 for `2m_temperature`, `vpd_2m`, and `qpf_1h`. After importing the second hour, `vpd_2m` reports available hours `[1, 2]`, the Mapbox layer endpoint returns frames `f001` and `f002`, and the spatial root is 31.62 MB.
+
+Local release-server benchmark on `127.0.0.1:8899`:
+
+| Scenario | Requests | Concurrency | Failures | Req/s | P50 | P95 | P99 | Avg payload |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| Cached VPD Mapbox PNG tile, z5 | 30,000 | 192 | 0 | 19,364.4 | 4.85 ms | 5.56 ms | 6.19 ms | 115.6 KB |
+| Cached STP Mapbox PNG tile, z4 | 30,000 | 192 | 0 | 19,362.1 | 4.31 ms | 5.02 ms | 5.54 ms | 3.8 KB |
+| Mapbox layer metadata | 10,000 | 128 | 0 | 8,898.2 | 14.15 ms | 21.39 ms | 25.23 ms | 838 B |
+
+Before adding final PNG byte caching, the same dynamic z4 tile render path was about 1,711.6 req/s for a 49.9 KB tile. The cached path is the correct production/Mapbox/CDN path for immutable run URLs.
+
+### Latest Multi-Frame Load Test
+
+For freshness/comparison testing, a newer HRRR cycle was added:
+
+```text
+Run: 20260430_hrrr_15z
+Products: 2m_temperature, vpd_2m, composite_reflectivity
+Frames: f000, f001, f002, f003
+```
+
+Export timings from rustwx:
+
+| Forecast hour | Wall time | rustwx internal | Products | Blockers |
+| --- | ---: | ---: | ---: | ---: |
+| f000 | 20.807 s | 20.751 s | 3 | 0 |
+| f001 | 12.811 s | 12.750 s | 3 | 0 |
+| f002 | 17.679 s | 17.630 s | 3 | 0 |
+| f003 | 20.424 s | 20.375 s | 3 | 0 |
+
+Total export wall time was about 71.7 s for 12 product-hour grids. The raw f32 export bundle for the four frames was 21.62 MB.
+
+WxStore import timings into WXA:
+
+| Forecast hour | Wall time | import internal | Products |
+| --- | ---: | ---: | ---: |
+| f000 | 5.356 s | 115 ms | 3 |
+| f001 | 0.341 s | 200 ms | 3 |
+| f002 | 0.422 s | 281 ms | 3 |
+| f003 | 0.505 s | 369 ms | 3 |
+
+The first import paid Cargo startup/build overhead; the internal importer stayed under 0.4 s while merging frames. The resulting WXA run directory is 5.30 MB.
+
+First-load tile render after clearing the in-process tile cache:
+
+| Tile | First load | Payload |
+| --- | ---: | ---: |
+| `vpd_2m f000 z5/5/12` | 74.3 ms | 90.2 KB |
+| `vpd_2m f001 z5/5/12` | 44.6 ms | 58.5 KB |
+| `vpd_2m f002 z5/5/12` | 41.4 ms | 46.6 KB |
+| `vpd_2m f003 z5/5/12` | 45.1 ms | 43.2 KB |
+
+Clean endpoint benchmarks:
+
+| Scenario | Requests | Concurrency | Failures | Req/s | P50 | P95 | P99 | Avg payload |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| Cached `vpd_2m f003` PNG tile | 30,000 | 192 | 0 | 19,378.2 | 4.34 ms | 5.07 ms | 5.87 ms | 43.6 KB |
+| Mapbox layer metadata, 4 frames | 10,000 | 128 | 0 | 2,389.8 | 51.75 ms | 88.29 ms | 101.91 ms | 1.63 KB |
+| Variables metadata, latest run | 10,000 | 128 | 0 | 1,764.3 | 71.28 ms | 114.23 ms | 142.89 ms | 550 B |
+
+The local viewer now exposes both runs and has a compare mode:
+
+```text
+http://127.0.0.1:8899/
+```
+
 ## Current Product Inventory
 
 Rustwx HRRR capability inventory was generated with:

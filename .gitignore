@@ -1,5 +1,6 @@
 /target/
+/data/
 *.log
 *.tmp
 .env
-
+latest-northshift-*.json
