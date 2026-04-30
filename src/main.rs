@@ -653,6 +653,7 @@ const INDEX_HTML: &str = r#"<!doctype html>
     <div id="pickerMeta" class="picker-meta">Samples the selected layer/hour from the WxStore grid.</div>
   </div>
   <div class="panel">
+    <label>Model<select id="model"></select></label>
     <label>Run A<select id="runA"></select></label>
     <label>Run B<select id="runB"></select></label>
     <label class="wide">Layer<select id="layer"></select></label>
@@ -695,8 +696,8 @@ const INDEX_HTML: &str = r#"<!doctype html>
   </div>
   <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
   <script>
-    const MODEL = "hrrr";
     const els = {
+      model: document.getElementById("model"),
       runA: document.getElementById("runA"),
       runB: document.getElementById("runB"),
       layer: document.getElementById("layer"),
@@ -744,6 +745,7 @@ const INDEX_HTML: &str = r#"<!doctype html>
     let overlayA = null;
     let overlayB = null;
     let variablesByRun = {};
+    let modelInfoById = {};
     let runs = [];
     let pickerAbort = null;
     let pickerLastAt = 0;
@@ -819,7 +821,7 @@ const INDEX_HTML: &str = r#"<!doctype html>
       pickerAbort = new AbortController();
       setPickerWaiting(latlng, run);
       const params = new URLSearchParams({
-        model: MODEL,
+        model: els.model.value,
         run,
         variable: layer,
         forecast_hour: hour,
@@ -964,12 +966,38 @@ const INDEX_HTML: &str = r#"<!doctype html>
       }
     }
 
-    async function loadRunList() {
+    async function loadModelList() {
       const res = await fetch("/v1/models");
       if (!res.ok) throw new Error(`models failed: ${res.status}`);
       const data = await res.json();
-      const model = (data.spatial_loaded.models || []).find(item => item.id === MODEL);
-      runs = model ? model.runs : ["20260429_hrrr_06z"];
+      const models = data.spatial_loaded.models || [];
+      modelInfoById = {};
+      els.model.innerHTML = "";
+      for (const model of models) {
+        modelInfoById[model.id] = model;
+        const opt = document.createElement("option");
+        opt.value = model.id;
+        opt.textContent = model.id;
+        els.model.appendChild(opt);
+      }
+      if (models.some(item => item.id === "hrrr")) {
+        els.model.value = "hrrr";
+      } else if (models[0]) {
+        els.model.value = models[0].id;
+      } else {
+        const opt = document.createElement("option");
+        opt.value = "hrrr";
+        opt.textContent = "hrrr";
+        els.model.appendChild(opt);
+        els.model.value = "hrrr";
+      }
+      loadRunList();
+    }
+
+    function loadRunList() {
+      const model = modelInfoById[els.model.value];
+      variablesByRun = {};
+      runs = model ? (model.runs || []).slice() : ["20260429_hrrr_06z"];
       runs.sort();
       for (const select of [els.runA, els.runB]) {
         select.innerHTML = "";
@@ -985,12 +1013,13 @@ const INDEX_HTML: &str = r#"<!doctype html>
     }
 
     async function loadVariablesFor(run) {
-      if (variablesByRun[run]) return variablesByRun[run];
-      const res = await fetch(`/v1/variables?model=${MODEL}&run=${run}`);
+      const key = `${els.model.value}|${run}`;
+      if (variablesByRun[key]) return variablesByRun[key];
+      const res = await fetch(`/v1/variables?model=${els.model.value}&run=${run}`);
       if (!res.ok) throw new Error(`variables failed: ${res.status}`);
       const data = await res.json();
-      variablesByRun[run] = { hours: data.available_hours || {}, variables: data.variables || [] };
-      return variablesByRun[run];
+      variablesByRun[key] = { hours: data.available_hours || {}, variables: data.variables || [] };
+      return variablesByRun[key];
     }
 
     async function refreshLayerList() {
@@ -1033,7 +1062,7 @@ const INDEX_HTML: &str = r#"<!doctype html>
       if (!run || !layer || hour === "") return existingOverlay;
       const palette = els.palette.value === "auto" ? defaultsFor(layer)[0] : els.palette.value;
       const range = `${els.min.value},${els.max.value}`;
-      const url = `/v1/mapbox/layers/${MODEL}/${run}/${layer}?hours=${hour}&palette=${encodeURIComponent(palette)}&range=${encodeURIComponent(range)}&base_url=${encodeURIComponent(tileBase())}`;
+      const url = `/v1/mapbox/layers/${els.model.value}/${run}/${layer}?hours=${hour}&palette=${encodeURIComponent(palette)}&range=${encodeURIComponent(range)}&base_url=${encodeURIComponent(tileBase())}`;
       const res = await fetch(url);
       if (!res.ok) throw new Error(`${run} layer failed: ${res.status}`);
       const data = await res.json();
@@ -1060,9 +1089,13 @@ const INDEX_HTML: &str = r#"<!doctype html>
         overlayB = null;
       }
       const palette = els.palette.value === "auto" ? defaultsFor(els.layer.value)[0] : els.palette.value;
-      setStatus(`${els.layer.value} f${String(els.hour.value).padStart(3, "0")} | ${palette} ${els.min.value},${els.max.value} | A=${els.runA.value}${els.compare.checked ? " B=" + els.runB.value : ""}`);
+      setStatus(`${els.model.value} ${els.layer.value} f${String(els.hour.value).padStart(3, "0")} | ${palette} ${els.min.value},${els.max.value} | A=${els.runA.value}${els.compare.checked ? " B=" + els.runB.value : ""}`);
     }
 
+    els.model.addEventListener("change", () => {
+      loadRunList();
+      refreshLayerList().then(applyLayer).catch(err => setStatus(err.message));
+    });
     els.runA.addEventListener("change", () => refreshLayerList().then(applyLayer).catch(err => setStatus(err.message)));
     els.runB.addEventListener("change", () => refreshHours().then(applyLayer).catch(err => setStatus(err.message)));
     els.layer.addEventListener("change", () => refreshHours().then(applyLayer).catch(err => setStatus(err.message)));
@@ -1084,7 +1117,7 @@ const INDEX_HTML: &str = r#"<!doctype html>
         els.pickerMeta.textContent = "Samples the selected layer/hour from the WxStore grid.";
       });
     }
-    loadRunList().then(refreshLayerList).then(applyLayer).catch(err => setStatus(err.message));
+    loadModelList().then(refreshLayerList).then(applyLayer).catch(err => setStatus(err.message));
   </script>
 </body>
 </html>
@@ -3735,11 +3768,31 @@ impl SpatialLane {
         units.insert("time".to_string(), json!("iso8601"));
 
         for variable in variables {
-            units.insert(variable.clone(), json!(units_for_variable(variable)));
             let mut values = Vec::with_capacity(hours.len());
             for hour in hours {
                 let grid = self.read_grid(model, run, member, variable, *hour)?;
-                let point = locate_spatial_point(model, grid.nx, grid.ny, lat, lon)?;
+                units
+                    .entry(variable.clone())
+                    .or_insert_with(|| json!(grid.units.clone()));
+                let index = grid_index_for_latlon(&grid, lat, lon).ok_or_else(|| {
+                    anyhow!(
+                        "lat/lon is outside {} {} {} f{hour:03}",
+                        grid.model,
+                        grid.run_id,
+                        grid.variable
+                    )
+                })?;
+                let x = index % grid.nx;
+                let y = index / grid.nx;
+                let (grid_lat, grid_lon) = grid_latlon_at(&grid, x, y);
+                let point = GridPoint {
+                    x,
+                    y,
+                    index,
+                    lat: grid_lat,
+                    lon: grid_lon,
+                    sample: "nearest",
+                };
                 sampled_grid.get_or_insert(point);
                 let value = grid.values.get(point.index).copied().unwrap_or(f32::NAN);
                 if value.is_finite() {
@@ -4497,6 +4550,9 @@ fn grid_index_for_latlon(grid: &SpatialGrid, lat: f64, lon: f64) -> Option<usize
         }
         return Some(y as usize * grid.nx + x as usize);
     }
+    if let Some(index) = grid_index_from_geographic_meta(grid, lat, lon) {
+        return index;
+    }
     if !lat.is_finite() || !lon.is_finite() {
         return None;
     }
@@ -4509,6 +4565,120 @@ fn grid_index_for_latlon(grid: &SpatialGrid, lat: f64, lon: f64) -> Option<usize
         return None;
     }
     Some(y as usize * grid.nx + x.min(grid.nx - 1))
+}
+
+fn grid_index_from_geographic_meta(
+    grid: &SpatialGrid,
+    lat: f64,
+    lon: f64,
+) -> Option<Option<usize>> {
+    if !lat.is_finite() || !lon.is_finite() {
+        return Some(None);
+    }
+    match grid.grid_meta.get("type").and_then(Value::as_str)? {
+        "regular_latlon" => Some(regular_latlon_index(grid, lat, lon)),
+        "rectilinear_latlon" => Some(rectilinear_latlon_index(grid, lat, lon)),
+        "curvilinear_latlon_sampled" => Some(sampled_curvilinear_index(grid, lat, lon)),
+        _ => None,
+    }
+}
+
+fn regular_latlon_index(grid: &SpatialGrid, lat: f64, lon: f64) -> Option<usize> {
+    let lat_start = meta_f64(&grid.grid_meta, "lat_start")?;
+    let lon_start = meta_f64(&grid.grid_meta, "lon_start")?;
+    let lat_step = meta_f64(&grid.grid_meta, "lat_step").or_else(|| {
+        meta_f64(&grid.grid_meta, "lat_end")
+            .map(|lat_end| (lat_end - lat_start) / grid.ny.saturating_sub(1).max(1) as f64)
+    })?;
+    let lon_step = meta_f64(&grid.grid_meta, "lon_step").or_else(|| {
+        meta_f64(&grid.grid_meta, "lon_end")
+            .map(|lon_end| (lon_end - lon_start) / grid.nx.saturating_sub(1).max(1) as f64)
+    })?;
+    if lat_step == 0.0 || lon_step == 0.0 {
+        return None;
+    }
+    let y = ((lat - lat_start) / lat_step).round();
+    if y < 0.0 || y > (grid.ny.saturating_sub(1)) as f64 {
+        return None;
+    }
+    let mut x = ((unwrap_lon_near(lon, lon_start) - lon_start) / lon_step).round();
+    let lon_wrap = grid
+        .grid_meta
+        .get("lon_wrap")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+        || (lon_step.abs() * grid.nx as f64 - 360.0).abs() <= lon_step.abs().max(0.01) * 2.0;
+    if lon_wrap {
+        x = x.rem_euclid(grid.nx as f64);
+    } else if x < 0.0 || x > (grid.nx.saturating_sub(1)) as f64 {
+        return None;
+    }
+    let x = x as usize;
+    let y = y as usize;
+    Some(y * grid.nx + x.min(grid.nx.saturating_sub(1)))
+}
+
+fn rectilinear_latlon_index(grid: &SpatialGrid, lat: f64, lon: f64) -> Option<usize> {
+    let lat_axis = meta_f64_array(&grid.grid_meta, "lat_axis")?;
+    let lon_axis = meta_f64_array(&grid.grid_meta, "lon_axis")?;
+    if lat_axis.len() != grid.ny || lon_axis.len() != grid.nx {
+        return None;
+    }
+    let y = nearest_axis_index(&lat_axis, lat, false)?;
+    let lon_wrap = grid
+        .grid_meta
+        .get("lon_wrap")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let x = nearest_axis_index(&lon_axis, lon, lon_wrap)?;
+    Some(y * grid.nx + x)
+}
+
+fn sampled_curvilinear_index(grid: &SpatialGrid, lat: f64, lon: f64) -> Option<usize> {
+    let bounds = grid_bounds(grid);
+    if lat < bounds[1] - 0.25 || lat > bounds[3] + 0.25 {
+        return None;
+    }
+    if lon < bounds[0] - 0.25 || lon > bounds[2] + 0.25 {
+        return None;
+    }
+    let sample = grid.grid_meta.get("sample")?.as_object()?;
+    let sample_nx = sample.get("nx")?.as_u64()? as usize;
+    let sample_ny = sample.get("ny")?.as_u64()? as usize;
+    let xs = value_f64_array(sample.get("x")?)?;
+    let ys = value_f64_array(sample.get("y")?)?;
+    let lats = value_f64_array(sample.get("lat")?)?;
+    let lons = value_f64_array(sample.get("lon")?)?;
+    if xs.len() != sample_nx
+        || ys.len() != sample_ny
+        || lats.len() != sample_nx * sample_ny
+        || lons.len() != sample_nx * sample_ny
+    {
+        return None;
+    }
+
+    let mut best = None::<(usize, f64)>;
+    for (index, (&sample_lat, &sample_lon)) in lats.iter().zip(lons.iter()).enumerate() {
+        if !sample_lat.is_finite() || !sample_lon.is_finite() {
+            continue;
+        }
+        let dlat = sample_lat - lat;
+        let dlon = normalized_lon_delta(sample_lon - lon) * lat.to_radians().cos().abs().max(0.25);
+        let dist2 = dlat * dlat + dlon * dlon;
+        if best.is_none_or(|(_, best_dist)| dist2 < best_dist) {
+            best = Some((index, dist2));
+        }
+    }
+    let (sample_index, _) = best?;
+    let sample_x = sample_index % sample_nx;
+    let sample_y = sample_index / sample_nx;
+    let x = xs[sample_x]
+        .round()
+        .clamp(0.0, grid.nx.saturating_sub(1) as f64) as usize;
+    let y = ys[sample_y]
+        .round()
+        .clamp(0.0, grid.ny.saturating_sub(1) as f64) as usize;
+    Some(y * grid.nx + x)
 }
 
 fn grid_bounds(grid: &SpatialGrid) -> [f64; 4] {
@@ -4571,6 +4741,18 @@ fn grid_bounds(grid: &SpatialGrid) -> [f64; 4] {
         }
         return [west, south, east, north];
     }
+    if matches!(
+        grid.grid_meta.get("type").and_then(Value::as_str),
+        Some("regular_latlon" | "rectilinear_latlon" | "curvilinear_latlon_sampled")
+    ) {
+        if let Some(bounds) = grid
+            .grid_meta
+            .get("bounds")
+            .and_then(|value| serde_json::from_value::<[f64; 4]>(value.clone()).ok())
+        {
+            return bounds;
+        }
+    }
     [-180.0, -85.05112878, 180.0, 85.05112878]
 }
 
@@ -4597,9 +4779,186 @@ fn grid_latlon_at(grid: &SpatialGrid, x: usize, y: usize) -> (f64, f64) {
         let projected_y = hrrr.ny.saturating_sub(1).saturating_sub(y);
         return hrrr.latlon_at(x, projected_y);
     }
+    if let Some(latlon) = grid_latlon_from_geographic_meta(grid, x, y) {
+        return latlon;
+    }
     let lon = x as f64 * 360.0 / grid.nx.max(1) as f64 - 180.0;
     let lat = 90.0 - y as f64 * 180.0 / grid.ny.saturating_sub(1).max(1) as f64;
     (lat, lon)
+}
+
+fn grid_latlon_from_geographic_meta(grid: &SpatialGrid, x: usize, y: usize) -> Option<(f64, f64)> {
+    if x >= grid.nx || y >= grid.ny {
+        return None;
+    }
+    match grid.grid_meta.get("type").and_then(Value::as_str)? {
+        "regular_latlon" => {
+            let lat_start = meta_f64(&grid.grid_meta, "lat_start")?;
+            let lon_start = meta_f64(&grid.grid_meta, "lon_start")?;
+            let lat_step = meta_f64(&grid.grid_meta, "lat_step").or_else(|| {
+                meta_f64(&grid.grid_meta, "lat_end")
+                    .map(|lat_end| (lat_end - lat_start) / grid.ny.saturating_sub(1).max(1) as f64)
+            })?;
+            let lon_step = meta_f64(&grid.grid_meta, "lon_step").or_else(|| {
+                meta_f64(&grid.grid_meta, "lon_end")
+                    .map(|lon_end| (lon_end - lon_start) / grid.nx.saturating_sub(1).max(1) as f64)
+            })?;
+            let lat = lat_start + y as f64 * lat_step;
+            let lon = lon_start + x as f64 * lon_step;
+            Some((lat, normalize_lon(lon)))
+        }
+        "rectilinear_latlon" => {
+            let lat_axis = meta_f64_array(&grid.grid_meta, "lat_axis")?;
+            let lon_axis = meta_f64_array(&grid.grid_meta, "lon_axis")?;
+            Some((*lat_axis.get(y)?, normalize_lon(*lon_axis.get(x)?)))
+        }
+        "curvilinear_latlon_sampled" => sampled_curvilinear_latlon_at(grid, x, y),
+        _ => None,
+    }
+}
+
+fn sampled_curvilinear_latlon_at(grid: &SpatialGrid, x: usize, y: usize) -> Option<(f64, f64)> {
+    let sample = grid.grid_meta.get("sample")?.as_object()?;
+    let sample_nx = sample.get("nx")?.as_u64()? as usize;
+    let sample_ny = sample.get("ny")?.as_u64()? as usize;
+    let xs = value_f64_array(sample.get("x")?)?;
+    let ys = value_f64_array(sample.get("y")?)?;
+    let lats = value_f64_array(sample.get("lat")?)?;
+    let lons = value_f64_array(sample.get("lon")?)?;
+    if sample_nx < 2
+        || sample_ny < 2
+        || xs.len() != sample_nx
+        || ys.len() != sample_ny
+        || lats.len() != sample_nx * sample_ny
+        || lons.len() != sample_nx * sample_ny
+    {
+        return None;
+    }
+    let sx1 = upper_axis_index(&xs, x as f64).clamp(1, sample_nx - 1);
+    let sy1 = upper_axis_index(&ys, y as f64).clamp(1, sample_ny - 1);
+    let sx0 = sx1 - 1;
+    let sy0 = sy1 - 1;
+    let tx = fraction_between(xs[sx0], xs[sx1], x as f64);
+    let ty = fraction_between(ys[sy0], ys[sy1], y as f64);
+    let i00 = sy0 * sample_nx + sx0;
+    let i10 = sy0 * sample_nx + sx1;
+    let i01 = sy1 * sample_nx + sx0;
+    let i11 = sy1 * sample_nx + sx1;
+    let lat = bilerp(lats[i00], lats[i10], lats[i01], lats[i11], tx, ty);
+    let lon00 = lons[i00];
+    let lon = bilerp(
+        lon00,
+        lon00 + normalized_lon_delta(lons[i10] - lon00),
+        lon00 + normalized_lon_delta(lons[i01] - lon00),
+        lon00 + normalized_lon_delta(lons[i11] - lon00),
+        tx,
+        ty,
+    );
+    Some((lat, normalize_lon(lon)))
+}
+
+fn meta_f64(meta: &Value, key: &str) -> Option<f64> {
+    meta.get(key).and_then(Value::as_f64)
+}
+
+fn meta_f64_array(meta: &Value, key: &str) -> Option<Vec<f64>> {
+    value_f64_array(meta.get(key)?)
+}
+
+fn value_f64_array(value: &Value) -> Option<Vec<f64>> {
+    value
+        .as_array()?
+        .iter()
+        .map(Value::as_f64)
+        .collect::<Option<Vec<_>>>()
+}
+
+fn nearest_axis_index(axis: &[f64], value: f64, wraps: bool) -> Option<usize> {
+    if axis.is_empty() || !value.is_finite() {
+        return None;
+    }
+    if axis.len() == 1 {
+        return Some(0);
+    }
+    let mut target = if wraps {
+        unwrap_lon_near(value, axis[0])
+    } else {
+        value
+    };
+    let increasing = axis[axis.len() - 1] >= axis[0];
+    let first_step = (axis[1] - axis[0]).abs();
+    let last_step = (axis[axis.len() - 1] - axis[axis.len() - 2]).abs();
+    let lower = axis[0].min(axis[axis.len() - 1]) - first_step.max(last_step) * 0.5;
+    let upper = axis[0].max(axis[axis.len() - 1]) + first_step.max(last_step) * 0.5;
+    if wraps {
+        while target < lower {
+            target += 360.0;
+        }
+        while target > upper {
+            target -= 360.0;
+        }
+    }
+    if target < lower || target > upper {
+        return None;
+    }
+
+    let mut lo = 0usize;
+    let mut hi = axis.len();
+    while lo < hi {
+        let mid = (lo + hi) / 2;
+        if (increasing && axis[mid] < target) || (!increasing && axis[mid] > target) {
+            lo = mid + 1;
+        } else {
+            hi = mid;
+        }
+    }
+    let mut best = lo.min(axis.len() - 1);
+    if lo > 0 && (axis[lo - 1] - target).abs() <= (axis[best] - target).abs() {
+        best = lo - 1;
+    }
+    Some(best)
+}
+
+fn upper_axis_index(axis: &[f64], value: f64) -> usize {
+    if axis.len() < 2 {
+        return 0;
+    }
+    let increasing = axis[axis.len() - 1] >= axis[0];
+    let mut lo = 0usize;
+    let mut hi = axis.len();
+    while lo < hi {
+        let mid = (lo + hi) / 2;
+        if (increasing && axis[mid] < value) || (!increasing && axis[mid] > value) {
+            lo = mid + 1;
+        } else {
+            hi = mid;
+        }
+    }
+    lo.min(axis.len() - 1)
+}
+
+fn fraction_between(a: f64, b: f64, value: f64) -> f64 {
+    if (b - a).abs() < f64::EPSILON {
+        0.0
+    } else {
+        ((value - a) / (b - a)).clamp(0.0, 1.0)
+    }
+}
+
+fn bilerp(v00: f64, v10: f64, v01: f64, v11: f64, tx: f64, ty: f64) -> f64 {
+    let top = v00 + (v10 - v00) * tx;
+    let bottom = v01 + (v11 - v01) * tx;
+    top + (bottom - top) * ty
+}
+
+fn unwrap_lon_near(mut lon: f64, reference: f64) -> f64 {
+    while lon - reference > 180.0 {
+        lon -= 360.0;
+    }
+    while lon - reference <= -180.0 {
+        lon += 360.0;
+    }
+    lon
 }
 
 fn wind_query_bounds(query: &WindFieldQuery) -> Result<Option<[f64; 4]>, ApiError> {
@@ -4663,7 +5022,10 @@ fn grid_meta_from_latlon(
             let y_start = (yf / hrrr.dy).round().max(0.0) as usize;
             (x_start, y_start, x_start + nx, y_start + ny)
         };
-        let bounds = record.bounds.or_else(|| bounds_from_latlon(lat, lon));
+        let bounds = record
+            .bounds
+            .map(normalize_bounds)
+            .or_else(|| bounds_from_latlon(lat, lon));
         return json!({
             "type": "hrrr_lambert_crop",
             "nx": nx,
@@ -4684,7 +5046,243 @@ fn grid_meta_from_latlon(
             "lov": hrrr.lov
         });
     }
+    if !lat.is_empty() && lat.len() == nx * ny && lon.len() == nx * ny {
+        let bounds = record
+            .bounds
+            .map(normalize_bounds)
+            .or_else(|| bounds_from_latlon(lat, lon));
+        let corners = corners_from_latlon(nx, ny, lat, lon);
+        if let Some((lat_axis, lon_axis)) = rectilinear_axes_from_latlon(nx, ny, lat, lon) {
+            let lon_wrap = longitude_axis_wraps(&lon_axis);
+            if let (Some(lat_step), Some(lon_step)) =
+                (linear_axis_step(&lat_axis), linear_axis_step(&lon_axis))
+            {
+                return json!({
+                    "type": "regular_latlon",
+                    "nx": nx,
+                    "ny": ny,
+                    "bounds": bounds,
+                    "corners": corners,
+                    "lat_start": lat_axis[0],
+                    "lat_end": lat_axis[lat_axis.len() - 1],
+                    "lon_start": lon_axis[0],
+                    "lon_end": lon_axis[lon_axis.len() - 1],
+                    "lat_step": lat_step,
+                    "lon_step": lon_step,
+                    "lon_wrap": lon_wrap,
+                    "monotonic": {
+                        "lat_y": axis_direction(&lat_axis),
+                        "lon_x": axis_direction(&lon_axis)
+                    },
+                    "sample_strategy": "regular_nearest"
+                });
+            }
+            return json!({
+                "type": "rectilinear_latlon",
+                "nx": nx,
+                "ny": ny,
+                "bounds": bounds,
+                "corners": corners,
+                "lat_axis": lat_axis,
+                "lon_axis": lon_axis,
+                "lon_wrap": lon_wrap,
+                "monotonic": {
+                    "lat_y": axis_direction(&lat_axis),
+                    "lon_x": axis_direction(&lon_axis)
+                },
+                "sample_strategy": "rectilinear_nearest"
+            });
+        }
+        return sampled_curvilinear_meta(nx, ny, lat, lon, bounds, corners);
+    }
     spatial_grid_meta(model, nx, ny)
+}
+
+fn rectilinear_axes_from_latlon(
+    nx: usize,
+    ny: usize,
+    lat: &[f32],
+    lon: &[f32],
+) -> Option<(Vec<f64>, Vec<f64>)> {
+    if nx == 0 || ny == 0 || lat.len() != nx * ny || lon.len() != nx * ny {
+        return None;
+    }
+    let tolerance = 0.01;
+    let mut lat_axis = Vec::with_capacity(ny);
+    for y in 0..ny {
+        let row = &lat[y * nx..(y + 1) * nx];
+        let first = row.first().copied()? as f64;
+        if !first.is_finite() {
+            return None;
+        }
+        if row
+            .iter()
+            .any(|value| !value.is_finite() || ((*value as f64) - first).abs() > tolerance)
+        {
+            return None;
+        }
+        lat_axis.push(first);
+    }
+    let mut lon_axis = Vec::with_capacity(nx);
+    for x in 0..nx {
+        let value = lon[x] as f64;
+        if !value.is_finite() {
+            return None;
+        }
+        let reference = lon_axis.last().copied().unwrap_or(value);
+        lon_axis.push(unwrap_lon_near(value, reference));
+    }
+    for y in 0..ny {
+        for x in 0..nx {
+            let index = y * nx + x;
+            if ((lat[index] as f64) - lat_axis[y]).abs() > tolerance
+                || normalized_lon_delta(lon[index] as f64 - lon_axis[x]).abs() > tolerance
+            {
+                return None;
+            }
+        }
+    }
+    if !axis_is_monotonic(&lat_axis) || !axis_is_monotonic(&lon_axis) {
+        return None;
+    }
+    Some((lat_axis, lon_axis))
+}
+
+fn axis_is_monotonic(axis: &[f64]) -> bool {
+    if axis.len() < 2 {
+        return true;
+    }
+    let increasing = axis[axis.len() - 1] >= axis[0];
+    axis.windows(2).all(|pair| {
+        if increasing {
+            pair[1] >= pair[0]
+        } else {
+            pair[1] <= pair[0]
+        }
+    })
+}
+
+fn axis_direction(axis: &[f64]) -> &'static str {
+    if axis.len() < 2 {
+        "constant"
+    } else if axis[axis.len() - 1] >= axis[0] {
+        "increasing"
+    } else {
+        "decreasing"
+    }
+}
+
+fn linear_axis_step(axis: &[f64]) -> Option<f64> {
+    if axis.len() < 2 {
+        return Some(0.0);
+    }
+    let step = (axis[axis.len() - 1] - axis[0]) / axis.len().saturating_sub(1) as f64;
+    if step == 0.0 {
+        return None;
+    }
+    let tolerance = step.abs().max(1.0) * 0.001;
+    axis.iter()
+        .enumerate()
+        .all(|(index, value)| (*value - (axis[0] + index as f64 * step)).abs() <= tolerance)
+        .then_some(step)
+}
+
+fn longitude_axis_wraps(axis: &[f64]) -> bool {
+    if axis.len() < 2 {
+        return false;
+    }
+    let span = (axis[axis.len() - 1] - axis[0]).abs();
+    let step = span / axis.len().saturating_sub(1) as f64;
+    (span + step - 360.0).abs() <= step.max(0.01) * 2.0
+}
+
+fn sampled_curvilinear_meta(
+    nx: usize,
+    ny: usize,
+    lat: &[f32],
+    lon: &[f32],
+    bounds: Option<[f64; 4]>,
+    corners: Value,
+) -> Value {
+    let xs = sample_positions(nx, 33);
+    let ys = sample_positions(ny, 33);
+    let mut sample_lat = Vec::with_capacity(xs.len() * ys.len());
+    let mut sample_lon = Vec::with_capacity(xs.len() * ys.len());
+    for &y in &ys {
+        for &x in &xs {
+            let index = y * nx + x;
+            sample_lat.push(lat[index] as f64);
+            sample_lon.push(normalize_lon(lon[index] as f64));
+        }
+    }
+    json!({
+        "type": "curvilinear_latlon_sampled",
+        "nx": nx,
+        "ny": ny,
+        "bounds": bounds,
+        "corners": corners,
+        "monotonic": edge_monotonic_from_latlon(nx, ny, lat, lon),
+        "sample_strategy": "sampled_control_mesh_nearest",
+        "sample": {
+            "nx": xs.len(),
+            "ny": ys.len(),
+            "x": xs,
+            "y": ys,
+            "lat": sample_lat,
+            "lon": sample_lon
+        }
+    })
+}
+
+fn edge_monotonic_from_latlon(nx: usize, ny: usize, lat: &[f32], lon: &[f32]) -> Value {
+    let top_lon = (0..nx)
+        .map(|x| unwrap_lon_near(lon[x] as f64, lon[0] as f64))
+        .collect::<Vec<_>>();
+    let bottom_offset = ny.saturating_sub(1) * nx;
+    let bottom_lon = (0..nx)
+        .map(|x| unwrap_lon_near(lon[bottom_offset + x] as f64, lon[bottom_offset] as f64))
+        .collect::<Vec<_>>();
+    let left_lat = (0..ny).map(|y| lat[y * nx] as f64).collect::<Vec<_>>();
+    let right_lat = (0..ny)
+        .map(|y| lat[y * nx + nx.saturating_sub(1)] as f64)
+        .collect::<Vec<_>>();
+    json!({
+        "top_lon_x": axis_is_monotonic(&top_lon).then(|| axis_direction(&top_lon)),
+        "bottom_lon_x": axis_is_monotonic(&bottom_lon).then(|| axis_direction(&bottom_lon)),
+        "left_lat_y": axis_is_monotonic(&left_lat).then(|| axis_direction(&left_lat)),
+        "right_lat_y": axis_is_monotonic(&right_lat).then(|| axis_direction(&right_lat))
+    })
+}
+
+fn sample_positions(len: usize, max_count: usize) -> Vec<usize> {
+    if len == 0 {
+        return Vec::new();
+    }
+    if len <= max_count {
+        return (0..len).collect();
+    }
+    let count = max_count.max(2);
+    let mut positions = Vec::with_capacity(count);
+    for index in 0..count {
+        let value = (index as f64 * (len - 1) as f64 / (count - 1) as f64).round() as usize;
+        if positions.last().copied() != Some(value) {
+            positions.push(value);
+        }
+    }
+    positions
+}
+
+fn corners_from_latlon(nx: usize, ny: usize, lat: &[f32], lon: &[f32]) -> Value {
+    let point = |x: usize, y: usize| {
+        let index = y * nx + x;
+        json!({"lat": lat[index] as f64, "lon": normalize_lon(lon[index] as f64), "x": x, "y": y})
+    };
+    json!({
+        "top_left": point(0, 0),
+        "top_right": point(nx.saturating_sub(1), 0),
+        "bottom_left": point(0, ny.saturating_sub(1)),
+        "bottom_right": point(nx.saturating_sub(1), ny.saturating_sub(1))
+    })
 }
 
 fn bounds_from_latlon(lat: &[f32], lon: &[f32]) -> Option<[f64; 4]> {
@@ -4695,7 +5293,7 @@ fn bounds_from_latlon(lat: &[f32], lon: &[f32]) -> Option<[f64; 4]> {
     let mut found = false;
     for (&lat, &lon) in lat.iter().zip(lon) {
         let lat = lat as f64;
-        let lon = lon as f64;
+        let lon = normalize_lon(lon as f64);
         if lat.is_finite() && lon.is_finite() {
             west = west.min(lon);
             east = east.max(lon);
@@ -4705,6 +5303,17 @@ fn bounds_from_latlon(lat: &[f32], lon: &[f32]) -> Option<[f64; 4]> {
         }
     }
     found.then_some([west, south, east, north])
+}
+
+fn normalize_bounds(bounds: [f64; 4]) -> [f64; 4] {
+    let west = normalize_lon(bounds[0]);
+    let east = normalize_lon(bounds[2]);
+    [
+        west.min(east),
+        bounds[1].min(bounds[3]),
+        west.max(east),
+        bounds[1].max(bounds[3]),
+    ]
 }
 
 fn default_range_for_variable(variable: &str, values: &[f32]) -> (f32, f32) {
@@ -5028,6 +5637,7 @@ fn compress_zlib(data: &[u8], level: u32) -> Result<Vec<u8>> {
     Ok(encoder.finish()?)
 }
 
+#[allow(dead_code)]
 fn locate_spatial_point(
     model: &str,
     nx: usize,
@@ -5095,7 +5705,9 @@ fn units_for_variable(variable: &str) -> &'static str {
         return units_for_variable(window.raw_variable);
     }
     match variable {
-        "temperature_2m"
+        "2m_temperature"
+        | "2m_dewpoint"
+        | "temperature_2m"
         | "dew_point_2m"
         | "dewpoint_depression_2m"
         | "heat_index_2m"
@@ -5113,6 +5725,9 @@ fn units_for_variable(variable: &str) -> &'static str {
         "pressure_msl" | "surface_pressure" => "hPa",
         "wind_speed_10m"
         | "wind_gusts_10m"
+        | "10m_wind_gusts"
+        | "wind_u_10m_ms"
+        | "wind_v_10m_ms"
         | "u_component_of_wind_10m"
         | "v_component_of_wind_10m"
         | "wind_speed"
@@ -5125,7 +5740,7 @@ fn units_for_variable(variable: &str) -> &'static str {
         "shortwave_radiation" | "direct_radiation" | "diffuse_radiation" => "W/m^2",
         "cape" | "convective_inhibition" => "J/kg",
         "visibility" => "m",
-        "vpd_2m" => "kPa",
+        "vpd_2m" => "hPa",
         _ => "unknown",
     }
 }

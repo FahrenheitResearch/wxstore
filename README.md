@@ -49,6 +49,45 @@ C:\Users\drew\wxstore\target\release\wxstore.exe serve `
 | `ecmwf_ens` | `20260412_00z`, member `001` | local sparse lead coverage: `f003` |
 | `hrrr` | `20260429T06Z` | temporal pressure profile + diagnostics, `f000-f048` |
 
+## Import Rustwx Grid Exports
+
+The production bridge is `rustwx -> f32 grid export -> WxStore WXA import`.
+This is model-agnostic for any model rustwx can export today. Current rustwx
+model IDs are:
+
+```text
+hrrr
+gfs
+rrfs / rrfs-a
+ecmwf-open-data
+wrf-gdex
+```
+
+Example GFS smoke import:
+
+```powershell
+cargo run -p rustwx-cli --bin rustwx_grid_export -- `
+  --model gfs `
+  --date 20260430 `
+  --cycle 12 `
+  --forecast-hour 0 `
+  --source aws `
+  --region conus `
+  --bounds=-125.0,-66.0,24.0,50.0 `
+  --product 2m_temperature,wind_u_10m_ms,wind_v_10m_ms `
+  --out-dir C:\Users\drew\rustwx\proof\wxstore_multimodel_gfs_smoke `
+  --cache-dir C:\Users\drew\rustwx\proof\wxstore_grid_export_cache
+
+C:\Users\drew\wxstore\target\release\wxstore.exe import-rustwx-grids `
+  --manifest C:\Users\drew\rustwx\proof\wxstore_multimodel_gfs_smoke\20260430_gfs_12z\conus_f000\manifest.json `
+  --spatial-root C:\Users\drew\wxstore\data\rustwx_layers_all
+```
+
+Imported WXA files preserve geographic metadata from the rustwx lat/lon grid:
+regular lat/lon, rectilinear lat/lon, HRRR Lambert crops, or a compact sampled
+curvilinear fallback. Existing WXA files need to be re-imported to gain the new
+metadata.
+
 ## Materialize Native WXA Products
 
 ```powershell
