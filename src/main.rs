@@ -1,5 +1,5 @@
 use std::{
-    collections::{BTreeMap, HashMap, VecDeque},
+    collections::{BTreeMap, BTreeSet, HashMap, VecDeque},
     fs::{self, File},
     net::SocketAddr,
     path::{Path, PathBuf},
@@ -102,6 +102,8 @@ struct ServeArgs {
     profile_store: PathBuf,
     #[arg(long)]
     diagnostic_store: Option<PathBuf>,
+    #[arg(long)]
+    spatial_root: Option<PathBuf>,
     #[arg(long, default_value = "127.0.0.1")]
     host: String,
     #[arg(long, default_value_t = 8897)]
@@ -114,6 +116,8 @@ struct InspectArgs {
     profile_store: PathBuf,
     #[arg(long)]
     diagnostic_store: Option<PathBuf>,
+    #[arg(long)]
+    spatial_root: Option<PathBuf>,
 }
 
 #[tokio::main]
@@ -128,9 +132,18 @@ async fn main() -> Result<()> {
                 .as_ref()
                 .map(|path| DiagnosticLane::open(path))
                 .transpose()?;
+            let spatial = args
+                .spatial_root
+                .as_ref()
+                .map(|path| SpatialLane::open(path))
+                .transpose()?;
             println!(
                 "{}",
-                serde_json::to_string_pretty(&store_status(&profile, diagnostic.as_ref()))?
+                serde_json::to_string_pretty(&store_status(
+                    &profile,
+                    diagnostic.as_ref(),
+                    spatial.as_ref()
+                ))?
             );
             Ok(())
         }
@@ -146,12 +159,22 @@ async fn serve(args: ServeArgs) -> Result<()> {
             .map(|path| DiagnosticLane::open(path))
             .transpose()
             .map(|lane| lane.map(Arc::new))?,
+        spatial: args
+            .spatial_root
+            .as_ref()
+            .map(|path| SpatialLane::open(path))
+            .transpose()
+            .map(|lane| lane.map(Arc::new))?,
         cache: RwLock::new(ResponseCache::default()),
     });
 
     let app = Router::new()
         .route("/v1/status", get(status))
         .route("/api/status", get(status))
+        .route("/v1/models", get(models))
+        .route("/v1/variables", get(variables))
+        .route("/v1/grid", get(grid_field))
+        .route("/v1/forecast", get(forecast))
         .route("/v1/latest/{model}/{domain}", get(latest))
         .route("/v1/resolve", get(resolve))
         .route("/v1/temporal-sounding", get(temporal_sounding))
@@ -178,6 +201,7 @@ async fn serve(args: ServeArgs) -> Result<()> {
 struct AppState {
     profile: Arc<ProfileLane>,
     diagnostic: Option<Arc<DiagnosticLane>>,
+    spatial: Option<Arc<SpatialLane>>,
     cache: RwLock<ResponseCache>,
 }
 
@@ -227,6 +251,40 @@ struct PointQuery {
 }
 
 #[derive(Debug, Deserialize)]
+struct ModelRunQuery {
+    model: String,
+    run: Option<String>,
+    member: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct GridQuery {
+    model: String,
+    variable: String,
+    forecast_hour: Option<u32>,
+    run: Option<String>,
+    member: Option<String>,
+    members: Option<String>,
+    format: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ForecastQuery {
+    lat: Option<f64>,
+    lon: Option<f64>,
+    latitude: Option<f64>,
+    longitude: Option<f64>,
+    model: Option<String>,
+    models: Option<String>,
+    run: Option<String>,
+    member: Option<String>,
+    members: Option<String>,
+    hourly: Option<String>,
+    forecast_hours: Option<String>,
+    hours: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
 struct CanonicalQuery {
     hours: Option<String>,
     forecast_hours: Option<String>,
@@ -241,7 +299,11 @@ struct CanonicalQuery {
 type ApiError = (StatusCode, Json<Value>);
 
 async fn status(State(state): State<Arc<AppState>>) -> Json<Value> {
-    Json(store_status(&state.profile, state.diagnostic.as_deref()))
+    Json(store_status(
+        &state.profile,
+        state.diagnostic.as_deref(),
+        state.spatial.as_deref(),
+    ))
 }
 
 async fn latest(
@@ -261,10 +323,154 @@ async fn latest(
         "products": {
             "profile_pressure_core": "ready",
             "diag_scalar_basic": if state.diagnostic.is_some() { "ready_sparse_v0" } else { "unavailable" },
-            "surface_ts": "unavailable"
+            "surface_spatial": if state.spatial.is_some() { "ready" } else { "unavailable" }
         },
         "canonical_run_url": format!("/v1/runs/{}/{}/{}", manifest.model, manifest.domain, manifest.run_id),
     })))
+}
+
+async fn models(State(state): State<Arc<AppState>>) -> Json<Value> {
+    let spatial = state.spatial.as_deref().map(SpatialLane::models_json);
+    Json(json!({
+        "schema": "wxstore.models.v1",
+        "profile_loaded": {
+            "model": state.profile.manifest.model,
+            "domain": state.profile.manifest.domain,
+            "run_id": state.profile.manifest.run_id,
+            "products": ["temporal_sounding", "point_bin"]
+        },
+        "spatial_loaded": spatial.unwrap_or_else(|| json!({"status": "unavailable"})),
+        "science_engine_scope": {
+            "current_profile_lane": ["hrrr"],
+            "current_spatial_surface_lanes": state.spatial.as_deref().map(SpatialLane::model_ids).unwrap_or_default(),
+            "designed_for": ["hrrr", "gfs", "nam", "rap", "rrfs", "ecmwf_ifs", "ecmwf_ens", "ai_model_outputs"]
+        }
+    }))
+}
+
+async fn variables(
+    State(state): State<Arc<AppState>>,
+    Query(query): Query<ModelRunQuery>,
+) -> Result<Json<Value>, ApiError> {
+    let Some(spatial) = state.spatial.as_deref() else {
+        return Err(not_found("spatial lane is not configured"));
+    };
+    let run = spatial.resolve_run(&query.model, query.run.as_deref())?;
+    let member = query.member.as_deref();
+    Ok(Json(spatial.variables_json(&query.model, &run, member)?))
+}
+
+async fn grid_field(
+    State(state): State<Arc<AppState>>,
+    Query(query): Query<GridQuery>,
+) -> Result<Response, ApiError> {
+    let Some(spatial) = state.spatial.clone() else {
+        return Err(not_found("spatial lane is not configured"));
+    };
+    let format = query.format.as_deref().unwrap_or("json");
+    let model = query.model;
+    let variable = query.variable;
+    let run = spatial.resolve_run(&model, query.run.as_deref())?;
+    let member = query.member.or(query.members.and_then(|value| {
+        value
+            .split(',')
+            .next()
+            .map(str::trim)
+            .filter(|item| !item.is_empty())
+            .map(str::to_string)
+    }));
+    let hour = query.forecast_hour.unwrap_or(0);
+    let read = tokio::task::spawn_blocking(move || {
+        spatial.read_grid(&model, &run, member.as_deref(), &variable, hour)
+    })
+    .await
+    .map_err(|err| internal_error(format!("join error: {err}")))?
+    .map_err(|err| bad_request(err.to_string()))?;
+
+    if format == "bin" {
+        let mut body = Vec::with_capacity(read.values.len() * 4);
+        for value in read.values.iter() {
+            body.extend_from_slice(&value.to_le_bytes());
+        }
+        let mut response = Bytes::from(body).into_response();
+        let headers = response.headers_mut();
+        headers.insert(header::CONTENT_TYPE, HeaderValue::from_static("application/octet-stream"));
+        insert_header(headers, "x-wxstore-model", &read.model);
+        insert_header(headers, "x-wxstore-run-id", &read.run_id);
+        insert_header(headers, "x-wxstore-variable", &read.variable);
+        insert_header(headers, "x-wxstore-units", &read.units);
+        insert_header(headers, "x-wxstore-nx", &read.nx.to_string());
+        insert_header(headers, "x-wxstore-ny", &read.ny.to_string());
+        insert_header(headers, "x-wxstore-forecast-hour", &read.forecast_hour.to_string());
+        if let Some(member) = &read.member {
+            insert_header(headers, "x-wxstore-member", member);
+        }
+        headers.insert(
+            "access-control-expose-headers",
+            HeaderValue::from_static("x-wxstore-model,x-wxstore-run-id,x-wxstore-variable,x-wxstore-units,x-wxstore-nx,x-wxstore-ny,x-wxstore-forecast-hour,x-wxstore-member"),
+        );
+        return Ok(response);
+    }
+
+    Ok(Json(json!({
+        "schema": "wxstore.grid.v1",
+        "model": read.model,
+        "run_id": read.run_id,
+        "member": read.member,
+        "variable": read.variable,
+        "units": read.units,
+        "forecast_hour": read.forecast_hour,
+        "nx": read.nx,
+        "ny": read.ny,
+        "grid": read.grid_meta(),
+        "data": read.values.as_ref()
+    }))
+    .into_response())
+}
+
+async fn forecast(
+    State(state): State<Arc<AppState>>,
+    Query(query): Query<ForecastQuery>,
+) -> Result<Json<Value>, ApiError> {
+    let Some(spatial) = state.spatial.clone() else {
+        return Err(not_found("spatial lane is not configured"));
+    };
+    let lat = query.lat.or(query.latitude).ok_or_else(|| bad_request("latitude is required"))?;
+    let lon = query.lon.or(query.longitude).ok_or_else(|| bad_request("longitude is required"))?;
+    let model = query.model.or(query.models).unwrap_or_else(|| "hrrr".to_string());
+    let run = spatial.resolve_run(&model, query.run.as_deref())?;
+    let member = query.member.or(query.members.and_then(|value| {
+        value
+            .split(',')
+            .next()
+            .map(str::trim)
+            .filter(|item| !item.is_empty())
+            .map(str::to_string)
+    }));
+    let variables = split_csv(
+        query
+            .hourly
+            .as_deref()
+            .unwrap_or("temperature_2m,dew_point_2m,wind_gusts_10m"),
+    );
+    if variables.is_empty() {
+        return Err(bad_request("hourly must list at least one variable"));
+    }
+    let hours = query
+        .forecast_hours
+        .or(query.hours)
+        .map(|value| parse_hours_u32(&value))
+        .transpose()
+        .map_err(bad_anyhow)?
+        .unwrap_or_else(|| vec![0, 1, 2]);
+
+    let read = tokio::task::spawn_blocking(move || {
+        spatial.forecast_point(&model, &run, member.as_deref(), lat, lon, &variables, &hours)
+    })
+    .await
+    .map_err(|err| internal_error(format!("join error: {err}")))?
+    .map_err(|err| bad_request(err.to_string()))?;
+    Ok(Json(read))
 }
 
 async fn resolve(
@@ -433,22 +639,30 @@ async fn binary_response_for_point(
     ))
 }
 
-fn store_status(profile: &ProfileLane, diagnostic: Option<&DiagnosticLane>) -> Value {
+fn store_status(
+    profile: &ProfileLane,
+    diagnostic: Option<&DiagnosticLane>,
+    spatial: Option<&SpatialLane>,
+) -> Value {
     json!({
         "schema": "wxstore.status.v1",
         "service": "wxstore",
         "ok": true,
-        "loaded_run": run_manifest_json(profile, diagnostic),
+        "loaded_run": run_manifest_json(profile, diagnostic, spatial),
         "lanes": {
             "profile_pressure_core": profile.lane_manifest_json(),
             "diag_scalar_basic": diagnostic.map(DiagnosticLane::lane_manifest_json).unwrap_or_else(|| json!({"status": "unavailable"})),
-            "surface_ts": {"status": "unavailable", "reason": "surface 0-48 lane not built on this node"}
+            "surface_spatial": spatial.map(SpatialLane::lane_manifest_json).unwrap_or_else(|| json!({"status": "unavailable"}))
         },
         "cache": {"entries_limit": CACHE_LIMIT}
     })
 }
 
-fn run_manifest_json(profile: &ProfileLane, diagnostic: Option<&DiagnosticLane>) -> Value {
+fn run_manifest_json(
+    profile: &ProfileLane,
+    diagnostic: Option<&DiagnosticLane>,
+    spatial: Option<&SpatialLane>,
+) -> Value {
     let manifest = &profile.manifest;
     json!({
         "schema": "wxstore.run.v1",
@@ -475,14 +689,15 @@ fn run_manifest_json(profile: &ProfileLane, diagnostic: Option<&DiagnosticLane>)
         "lanes": [
             {"id": "profile_pressure_core", "status": "complete"},
             {"id": "diag_scalar_basic", "status": if diagnostic.is_some() { "ready_sparse_v0" } else { "unavailable" }},
-            {"id": "surface_ts", "status": "unavailable"}
+            {"id": "surface_spatial", "status": if spatial.is_some() { "ready" } else { "unavailable" }}
         ],
         "provenance": {
             "builder": "wxstore v0 from custom .wxp lane",
-            "source": "rustwx/orwx generated HRRR profile lane",
+            "source": "rustwx-generated model lanes and local model-run stores",
             "notes": [
                 "No Open-Meteo file format or code is used by this service.",
-                "Diagnostic lane currently wraps a sparse precomputed diagnostic brick until dense diagnostics are built."
+                "Diagnostic lane currently wraps a sparse precomputed diagnostic brick until dense diagnostics are built.",
+                "Spatial lane is a read-only adapter for local model-run spatial arrays until native WXA spatial files are built."
             ]
         }
     })
@@ -1164,6 +1379,549 @@ fn parse_wxp_index(mmap: &[u8], header: WxpHeader) -> Result<Vec<WxpIndexRecord>
     Ok(records)
 }
 
+#[derive(Debug, Clone, Deserialize)]
+struct ZarrArrayMeta {
+    shape: Vec<usize>,
+    chunks: Vec<usize>,
+    dtype: String,
+    compressor: Option<ZarrCompressor>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct ZarrCompressor {
+    id: String,
+}
+
+struct SpatialLane {
+    root: PathBuf,
+    grid_cache: RwLock<HashMap<String, Arc<SpatialGrid>>>,
+}
+
+#[derive(Clone)]
+struct SpatialGrid {
+    model: String,
+    run_id: String,
+    member: Option<String>,
+    variable: String,
+    units: String,
+    forecast_hour: u32,
+    nx: usize,
+    ny: usize,
+    values: Arc<Vec<f32>>,
+}
+
+impl SpatialGrid {
+    fn grid_meta(&self) -> Value {
+        spatial_grid_meta(&self.model, self.nx, self.ny)
+    }
+}
+
+impl SpatialLane {
+    fn open(root: &Path) -> Result<Self> {
+        if !root.is_dir() {
+            bail!("spatial root does not exist: {}", root.display());
+        }
+        Ok(Self {
+            root: root.to_path_buf(),
+            grid_cache: RwLock::new(HashMap::new()),
+        })
+    }
+
+    fn model_ids(&self) -> Vec<String> {
+        list_dirs(&self.root)
+    }
+
+    fn lane_manifest_json(&self) -> Value {
+        let models = self
+            .model_ids()
+            .into_iter()
+            .map(|model| {
+                let runs = self.runs_for_model(&model);
+                json!({
+                    "model": model,
+                    "run_count": runs.len(),
+                    "latest_run": runs.last().cloned(),
+                    "runs": runs
+                })
+            })
+            .collect::<Vec<_>>();
+        json!({
+            "schema": "wxstore.lane.v1",
+            "id": "surface_spatial",
+            "status": "ready",
+            "role": "canonical_surface_spatial_adapter",
+            "format": "zarr_v2_read_adapter",
+            "products": ["forecast_point", "grid_field", "map_source"],
+            "models": models,
+            "cache": {
+                "kind": "in_process_grid_cache",
+                "entries": self.grid_cache.read().map(|cache| cache.len()).unwrap_or(0)
+            },
+            "notes": [
+                "The API surface is WxStore-native; this adapter reads existing local spatial model arrays.",
+                "Native WXA spatial containers can replace the adapter without changing endpoint contracts."
+            ]
+        })
+    }
+
+    fn models_json(&self) -> Value {
+        let models = self
+            .model_ids()
+            .into_iter()
+            .map(|model| {
+                let runs = self.runs_for_model(&model);
+                let latest = runs.last().cloned();
+                let variables = latest
+                    .as_deref()
+                    .and_then(|run| self.variables_for(&model, run, None).ok())
+                    .unwrap_or_default();
+                let members = latest
+                    .as_deref()
+                    .map(|run| self.members_for(&model, run))
+                    .unwrap_or_default();
+                json!({
+                    "id": model,
+                    "runs": runs,
+                    "latest_run": latest,
+                    "members": members,
+                    "latest_variables": variables
+                })
+            })
+            .collect::<Vec<_>>();
+        json!({
+            "status": "ready",
+            "root": self.root,
+            "models": models
+        })
+    }
+
+    fn variables_json(&self, model: &str, run: &str, member: Option<&str>) -> Result<Value, ApiError> {
+        let variables = self.variables_for(model, run, member).map_err(bad_anyhow)?;
+        let mut available_hours = Map::new();
+        for variable in &variables {
+            if let Ok(hours) = self.available_hours_for(model, run, member, variable) {
+                available_hours.insert(variable.clone(), json!(hours));
+            }
+        }
+        Ok(json!({
+            "schema": "wxstore.variables.v1",
+            "model": model,
+            "run_id": run,
+            "member": member,
+            "variables": variables,
+            "available_hours": available_hours,
+            "members": self.members_for(model, run)
+        }))
+    }
+
+    fn resolve_run(&self, model: &str, run: Option<&str>) -> Result<String, ApiError> {
+        if let Some(run) = run.filter(|value| *value != "latest") {
+            let path = self.root.join(model).join(run);
+            if path.is_dir() {
+                return Ok(run.to_string());
+            }
+            return Err(not_found(format!("run '{run}' is not available for model '{model}'")));
+        }
+        self.runs_for_model(model)
+            .last()
+            .cloned()
+            .ok_or_else(|| not_found(format!("no runs are available for model '{model}'")))
+    }
+
+    fn runs_for_model(&self, model: &str) -> Vec<String> {
+        list_dirs(&self.root.join(model))
+    }
+
+    fn members_for(&self, model: &str, run: &str) -> Vec<String> {
+        list_dirs(&self.root.join(model).join(run).join("members"))
+    }
+
+    fn variables_for(&self, model: &str, run: &str, member: Option<&str>) -> Result<Vec<String>> {
+        let base = self.array_base(model, run, member);
+        if base.is_dir() {
+            let vars = fs::read_dir(&base)
+                .with_context(|| format!("read variables in {}", base.display()))?
+                .filter_map(|entry| entry.ok())
+                .filter_map(|entry| {
+                    let path = entry.path();
+                    if path.is_dir() && path.extension().is_some_and(|ext| ext == "zarr") {
+                        path.file_stem().map(|name| name.to_string_lossy().to_string())
+                    } else {
+                        None
+                    }
+                })
+                .collect::<Vec<_>>();
+            let mut vars = vars;
+            vars.sort();
+            return Ok(vars);
+        }
+        let members = self.members_for(model, run);
+        if member.is_none() {
+            if let Some(first) = members.first() {
+                return self.variables_for(model, run, Some(first));
+            }
+        }
+        bail!("no variables are available for model '{model}' run '{run}'");
+    }
+
+    fn available_hours_for(
+        &self,
+        model: &str,
+        run: &str,
+        member: Option<&str>,
+        variable: &str,
+    ) -> Result<Vec<u32>> {
+        let array_dir = self.array_dir(model, run, member, variable)?;
+        let mut hours = BTreeSet::new();
+        for entry in fs::read_dir(&array_dir).with_context(|| format!("read {}", array_dir.display()))? {
+            let entry = entry?;
+            let name = entry.file_name();
+            let Some(name) = name.to_str() else {
+                continue;
+            };
+            let Some((hour, rest)) = name.split_once('.') else {
+                continue;
+            };
+            if rest.starts_with("0.") {
+                if let Ok(hour) = hour.parse::<u32>() {
+                    hours.insert(hour);
+                }
+            }
+        }
+        Ok(hours.into_iter().collect())
+    }
+
+    fn read_grid(
+        &self,
+        model: &str,
+        run: &str,
+        member: Option<&str>,
+        variable: &str,
+        forecast_hour: u32,
+    ) -> Result<SpatialGrid> {
+        let member_key = member.unwrap_or("-");
+        let cache_key = format!("{model}|{run}|{member_key}|{variable}|{forecast_hour}");
+        if let Some(grid) = self
+            .grid_cache
+            .read()
+            .ok()
+            .and_then(|cache| cache.get(&cache_key).cloned())
+        {
+            return Ok((*grid).clone());
+        }
+
+        let array_dir = self.array_dir(model, run, member, variable)?;
+        let meta_path = array_dir.join(".zarray");
+        let meta: ZarrArrayMeta = serde_json::from_slice(
+            &fs::read(&meta_path).with_context(|| format!("read {}", meta_path.display()))?,
+        )
+        .with_context(|| format!("parse {}", meta_path.display()))?;
+        if meta.dtype != "<f4" {
+            bail!("unsupported zarr dtype '{}'", meta.dtype);
+        }
+        if meta.shape.len() != 3 || meta.chunks.len() != 3 {
+            bail!("expected zarr shape/chunks [forecast_hour, y, x]");
+        }
+        let hour_count = meta.shape[0];
+        let ny = meta.shape[1];
+        let nx = meta.shape[2];
+        let cy = meta.chunks[1].min(ny);
+        let cx = meta.chunks[2].min(nx);
+        let fh = forecast_hour as usize;
+        if fh >= hour_count {
+            bail!("forecast hour f{forecast_hour:03} outside array horizon {hour_count}");
+        }
+        let compressed = meta.compressor.as_ref().is_some_and(|compressor| compressor.id == "zlib");
+        let n_chunks_y = ny.div_ceil(cy);
+        let n_chunks_x = nx.div_ceil(cx);
+        let mut values = vec![f32::NAN; ny * nx];
+
+        for chunk_y in 0..n_chunks_y {
+            for chunk_x in 0..n_chunks_x {
+                let path = array_dir.join(format!("{fh}.{chunk_y}.{chunk_x}"));
+                let bytes = fs::read(&path).with_context(|| format!("read chunk {}", path.display()))?;
+                let raw = if compressed {
+                    decompress_zlib(&bytes).with_context(|| format!("decompress {}", path.display()))?
+                } else {
+                    bytes
+                };
+                let chunk = raw
+                    .chunks_exact(4)
+                    .map(|item| f32::from_le_bytes([item[0], item[1], item[2], item[3]]))
+                    .collect::<Vec<_>>();
+                let y0 = chunk_y * cy;
+                let x0 = chunk_x * cx;
+                let y1 = (y0 + cy).min(ny);
+                let x1 = (x0 + cx).min(nx);
+                for yy in 0..(y1 - y0) {
+                    for xx in 0..(x1 - x0) {
+                        let src = yy * cx + xx;
+                        let dst = (y0 + yy) * nx + (x0 + xx);
+                        if let Some(value) = chunk.get(src) {
+                            values[dst] = *value;
+                        }
+                    }
+                }
+            }
+        }
+        normalize_spatial_values(variable, &mut values);
+
+        let grid = SpatialGrid {
+            model: model.to_string(),
+            run_id: run.to_string(),
+            member: member.map(str::to_string),
+            variable: variable.to_string(),
+            units: units_for_variable(variable).to_string(),
+            forecast_hour,
+            nx,
+            ny,
+            values: Arc::new(values),
+        };
+        if let Ok(mut cache) = self.grid_cache.write() {
+            if cache.len() > 64 {
+                cache.clear();
+            }
+            cache.insert(cache_key, Arc::new(grid.clone()));
+        }
+        Ok(grid)
+    }
+
+    fn forecast_point(
+        &self,
+        model: &str,
+        run: &str,
+        member: Option<&str>,
+        lat: f64,
+        lon: f64,
+        variables: &[String],
+        hours: &[u32],
+    ) -> Result<Value> {
+        let started = Instant::now();
+        let mut hourly = Map::new();
+        let mut units = Map::new();
+        let mut sampled_grid = None::<GridPoint>;
+        let times = valid_times_from_run_id(run, hours);
+        hourly.insert("time".to_string(), json!(times));
+        units.insert("time".to_string(), json!("iso8601"));
+
+        for variable in variables {
+            units.insert(variable.clone(), json!(units_for_variable(variable)));
+            let mut values = Vec::with_capacity(hours.len());
+            for hour in hours {
+                let grid = self.read_grid(model, run, member, variable, *hour)?;
+                let point = locate_spatial_point(model, grid.nx, grid.ny, lat, lon)?;
+                sampled_grid.get_or_insert(point);
+                let value = grid.values.get(point.index).copied().unwrap_or(f32::NAN);
+                if value.is_finite() {
+                    values.push(Some(f64::from(value)));
+                } else {
+                    values.push(None);
+                }
+            }
+            hourly.insert(variable.clone(), json!(values));
+        }
+
+        let gridpoint = sampled_grid.unwrap_or(GridPoint {
+            x: 0,
+            y: 0,
+            index: 0,
+            lat,
+            lon: normalize_lon(lon),
+            sample: "nearest",
+        });
+        Ok(json!({
+            "latitude": lat,
+            "longitude": lon,
+            "generationtime_ms": started.elapsed().as_secs_f64() * 1000.0,
+            "utc_offset_seconds": 0,
+            "timezone": "GMT",
+            "model": model,
+            "run": run,
+            "member": member,
+            "gridpoint": gridpoint,
+            "hourly_units": units,
+            "hourly": hourly,
+            "wxstore": {
+                "schema": "wxstore.forecast.v1",
+                "lane": "surface_spatial",
+                "sample": "nearest",
+                "format": "open_meteo_shaped_json"
+            }
+        }))
+    }
+
+    fn array_base(&self, model: &str, run: &str, member: Option<&str>) -> PathBuf {
+        let run_path = self.root.join(model).join(run);
+        if let Some(member) = member {
+            run_path.join("members").join(member)
+        } else {
+            run_path
+        }
+    }
+
+    fn array_dir(
+        &self,
+        model: &str,
+        run: &str,
+        member: Option<&str>,
+        variable: &str,
+    ) -> Result<PathBuf> {
+        let mut base = self.array_base(model, run, member);
+        let mut path = base.join(format!("{variable}.zarr")).join("data");
+        if path.join(".zarray").is_file() {
+            return Ok(path);
+        }
+        if member.is_none() {
+            let members = self.members_for(model, run);
+            if let Some(first) = members.first() {
+                base = self.array_base(model, run, Some(first));
+                path = base.join(format!("{variable}.zarr")).join("data");
+                if path.join(".zarray").is_file() {
+                    return Ok(path);
+                }
+            }
+        }
+        bail!("spatial variable '{variable}' is not available for {model}/{run}");
+    }
+}
+
+fn list_dirs(path: &Path) -> Vec<String> {
+    let mut values = fs::read_dir(path)
+        .ok()
+        .into_iter()
+        .flatten()
+        .filter_map(|entry| entry.ok())
+        .filter(|entry| entry.path().is_dir())
+        .filter_map(|entry| entry.file_name().to_str().map(str::to_string))
+        .collect::<Vec<_>>();
+    values.sort();
+    values
+}
+
+fn decompress_zlib(data: &[u8]) -> Result<Vec<u8>> {
+    use flate2::read::ZlibDecoder;
+    use std::io::Read;
+
+    let mut decoder = ZlibDecoder::new(data);
+    let mut decoded = Vec::new();
+    decoder.read_to_end(&mut decoded)?;
+    Ok(decoded)
+}
+
+fn locate_spatial_point(model: &str, nx: usize, ny: usize, lat: f64, lon: f64) -> Result<GridPoint> {
+    if !lat.is_finite() || !lon.is_finite() {
+        bail!("lat/lon must be finite");
+    }
+    let (x, y, grid_lat, grid_lon) = if model == "hrrr" && nx == 1799 && ny == 1059 {
+        let grid = HrrrLambert::default();
+        let (x, y) = grid.nearest(lat, lon);
+        let (grid_lat, grid_lon) = grid.latlon_at(x, y);
+        (x, y, grid_lat, grid_lon)
+    } else {
+        let lon_east = if lon < 0.0 { lon + 360.0 } else { lon };
+        let x = (lon_east / 360.0 * nx as f64)
+            .round()
+            .rem_euclid(nx as f64) as usize;
+        let y = ((90.0 - lat) / 180.0 * (ny.saturating_sub(1)) as f64)
+            .round()
+            .clamp(0.0, (ny.saturating_sub(1)) as f64) as usize;
+        let grid_lat = 90.0 - y as f64 * 180.0 / (ny.saturating_sub(1)).max(1) as f64;
+        let grid_lon = normalize_lon(x as f64 * 360.0 / nx as f64);
+        (x, y, grid_lat, grid_lon)
+    };
+    Ok(GridPoint {
+        x,
+        y,
+        index: y * nx + x,
+        lat: grid_lat,
+        lon: grid_lon,
+        sample: "nearest",
+    })
+}
+
+fn spatial_grid_meta(model: &str, nx: usize, ny: usize) -> Value {
+    if model == "hrrr" && nx == 1799 && ny == 1059 {
+        json!({
+            "type": "lambert_conformal",
+            "nx": nx,
+            "ny": ny,
+            "lat1": 21.138123,
+            "lon1": 237.280472,
+            "dx_m": 3000.0,
+            "dy_m": 3000.0,
+            "latin1": 38.5,
+            "latin2": 38.5,
+            "lov": 262.5
+        })
+    } else {
+        json!({
+            "type": "regular_latlon",
+            "nx": nx,
+            "ny": ny,
+            "lat_start": 90.0,
+            "lat_end": -90.0,
+            "lon_start": 0.0,
+            "lon_end": 360.0 - 360.0 / nx.max(1) as f64
+        })
+    }
+}
+
+fn units_for_variable(variable: &str) -> &'static str {
+    match variable {
+        "temperature_2m" | "dew_point_2m" | "apparent_temperature" | "temperature" | "dew_point" => "degC",
+        "relative_humidity_2m" | "relative_humidity" | "cloud_cover" | "cloud_cover_low" | "cloud_cover_mid" | "cloud_cover_high" => "%",
+        "pressure_msl" | "surface_pressure" => "hPa",
+        "wind_speed_10m" | "wind_gusts_10m" | "u_component_of_wind_10m" | "v_component_of_wind_10m" | "wind_speed" | "u_component_of_wind" | "v_component_of_wind" => "m/s",
+        "wind_direction_10m" => "deg",
+        "precipitation" | "rain" | "precipitable_water" => "mm",
+        "snowfall" => "cm",
+        "snow_depth" => "m",
+        "shortwave_radiation" | "direct_radiation" | "diffuse_radiation" => "W/m^2",
+        "cape" | "convective_inhibition" => "J/kg",
+        "visibility" => "m",
+        _ => "unknown",
+    }
+}
+
+fn normalize_spatial_values(variable: &str, values: &mut [f32]) {
+    if matches!(
+        variable,
+        "temperature_2m" | "dew_point_2m" | "apparent_temperature" | "temperature" | "dew_point"
+    ) && values.iter().any(|value| value.is_finite() && *value > 150.0)
+    {
+        for value in values.iter_mut().filter(|value| value.is_finite()) {
+            *value -= 273.15;
+        }
+    }
+    if matches!(variable, "pressure_msl" | "surface_pressure")
+        && values.iter().any(|value| value.is_finite() && *value > 10_000.0)
+    {
+        for value in values.iter_mut().filter(|value| value.is_finite()) {
+            *value /= 100.0;
+        }
+    }
+}
+
+fn valid_times_from_run_id(run: &str, hours: &[u32]) -> Vec<String> {
+    if let Some((date, hour_z)) = run.split_once('_') {
+        if date.len() == 8 && hour_z.ends_with('z') {
+            if let Ok(hour) = hour_z.trim_end_matches('z').parse::<u32>() {
+                return hours
+                    .iter()
+                    .map(|lead| format!(
+                        "{}-{}-{}T{:02}:00:00Z",
+                        &date[0..4],
+                        &date[4..6],
+                        &date[6..8],
+                        (hour + lead) % 24
+                    ))
+                    .collect();
+            }
+        }
+    }
+    hours.iter().map(|hour| format!("{run}+f{hour:03}")).collect()
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct DiagnosticManifest {
     format: String,
@@ -1497,7 +2255,7 @@ fn query_lon(query: &PointQuery) -> Result<f64, ApiError> {
 fn parse_hours(value: &str) -> Result<Vec<u8>> {
     let mut hours = Vec::new();
     for part in value.split(',').map(str::trim).filter(|part| !part.is_empty()) {
-        if let Some((start, end)) = part.split_once('-') {
+        if let Some((start, end)) = part.split_once('-').or_else(|| part.split_once(':')) {
             let start = start.parse::<u8>().with_context(|| format!("invalid hour range '{part}'"))?;
             let end = end.parse::<u8>().with_context(|| format!("invalid hour range '{part}'"))?;
             if end < start {
@@ -1506,6 +2264,25 @@ fn parse_hours(value: &str) -> Result<Vec<u8>> {
             hours.extend(start..=end);
         } else {
             hours.push(part.parse::<u8>().with_context(|| format!("invalid hour '{part}'"))?);
+        }
+    }
+    hours.sort_unstable();
+    hours.dedup();
+    Ok(hours)
+}
+
+fn parse_hours_u32(value: &str) -> Result<Vec<u32>> {
+    let mut hours = Vec::new();
+    for part in value.split(',').map(str::trim).filter(|part| !part.is_empty()) {
+        if let Some((start, end)) = part.split_once('-').or_else(|| part.split_once(':')) {
+            let start = start.parse::<u32>().with_context(|| format!("invalid hour range '{part}'"))?;
+            let end = end.parse::<u32>().with_context(|| format!("invalid hour range '{part}'"))?;
+            if end < start {
+                bail!("hour range '{part}' is reversed");
+            }
+            hours.extend(start..=end);
+        } else {
+            hours.push(part.parse::<u32>().with_context(|| format!("invalid hour '{part}'"))?);
         }
     }
     hours.sort_unstable();
@@ -1627,6 +2404,12 @@ fn u64_from(bytes: &[u8]) -> Result<u64> {
 
 fn f32_from(bytes: &[u8]) -> Result<f32> {
     Ok(f32::from_le_bytes(bytes.try_into()?))
+}
+
+fn insert_header(headers: &mut HeaderMap, name: &'static str, value: &str) {
+    if let Ok(value) = HeaderValue::from_str(value) {
+        headers.insert(name, value);
+    }
 }
 
 fn bad_request(reason: impl AsRef<str>) -> ApiError {

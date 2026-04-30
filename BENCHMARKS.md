@@ -1,23 +1,27 @@
 # WxStore Benchmark Report
 
-Date: 2026-04-29 local / 2026-04-30 UTC
+Date: 2026-04-29 local
 
-## What Was Built
+## Built Service
 
-Created `C:\Users\drew\wxstore`, a clean Rust service for the private WxStore direction:
+`C:\Users\drew\wxstore` is a clean Rust service for the private WxStore direction:
 
 - no Open-Meteo file dependency;
 - no Open-Meteo code dependency;
-- no `rustwx-cli` service dependency;
-- model/domain/run/lane oriented manifests;
+- no service dependency on a CLI crate;
+- run/lane/field manifests;
 - canonical immutable gridpoint endpoints;
-- lat/lon resolver endpoints;
-- compact JSON temporal sounding response;
-- custom binary point response;
-- mmap/zstd reader for the custom `.wxp` pressure-profile lane;
-- wrapper for the existing precomputed diagnostic brick as `diag_scalar_basic/sparse_v0`.
+- Open-Meteo-shaped point forecast output for surface/spatial fields;
+- compact JSON temporal sounding output;
+- custom binary point payloads;
+- full-grid binary map-source extraction;
+- read-only multi-model spatial lane adapter;
+- mmap/zstd reader for the custom point-temporal pressure-profile lane;
+- precomputed diagnostic lane integration.
 
-Current loaded data:
+## Loaded Data
+
+Temporal sounding lane:
 
 ```text
 model:       hrrr
@@ -27,55 +31,52 @@ horizon:     f000-f048
 grid:        1799 x 1059
 levels:      40 pressure levels
 profile:     TMP, SPFH, UGRD, VGRD, HGT
-diagnostics: sparse precomputed brick, 1620 points, f000-f048
+diagnostics: precomputed diagnostic artifact, f000-f048
 ```
 
-## Profile Lane Build Matrix
-
-All stores were built from:
+Surface/spatial lanes:
 
 ```text
-C:\Users\drew\orwx-native-profile-nvme\hrrr_20260429_06z_f000_f048_core
+hrrr:       20260405_18z, many hourly leads
+gfs:        20260405_12z, many hourly leads
+ecmwf_ifs:  20260411_12z, local sparse leads f000/f003
+ecmwf_ens:  20260412_00z, member 001, local sparse lead f003
 ```
 
-Build command shape:
+The ECMWF local files are sparse because that is what is present on disk. The API advertises available hours through `/v1/variables`.
 
-```powershell
-C:\Users\drew\open-rust-wx\target\release\orwx.exe build-wx-profile `
-  --source-native-profile-store C:\Users\drew\orwx-native-profile-nvme\hrrr_20260429_06z_f000_f048_core `
-  --out-dir <out> `
-  --variables TMP,SPFH,UGRD,VGRD,HGT `
-  --hours 0-48 `
-  --chunk-x <N> `
-  --parallelism 5
-```
-
-| Store | Chunk shape | Bytes | GiB | Build time |
-| --- | --- | ---: | ---: | ---: |
-| `chunk50` | `y=1,x=50,levels=40,hours=49` | 16,734,724,023 | 15.59 | 253.2 s |
-| `chunk16` | `y=1,x=16,levels=40,hours=49` | 17,211,717,508 | 16.03 | 126.2 s |
-| `chunk8` | `y=1,x=8,levels=40,hours=49` | 17,981,715,436 | 16.75 | 111.2 s |
-
-`chunk8` is the current winner for arbitrary point serving.
-
-## Service
-
-Current process:
-
-```text
-http://127.0.0.1:8897
-profile store: C:\Users\drew\orwx-wx-profile-nvme\hrrr_20260429_06z_f000_f048_core_chunk8
-diagnostic store: C:\Users\drew\rustwx\proof\aether_temporal_profile_mvp\diagnostic_conus_20260429_06z_f000_f048
-```
-
-Run command:
+## Service Command
 
 ```powershell
 C:\Users\drew\wxstore\target\release\wxstore.exe serve `
   --profile-store C:\Users\drew\orwx-wx-profile-nvme\hrrr_20260429_06z_f000_f048_core_chunk8 `
   --diagnostic-store C:\Users\drew\rustwx\proof\aether_temporal_profile_mvp\diagnostic_conus_20260429_06z_f000_f048 `
+  --spatial-root C:\Users\drew\open-rust-wx\data\spatial `
   --host 127.0.0.1 `
   --port 8897
+```
+
+## Smoke Tests
+
+All returned 200:
+
+```text
+/v1/status
+/v1/models
+/v1/variables?model=hrrr&run=20260405_18z
+/v1/forecast?latitude=35.22&longitude=-97.44&model=hrrr&run=20260405_18z&hourly=temperature_2m,dew_point_2m,wind_gusts_10m&forecast_hours=0-2
+/v1/grid?model=hrrr&run=20260405_18z&variable=temperature_2m&forecast_hour=0&format=bin
+/v1/point.bin?lat=35.22&lon=-97.44&hours=0-48&diagnostics=basic
+/v1/temporal-sounding?lat=35.22&lon=-97.44&hours=0-2&diagnostics=basic
+```
+
+Surface forecast sample after unit normalization:
+
+```text
+HRRR / Oklahoma point / f000-f002:
+temperature_2m = 14.55, 15.39, 16.02 degC
+dew_point_2m   = 1.50, 1.11, 1.17 degC
+wind_gusts_10m = 8.95, 8.86, 8.67 m/s
 ```
 
 ## Sequential HTTP Benchmarks
@@ -86,58 +87,53 @@ Tool:
 C:\Users\drew\open-rust-wx\target\release\raw-http-bench.exe
 ```
 
-### Winning Store: `chunk_x=8`
+Point forecast products:
 
-| Scenario | Requests | Concurrency | Req/s | P50 | P95 | P99 | Avg payload |
-| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| Random lat/lon, 48h binary, profile+basic diag | 30,000 | 192 | 12,148.9 | 14.4 ms | 22.9 ms | 27.6 ms | 30.3 KB |
-| Random lat/lon, 48h binary, profile only | 30,000 | 192 | 3,521.2 | 53.1 ms | 71.9 ms | 81.3 ms | 23.1 KB |
-| Random lat/lon, 48h compact JSON, profile+basic diag | 30,000 | 192 | 2,457.3 | 59.5 ms | 149.8 ms | 574.3 ms | 112.6 KB |
-| Random lat/lon, 1h binary, profile+basic diag | 30,000 | 192 | 3,615.6 | 52.2 ms | 71.0 ms | 80.3 ms | 4.8 KB |
-| Random lat/lon, 0-18h binary, profile+basic diag | 30,000 | 192 | 4,059.8 | 46.2 ms | 63.3 ms | 71.9 ms | 14.4 KB |
-| Hot canonical gridpoint, 48h binary, cached bytes | 30,000 | 192 | 19,252.5 | 4.6 ms | 5.4 ms | 13.3 ms | 30.3 KB |
-| Hot canonical gridpoint, 48h compact JSON, cached bytes | 30,000 | 192 | 19,361.0 | 4.8 ms | 5.8 ms | 9.6 ms | 111.5 KB |
+| Scenario | Requests | Concurrency | Failures | Req/s | P50 | P95 | P99 | Avg payload |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| HRRR surface forecast, 3 vars x 3h | 30,000 | 192 | 0 | 19,317.7 | 4.69 ms | 5.40 ms | 5.89 ms | 1.06 KB |
+| GFS surface forecast, 3 vars x 3h | 30,000 | 192 | 0 | 19,634.2 | 4.80 ms | 5.81 ms | 6.22 ms | 1.04 KB |
+| ECMWF IFS surface forecast, 3 vars x 2h | 30,000 | 192 | 0 | 19,334.7 | 4.72 ms | 5.69 ms | 6.18 ms | 0.96 KB |
+| ECMWF ENS member 001 surface forecast, 3 vars x 1h | 30,000 | 192 | 0 | 19,284.5 | 4.30 ms | 5.10 ms | 5.93 ms | 0.90 KB |
+| HRRR 48h temporal sounding binary + basic diagnostics | 30,000 | 192 | 0 | 10,925.0 | 15.51 ms | 27.10 ms | 37.94 ms | 30.3 KB |
+| HRRR 48h temporal sounding compact JSON + basic diagnostics | 10,000 | 96 | 0 | 3,852.4 | 24.60 ms | 32.76 ms | 36.25 ms | 112.6 KB |
 
-Notes:
+Full-grid binary map-source products:
 
-- The `profile only` and shorter-hour rows were run after other stress passes, so treat them as supporting numbers, not the headline.
-- Single-hour is not much cheaper than 48h because the current profile lane is intentionally all-hours-per-point. A separate single-hour/spatial lane is needed for cheap one-hour-only calls.
-- Cached canonical endpoints serve final bytes and therefore are limited mostly by HTTP and local loopback throughput.
+| Scenario | Requests | Concurrency | Failures | Req/s | P50 | P95 | P99 | Avg payload |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| HRRR CONUS temperature grid `f000` | 300 | 16 | 0 | 535.1 | 29.39 ms | 40.67 ms | 47.47 ms | 7.27 MB |
+| GFS global temperature grid `f000` | 300 | 16 | 0 | 998.8 | 15.40 ms | 22.91 ms | 27.08 ms | 3.96 MB |
+| ECMWF IFS global temperature grid `f000` | 300 | 16 | 0 | 952.0 | 15.06 ms | 22.96 ms | 27.88 ms | 3.96 MB |
+| ECMWF ENS member 001 global temperature grid `f003` | 300 | 16 | 0 | 995.6 | 14.98 ms | 24.91 ms | 30.89 ms | 3.96 MB |
 
-### Chunk Layout Comparison
+## Profile Lane Build Matrix
 
-Same scenario for each store:
+All stores were built from the same HRRR `f000-f048` pressure-profile source.
 
-```text
-/v1/point.bin?lat={lat}&lon={lon}&hours=0-48&diagnostics=basic
-```
+| Store | Chunk shape | Bytes | GiB | Build time | Random 48h binary req/s |
+| --- | --- | ---: | ---: | ---: | ---: |
+| `chunk50` | `y=1,x=50,levels=40,hours=49` | 16,734,724,023 | 15.59 | 253.2 s | 5,202.0 |
+| `chunk16` | `y=1,x=16,levels=40,hours=49` | 17,211,717,508 | 16.03 | 126.2 s | 7,188.9 |
+| `chunk8` | `y=1,x=8,levels=40,hours=49` | 17,981,715,436 | 16.75 | 111.2 s | 10,925.0 to 12,148.9 |
 
-| chunk_x | Requests | Concurrency | Req/s | P50 | P95 | P99 | Avg payload |
-| ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| 50 | 15,000 | 96 | 5,202.0 | 16.8 ms | 31.9 ms | 44.6 ms | 30.3 KB |
-| 16 | 30,000 | 192 | 7,188.9 | 24.2 ms | 39.1 ms | 50.4 ms | 30.3 KB |
-| 8 | 30,000 | 192 | 12,148.9 | 14.4 ms | 22.9 ms | 27.6 ms | 30.3 KB |
+`chunk8` remains the local winner for arbitrary point temporal soundings.
 
 ## Interpretation
 
-The physical serving idea is validated:
+The service now proves the combined product surface:
 
 ```text
-point -> all forecast hours -> all pressure levels
+surface point forecasts:
+  model/run/variable/hour -> nearest gridpoint -> Open-Meteo-shaped hourly JSON
+
+temporal soundings:
+  HRRR gridpoint -> all hours -> all pressure levels -> compact JSON or binary
+
+map/grid source:
+  model/run/variable/hour -> full f32 grid as binary
 ```
 
-For arbitrary 48-hour point soundings, the winning local profile lane reads one small temporal-profile chunk per variable, then assembles either compact JSON or a binary payload. `chunk_x=8` is the best tested profile chunk size because it wastes far less decompression work per random point than `chunk_x=50` while only adding about 1.25 GB over the original store.
+The major product result is that surface forecast calls across the available local model families are all around `19k req/s` on this workstation after the spatial arrays are warm, and HRRR 48h binary temporal soundings are above `10k req/s` with the current diagnostic lane attached.
 
-The real production shape should keep these separate:
-
-- `profile_pressure_core`: point-temporal profile lane, current winner.
-- `surface_ts`: surface time-series lane, not built in this repo yet.
-- `diag_scalar_basic/severe/parcel`: dense diagnostic lanes, not sparse.
-- `raster_tiles`: map/spatial lane.
-- `response_blobs`: optional pre-shaped cached point products.
-
-## Bottom Line
-
-On this local Windows workstation, the clean WxStore service can already serve random unique 48-hour HRRR temporal-sounding binary responses with basic diagnostics at about `12.1k req/s` and hot canonical cached responses at about `19.3k req/s`.
-
-The remaining work is not proving the core point-temporal store. The remaining work is building the missing production lanes: dense diagnostics, surface time-series, maps/raster tiles, run publishing, and multi-model builders.
+`latest-benchmark-results.json` is the machine-readable output from the latest run.

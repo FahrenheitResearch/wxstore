@@ -1,0 +1,102 @@
+[
+    {
+        "case":  "hrrr_surface_3vars_3h",
+        "requests":  30000,
+        "failed":  0,
+        "rps":  19317.736,
+        "p50_ms":  4.689,
+        "p95_ms":  5.397,
+        "p99_ms":  5.889,
+        "avg_bytes":  1062.1
+    },
+    {
+        "case":  "gfs_surface_3vars_3h",
+        "requests":  30000,
+        "failed":  0,
+        "rps":  19634.238,
+        "p50_ms":  4.795,
+        "p95_ms":  5.813,
+        "p99_ms":  6.224,
+        "avg_bytes":  1044.6
+    },
+    {
+        "case":  "ecmwf_ifs_surface_3vars_2h",
+        "requests":  30000,
+        "failed":  0,
+        "rps":  19334.726,
+        "p50_ms":  4.724,
+        "p95_ms":  5.691,
+        "p99_ms":  6.184,
+        "avg_bytes":  963.1
+    },
+    {
+        "case":  "ecmwf_ens_m001_surface_3vars_1h",
+        "requests":  30000,
+        "failed":  0,
+        "rps":  19284.465,
+        "p50_ms":  4.295,
+        "p95_ms":  5.097,
+        "p99_ms":  5.931,
+        "avg_bytes":  900.4
+    },
+    {
+        "case":  "hrrr_temporal_sounding_bin_48h_basic",
+        "requests":  30000,
+        "failed":  0,
+        "rps":  10925.029,
+        "p50_ms":  15.513,
+        "p95_ms":  27.099,
+        "p99_ms":  37.944,
+        "avg_bytes":  30286.3
+    },
+    {
+        "case":  "hrrr_temporal_sounding_json_48h_basic",
+        "requests":  10000,
+        "failed":  0,
+        "rps":  3852.361,
+        "p50_ms":  24.6,
+        "p95_ms":  32.76,
+        "p99_ms":  36.249,
+        "avg_bytes":  112582.2
+    },
+    {
+        "case":  "hrrr_grid_temp_f000_bin",
+        "requests":  300,
+        "failed":  0,
+        "rps":  535.122,
+        "p50_ms":  29.389,
+        "p95_ms":  40.667,
+        "p99_ms":  47.471,
+        "avg_mb":  7.268
+    },
+    {
+        "case":  "gfs_grid_temp_f000_bin",
+        "requests":  300,
+        "failed":  0,
+        "rps":  998.777,
+        "p50_ms":  15.397,
+        "p95_ms":  22.907,
+        "p99_ms":  27.079,
+        "avg_mb":  3.961
+    },
+    {
+        "case":  "ecmwf_ifs_grid_temp_f000_bin",
+        "requests":  300,
+        "failed":  0,
+        "rps":  951.977,
+        "p50_ms":  15.056,
+        "p95_ms":  22.96,
+        "p99_ms":  27.883,
+        "avg_mb":  3.961
+    },
+    {
+        "case":  "ecmwf_ens_grid_temp_f003_bin",
+        "requests":  300,
+        "failed":  0,
+        "rps":  995.646,
+        "p50_ms":  14.978,
+        "p95_ms":  24.913,
+        "p99_ms":  30.887,
+        "avg_mb":  3.961
+    }
+]
