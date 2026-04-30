@@ -67,6 +67,9 @@ All returned 200:
 /v1/variables?model=hrrr&run=20260405_18z
 /v1/forecast?latitude=35.22&longitude=-97.44&model=hrrr&run=20260405_18z&hourly=temperature_2m,dew_point_2m,wind_gusts_10m&forecast_hours=0-2
 /v1/grid?model=hrrr&run=20260405_18z&variable=temperature_2m&forecast_hour=0&format=bin
+/v1/mapbox/layers/hrrr/20260405_18z/vpd_2m?hours=0-2&palette=magma&range=0,5
+/v1/mapbox/tiles/hrrr/20260405_18z/vpd_2m/f000/4/3/6.png?palette=magma&range=0,5
+/v1/mapbox/tiles/hrrr/hrrr_20260429_060000/500mb_temperature/f000/4/3/6.png?palette=temperature&range=-40,20
 /v1/point.bin?lat=35.22&lon=-97.44&hours=0-48&diagnostics=basic
 /v1/temporal-sounding?lat=35.22&lon=-97.44&hours=0-2&diagnostics=basic
 ```
@@ -99,6 +102,14 @@ Point forecast products:
 | HRRR WXA 24h windowed forecast, 3 vars x 1h | 30,000 | 192 | 0 | 19,508.5 | 4.83 ms | 5.70 ms | 26.51 ms | 0.94 KB |
 | HRRR 48h temporal sounding binary + basic diagnostics | 30,000 | 192 | 0 | 11,313.2 | 14.91 ms | 27.07 ms | 34.87 ms | 30.3 KB |
 | HRRR 48h temporal sounding compact JSON + basic diagnostics | 10,000 | 128 | 0 | 4,433.0 | 27.85 ms | 40.74 ms | 47.20 ms | 112.6 KB |
+
+Mapbox-compatible raster PNG tiles:
+
+| Scenario | Requests | Concurrency | Failures | Req/s | P50 | P95 | P99 | Avg payload |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| HRRR WXA VPD tile z4 | 3,000 | 96 | 0 | 3,589.6 | 19.82 ms | 65.79 ms | 98.79 ms | 86.8 KB |
+| HRRR profile 500mb temperature tile z4 | 3,000 | 96 | 0 | 3,601.4 | 23.42 ms | 48.50 ms | 76.82 ms | 43.4 KB |
+| HRRR profile 500mb RH tile z4 | 1,000 | 64 | 0 | 3,416.7 | 17.29 ms | 28.00 ms | 41.46 ms | 96.1 KB |
 
 Full-grid binary map-source products:
 
@@ -155,8 +166,15 @@ temporal soundings:
 
 map/grid source:
   model/run/variable/hour -> full f32 grid as binary
+
+Mapbox layers:
+  model/run/variable/frame/z/x/y -> transparent PNG raster tile
 ```
 
 The major product result is that surface forecast calls across the available local model families are all around `19k req/s` on this workstation after the spatial arrays are warm, and HRRR 48h binary temporal soundings are above `10k req/s` with the current diagnostic lane attached.
 
 `latest-benchmark-results.json` is the machine-readable output from the latest run.
+
+## Current Blocker For Complete Rustwx Product Coverage
+
+WxStore can now serve WXA spatial grids, temporal profile-derived pressure grids, and Mapbox raster layers. The remaining blocker for "all rustwx products except ECAPE" is upstream export plumbing: rustwx has internal `Field2D` producers for direct, derived, and windowed HRRR products, but the current public CLIs render PNG/report artifacts rather than exporting every product as raw f32 grids with manifests. A rustwx-side grid export builder is required to materialize the full catalog into WXA without reimplementing meteorology inside WxStore.

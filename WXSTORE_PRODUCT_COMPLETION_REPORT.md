@@ -37,7 +37,10 @@ C:\Users\drew\wxstore\rustwx-inventory\rustwx_hrrr_20260429_f000_capability_inve
 New service capabilities:
 
 - `/v1/products` exposes service products plus the rustwx HRRR product inventory.
+- `/v1/layers` exposes raster layer metadata for WXA spatial products plus HRRR pressure-profile map layers.
+- `/v1/mapbox/layers/...`, `/v1/mapbox/tilejson/...`, and `/v1/mapbox/tiles/...` provide Mapbox-compatible temporal raster layer metadata and PNG XYZ tiles.
 - `/v1/grid` now accepts raw variables, rustwx-style direct aliases, stored derived products, cheap virtual derived products, and windowed product patterns.
+- `/v1/grid` also serves HRRR pressure-profile map grids from the temporal profile lane for products like `500mb_temperature`, `500mb_height`, `500mb_wind_speed`, `500mb_rh`, `500mb_dewpoint`, and `500mb_specific_humidity`.
 - `materialize-spatial` command computes product grids and writes native `.wxa` dense2d spatial arrays by default.
 - The same command can still write Zarr-v2 with `--output-format zarr`, but Zarr is now only a source/proof adapter.
 - Stored product arrays now take priority over virtual compute paths.
@@ -110,6 +113,9 @@ Sequential local raw HTTP, release service on `127.0.0.1:8897`.
 | HRRR WXA VPD grid binary, `f000` | 540.2 | 28.37 ms | 40.05 ms | 46.45 ms | 7.27 MiB |
 | GFS WXA VPD grid binary, `f000` | 1,046.4 | 14.76 ms | 21.47 ms | 23.76 ms | 3.96 MiB |
 | HRRR WXA 24h max temp grid binary, `f000` | 528.2 | 29.01 ms | 41.57 ms | 47.19 ms | 7.27 MiB |
+| HRRR WXA VPD Mapbox PNG tile z4 | 3,589.6 | 19.82 ms | 65.79 ms | 98.79 ms | 86.8 KiB |
+| HRRR profile 500mb temp Mapbox PNG tile z4 | 3,601.4 | 23.42 ms | 48.50 ms | 76.82 ms | 43.4 KiB |
+| HRRR profile 500mb RH Mapbox PNG tile z4 | 3,416.7 | 17.29 ms | 28.00 ms | 41.46 ms | 96.1 KiB |
 | HRRR 48h temporal sounding binary + diagnostics | 11,313.2 | 14.91 ms | 27.07 ms | 34.87 ms | 30.3 KiB |
 | HRRR 48h temporal sounding compact JSON + diagnostics | 4,433.0 | 27.85 ms | 40.74 ms | 47.20 ms | 112.6 KiB |
 
@@ -159,3 +165,36 @@ manifest: inline JSON metadata per product file
 ```
 
 The current Zarr adapter remains useful as a source/proof adapter, not the final on-disk serving format.
+
+## Current Blocker
+
+The remaining blocker for making every non-ECAPE rustwx HRRR product physically available in WxStore is not Mapbox or serving. It is export plumbing from rustwx.
+
+Current rustwx state:
+
+```text
+direct products:   internal Field2D producers exist
+derived products:  internal light-derived Field2D producers exist
+windowed products: internal Field2D producers exist
+existing CLIs:     render PNG/report/manifest artifacts, not complete raw f32 grid exports
+```
+
+Needed next builder:
+
+```text
+hrrr_non_ecape_grid_export
+  input: model run, hours, product filter
+  output: Field2D grids + provenance manifests
+  target: WXA dense2d files or neutral f32 grid bundles for WxStore ingestion
+```
+
+Products that remain true meteorology/source blockers rather than WxStore routing blockers:
+
+```text
+stp_effective
+scp
+scp_effective
+lightning_flash_density
+full smoke/native products unless the wrfnat MASSDEN/COLMD extraction path is wired into the exporter
+absolute-vorticity pressure maps until the all-variable profile lane or direct pressure exporter includes ABSV
+```

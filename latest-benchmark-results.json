@@ -288,5 +288,35 @@
         "p95_ms":  40.74,
         "p99_ms":  47.195,
         "avg_bytes":  112582.2
+    },
+    {
+        "case":  "hrrr_wxa_vpd_mapbox_tile_z4",
+        "requests":  3000,
+        "failed":  0,
+        "rps":  3589.59,
+        "p50_ms":  19.816,
+        "p95_ms":  65.785,
+        "p99_ms":  98.789,
+        "avg_bytes":  88908
+    },
+    {
+        "case":  "hrrr_profile_500mb_temp_tile_z4",
+        "requests":  3000,
+        "failed":  0,
+        "rps":  3601.402,
+        "p50_ms":  23.417,
+        "p95_ms":  48.501,
+        "p99_ms":  76.817,
+        "avg_bytes":  44398
+    },
+    {
+        "case":  "hrrr_profile_500mb_rh_tile_z4",
+        "requests":  1000,
+        "failed":  0,
+        "rps":  3416.688,
+        "p50_ms":  17.286,
+        "p95_ms":  28.001,
+        "p99_ms":  41.463,
+        "avg_bytes":  98420
     }
 ]

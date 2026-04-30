@@ -25,8 +25,13 @@ C:\Users\drew\wxstore\target\release\wxstore.exe serve `
 - `GET /v1/models`
 - `GET /v1/variables?model=hrrr&run=latest`
 - `GET /v1/products`
+- `GET /v1/layers?model=hrrr&run=latest`
 - `GET /v1/forecast?latitude=35.22&longitude=-97.44&model=hrrr&hourly=temperature_2m,dew_point_2m&forecast_hours=0-2`
 - `GET /v1/grid?model=hrrr&variable=temperature_2m&forecast_hour=0&format=bin`
+- `GET /v1/mapbox/layers/hrrr/20260405_18z/vpd_2m?hours=0-2&palette=magma&range=0,5`
+- `GET /v1/mapbox/tilejson/hrrr/20260405_18z/vpd_2m/f000?palette=magma&range=0,5`
+- `GET /v1/mapbox/tiles/hrrr/20260405_18z/vpd_2m/f000/{z}/{x}/{y}?palette=magma&range=0,5`
+- `GET /v1/mapbox/tiles/hrrr/hrrr_20260429_060000/500mb_temperature/f000/{z}/{x}/{y}?palette=temperature&range=-40,20`
 - `GET /v1/latest/{model}/{domain}`
 - `GET /v1/resolve?lat=35.22&lon=-97.44`
 - `GET /v1/temporal-sounding?lat=35.22&lon=-97.44&hours=0-48&diagnostics=basic`
@@ -72,6 +77,14 @@ Sequential raw HTTP benchmark on this local Windows workstation, release build, 
 | HRRR 48h temporal sounding binary + basic diagnostics | 30,000 | 192 | 11,313.2 | 14.91 ms | 27.07 ms | 34.87 ms | 30.3 KB |
 | HRRR 48h temporal sounding compact JSON + basic diagnostics | 10,000 | 128 | 4,433.0 | 27.85 ms | 40.74 ms | 47.20 ms | 112.6 KB |
 
+Mapbox-compatible raster PNG tiles:
+
+| Scenario | Requests | Concurrency | Req/s | P50 | P95 | P99 | Avg payload |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| HRRR WXA VPD tile z4 | 3,000 | 96 | 3,589.6 | 19.82 ms | 65.79 ms | 98.79 ms | 86.8 KB |
+| HRRR profile 500mb temperature tile z4 | 3,000 | 96 | 3,601.4 | 23.42 ms | 48.50 ms | 76.82 ms | 43.4 KB |
+| HRRR profile 500mb RH tile z4 | 1,000 | 64 | 3,416.7 | 17.29 ms | 28.00 ms | 41.46 ms | 96.1 KB |
+
 Full-grid binary map-source extraction:
 
 | Scenario | Requests | Concurrency | Req/s | P50 | P95 | P99 | Avg payload |
@@ -84,5 +97,8 @@ Full-grid binary map-source extraction:
 
 - Temporal sounding uses the custom point-temporal `.wxp` lane with `chunk_x=8`, `chunk_y=1`, all 49 hours and 40 pressure levels per chunk.
 - Surface forecast and grid endpoints prefer native `.wxa` products and fall back to the local Zarr source adapter only when a WXA product is not present.
+- Mapbox endpoints render transparent PNG XYZ tiles from any grid product that `read_grid` can return, including WXA spatial fields and HRRR pressure-profile grids.
+- HRRR profile grids currently expose pressure-level temperature, height, wind speed, RH, dewpoint, and specific humidity at the standard pressure levels available in the profile lane.
 - Current WXA proof storage: 20 files, 78.5 MiB total. HRRR proof products are 45.8 MiB; GFS proof products are 28.5 MiB.
+- Full rustwx catalog materialization is blocked on a rustwx-side raw `Field2D` export builder. Current rustwx CLIs render PNG/report artifacts but do not export every direct/derived/windowed product as f32 grids for WxStore.
 - `latest-benchmark-results.json` contains the latest machine-readable benchmark table.

@@ -201,6 +201,12 @@ async fn serve(args: ServeArgs) -> Result<()> {
         .route("/v1/variables", get(variables))
         .route("/v1/products", get(products))
         .route("/v1/grid", get(grid_field))
+        .route("/v1/layers", get(layers))
+        .route("/v1/tilejson/{model}/{run}/{variable}", get(tilejson))
+        .route("/v1/tiles/{model}/{run}/{variable}/{forecast_hour}/{z}/{x}/{y}", get(raster_tile))
+        .route("/v1/mapbox/layers/{model}/{run}/{variable}", get(mapbox_layer))
+        .route("/v1/mapbox/tilejson/{model}/{run}/{variable}/{frame}", get(mapbox_tilejson))
+        .route("/v1/mapbox/tiles/{model}/{run}/{variable}/{frame}/{z}/{x}/{y}", get(mapbox_raster_tile))
         .route("/v1/forecast", get(forecast))
         .route("/v1/latest/{model}/{domain}", get(latest))
         .route("/v1/resolve", get(resolve))
@@ -419,6 +425,40 @@ struct GridQuery {
 }
 
 #[derive(Debug, Deserialize)]
+struct LayerQuery {
+    model: Option<String>,
+    run: Option<String>,
+    member: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct TileJsonQuery {
+    member: Option<String>,
+    forecast_hour: Option<u32>,
+    palette: Option<String>,
+    min: Option<f32>,
+    max: Option<f32>,
+    base_url: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct MapboxLayerQuery {
+    member: Option<String>,
+    hours: Option<String>,
+    palette: Option<String>,
+    range: Option<String>,
+    base_url: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct TileQuery {
+    member: Option<String>,
+    palette: Option<String>,
+    min: Option<f32>,
+    max: Option<f32>,
+}
+
+#[derive(Debug, Deserialize)]
 struct ForecastQuery {
     lat: Option<f64>,
     lon: Option<f64>,
@@ -563,17 +603,56 @@ async fn products(State(state): State<Arc<AppState>>) -> Json<Value> {
     }))
 }
 
+fn read_grid_from_state(
+    state: &AppState,
+    model: &str,
+    run: Option<&str>,
+    member: Option<&str>,
+    variable: &str,
+    forecast_hour: u32,
+) -> Result<SpatialGrid> {
+    let mut spatial_error = None::<String>;
+    if let Some(spatial) = state.spatial.as_deref() {
+        match spatial.resolve_run(model, run) {
+            Ok(resolved_run) => match spatial.read_grid(model, &resolved_run, member, variable, forecast_hour) {
+                Ok(grid) => return Ok(grid),
+                Err(err) => spatial_error = Some(err.to_string()),
+            },
+            Err((_, body)) => {
+                spatial_error = Some(
+                    body.0
+                        .get("reason")
+                        .and_then(Value::as_str)
+                        .unwrap_or("spatial run is not available")
+                        .to_string(),
+                );
+            }
+        }
+    }
+
+    let profile = &state.profile;
+    let profile_run_requested = run
+        .map(|value| value == "latest" || value == profile.manifest.run_id || value == profile.manifest.cycle)
+        .unwrap_or(true);
+    if model == profile.manifest.model && profile_run_requested && member.is_none() {
+        if let Some(grid) = profile.read_pressure_grid_product(variable, forecast_hour)? {
+            return Ok(grid);
+        }
+    }
+
+    if let Some(err) = spatial_error {
+        bail!("{err}");
+    }
+    bail!("grid product '{variable}' is not available for {model}");
+}
+
 async fn grid_field(
     State(state): State<Arc<AppState>>,
     Query(query): Query<GridQuery>,
 ) -> Result<Response, ApiError> {
-    let Some(spatial) = state.spatial.clone() else {
-        return Err(not_found("spatial lane is not configured"));
-    };
     let format = query.format.as_deref().unwrap_or("json");
     let model = query.model;
     let variable = query.variable;
-    let run = spatial.resolve_run(&model, query.run.as_deref())?;
     let member = query.member.or(query.members.and_then(|value| {
         value
             .split(',')
@@ -583,8 +662,17 @@ async fn grid_field(
             .map(str::to_string)
     }));
     let hour = query.forecast_hour.unwrap_or(0);
+    let requested_run = query.run;
+    let state_for_read = state.clone();
     let read = tokio::task::spawn_blocking(move || {
-        spatial.read_grid(&model, &run, member.as_deref(), &variable, hour)
+        read_grid_from_state(
+            &state_for_read,
+            &model,
+            requested_run.as_deref(),
+            member.as_deref(),
+            &variable,
+            hour,
+        )
     })
     .await
     .map_err(|err| internal_error(format!("join error: {err}")))?
@@ -629,6 +717,262 @@ async fn grid_field(
         "data": read.values.as_ref()
     }))
     .into_response())
+}
+
+async fn layers(
+    State(state): State<Arc<AppState>>,
+    Query(query): Query<LayerQuery>,
+) -> Json<Value> {
+    let model = query.model.unwrap_or_else(|| "hrrr".to_string());
+    let run = query.run.unwrap_or_else(|| "latest".to_string());
+    let mut layers = Vec::<Value>::new();
+    if let Some(spatial) = state.spatial.as_deref() {
+        if let Ok(resolved_run) = spatial.resolve_run(&model, Some(&run)) {
+            if let Ok(variables) = spatial.variables_for(&model, &resolved_run, query.member.as_deref()) {
+                for variable in variables {
+                    let hours = spatial
+                        .available_hours_for(&model, &resolved_run, query.member.as_deref(), &variable)
+                        .unwrap_or_default();
+                    layers.push(json!({
+                        "id": variable,
+                        "kind": "raster_grid",
+                        "source": "wxa_or_spatial_adapter",
+                        "model": model,
+                        "run": resolved_run,
+                        "member": query.member,
+                        "forecast_hours": hours,
+                        "tilejson": format!("/v1/tilejson/{}/{}/{}", model, resolved_run, variable)
+                    }));
+                }
+            }
+        }
+    }
+    if model == state.profile.manifest.model && (run == "latest" || run == state.profile.manifest.run_id) {
+        for level in [1000u16, 925, 850, 700, 500, 300, 250, 200] {
+            for suffix in ["temperature", "height", "wind_speed", "rh", "dewpoint", "specific_humidity"] {
+                let variable = format!("{level}mb_{suffix}");
+                layers.push(json!({
+                    "id": variable,
+                    "kind": "raster_grid",
+                    "source": "profile_pressure_core",
+                    "model": state.profile.manifest.model,
+                    "run": state.profile.manifest.run_id,
+                    "forecast_hours": state.profile.manifest.forecast_hours,
+                    "pressure_hpa": level,
+                    "tilejson": format!("/v1/tilejson/{}/{}/{}", state.profile.manifest.model, state.profile.manifest.run_id, variable)
+                }));
+            }
+        }
+    }
+    Json(json!({
+        "schema": "wxstore.layers.v1",
+        "model": model,
+        "run": run,
+        "mapbox": {
+            "tile_template": "/v1/tiles/{model}/{run}/{variable}/{forecast_hour}/{z}/{x}/{y}.png",
+            "tilejson_template": "/v1/tilejson/{model}/{run}/{variable}?forecast_hour={forecast_hour}"
+        },
+        "layers": layers
+    }))
+}
+
+async fn tilejson(
+    State(_state): State<Arc<AppState>>,
+    AxumPath((model, run, variable)): AxumPath<(String, String, String)>,
+    Query(query): Query<TileJsonQuery>,
+) -> Json<Value> {
+    let base = query
+        .base_url
+        .unwrap_or_else(|| "http://127.0.0.1:8897".to_string())
+        .trim_end_matches('/')
+        .to_string();
+    let hour = query.forecast_hour.unwrap_or(0);
+    let mut tile_url = format!(
+        "{base}/v1/tiles/{model}/{run}/{variable}/{hour}/{{z}}/{{x}}/{{y}}.png"
+    );
+    let mut params = Vec::new();
+    if let Some(member) = query.member {
+        params.push(format!("member={member}"));
+    }
+    if let Some(palette) = query.palette {
+        params.push(format!("palette={palette}"));
+    }
+    if let Some(min) = query.min {
+        params.push(format!("min={min}"));
+    }
+    if let Some(max) = query.max {
+        params.push(format!("max={max}"));
+    }
+    if !params.is_empty() {
+        tile_url.push('?');
+        tile_url.push_str(&params.join("&"));
+    }
+    Json(json!({
+        "tilejson": "3.0.0",
+        "name": format!("{model}/{run}/{variable}"),
+        "scheme": "xyz",
+        "tiles": [tile_url],
+        "minzoom": 0,
+        "maxzoom": 9,
+        "bounds": [-180.0, -85.05112878, 180.0, 85.05112878],
+        "wxstore": {
+            "schema": "wxstore.mapbox_layer.v1",
+            "model": model,
+            "run": run,
+            "variable": variable,
+            "forecast_hour": hour,
+            "temporal_tile_template": format!("{base}/v1/tiles/{model}/{run}/{variable}/{{forecast_hour}}/{{z}}/{{x}}/{{y}}.png")
+        }
+    }))
+}
+
+async fn raster_tile(
+    State(state): State<Arc<AppState>>,
+    AxumPath((model, run, variable, forecast_hour, z, x, y)): AxumPath<(String, String, String, u32, u32, u32, String)>,
+    Query(query): Query<TileQuery>,
+) -> Result<Response, ApiError> {
+    let y = parse_tile_y(&y).map_err(bad_anyhow)?;
+    let member = query.member.clone();
+    let state_for_read = state.clone();
+    let grid = tokio::task::spawn_blocking(move || {
+        read_grid_from_state(
+            &state_for_read,
+            &model,
+            Some(&run),
+            member.as_deref(),
+            &variable,
+            forecast_hour,
+        )
+    })
+    .await
+    .map_err(|err| internal_error(format!("join error: {err}")))?
+    .map_err(|err| bad_request(err.to_string()))?;
+    let png = tokio::task::spawn_blocking(move || render_raster_tile_png(&grid, z, x, y, &query))
+        .await
+        .map_err(|err| internal_error(format!("join error: {err}")))?
+        .map_err(|err| bad_request(err.to_string()))?;
+    let mut response = Bytes::from(png).into_response();
+    let headers = response.headers_mut();
+    headers.insert(header::CONTENT_TYPE, HeaderValue::from_static("image/png"));
+    headers.insert(header::CACHE_CONTROL, HeaderValue::from_static("public, max-age=3600"));
+    Ok(response)
+}
+
+async fn mapbox_layer(
+    State(state): State<Arc<AppState>>,
+    AxumPath((model, run, variable)): AxumPath<(String, String, String)>,
+    Query(query): Query<MapboxLayerQuery>,
+) -> Result<Json<Value>, ApiError> {
+    let base = query
+        .base_url
+        .unwrap_or_else(|| "http://127.0.0.1:8897".to_string())
+        .trim_end_matches('/')
+        .to_string();
+    let (min, max) = query
+        .range
+        .as_deref()
+        .and_then(parse_range_pair)
+        .unwrap_or_else(|| default_range_for_variable(&variable, &[]));
+    let palette = query
+        .palette
+        .unwrap_or_else(|| default_palette_for_variable(&variable).to_string());
+    let hours = available_hours_for_layer(&state, &model, &run, query.member.as_deref(), &variable)
+        .map_err(bad_anyhow)?;
+    let requested_hours = query
+        .hours
+        .as_deref()
+        .map(parse_hours_u32)
+        .transpose()
+        .map_err(bad_anyhow)?;
+    let hours = if let Some(requested) = requested_hours {
+        hours
+            .into_iter()
+            .filter(|hour| requested.contains(hour))
+            .collect::<Vec<_>>()
+    } else {
+        hours
+    };
+    let frames = hours
+        .iter()
+        .map(|hour| {
+            let frame = format!("f{hour:03}");
+            let mut tile = format!(
+                "{base}/v1/mapbox/tiles/{model}/{run}/{variable}/{frame}/{{z}}/{{x}}/{{y}}?palette={palette}&range={min},{max}"
+            );
+            if let Some(member) = query.member.as_deref() {
+                tile.push_str("&member=");
+                tile.push_str(member);
+            }
+            json!({
+                "forecast_hour": hour,
+                "frame": frame,
+                "tiles": [tile],
+                "tilejson_url": format!("{base}/v1/mapbox/tilejson/{model}/{run}/{variable}/{frame}?palette={palette}&range={min},{max}")
+            })
+        })
+        .collect::<Vec<_>>();
+    Ok(Json(json!({
+        "schema": "wxstore.mapbox.layer.v1",
+        "model": model,
+        "run_id": run,
+        "variable": variable,
+        "bounds": [-180.0, -85.05112878, 180.0, 85.05112878],
+        "minzoom": 0,
+        "maxzoom": 9,
+        "tile_size": 256,
+        "palette": {"id": palette, "range": [min, max]},
+        "frames": frames
+    })))
+}
+
+async fn mapbox_tilejson(
+    State(state): State<Arc<AppState>>,
+    AxumPath((model, run, variable, frame)): AxumPath<(String, String, String, String)>,
+    Query(query): Query<MapboxLayerQuery>,
+) -> Result<Json<Value>, ApiError> {
+    let forecast_hour = parse_frame_hour(&frame).map_err(bad_anyhow)?;
+    let (min, max) = query
+        .range
+        .as_deref()
+        .and_then(parse_range_pair)
+        .unwrap_or_else(|| default_range_for_variable(&variable, &[]));
+    Ok(tilejson(
+        State(state),
+        AxumPath((model, run, variable)),
+        Query(TileJsonQuery {
+            member: query.member,
+            forecast_hour: Some(forecast_hour),
+            palette: query.palette,
+            min: Some(min),
+            max: Some(max),
+            base_url: query.base_url,
+        }),
+    )
+    .await)
+}
+
+async fn mapbox_raster_tile(
+    State(state): State<Arc<AppState>>,
+    AxumPath((model, run, variable, frame, z, x, y)): AxumPath<(String, String, String, String, u32, u32, String)>,
+    Query(query): Query<MapboxLayerQuery>,
+) -> Result<Response, ApiError> {
+    let forecast_hour = parse_frame_hour(&frame).map_err(bad_anyhow)?;
+    let (min, max) = query
+        .range
+        .as_deref()
+        .and_then(parse_range_pair)
+        .unwrap_or_else(|| default_range_for_variable(&variable, &[]));
+    raster_tile(
+        State(state),
+        AxumPath((model, run, variable, forecast_hour, z, x, y)),
+        Query(TileQuery {
+            member: query.member,
+            palette: query.palette,
+            min: Some(min),
+            max: Some(max),
+        }),
+    )
+    .await
 }
 
 async fn forecast(
@@ -1304,6 +1648,7 @@ struct ProfileLane {
     root: PathBuf,
     manifest: ProfileManifest,
     files: RwLock<HashMap<String, Arc<ProfileFile>>>,
+    grid_cache: RwLock<HashMap<String, Arc<SpatialGrid>>>,
 }
 
 struct ProfileFile {
@@ -1349,6 +1694,22 @@ struct QuantizedSeries {
     add_offset: f32,
 }
 
+#[derive(Debug, Clone, Copy)]
+enum PressureGridKind {
+    Variable(&'static str),
+    Dewpoint,
+    RelativeHumidity,
+    WindSpeed,
+}
+
+#[derive(Debug, Clone)]
+struct PressureGridSpec {
+    output_name: String,
+    units: &'static str,
+    level_hpa: u16,
+    kind: PressureGridKind,
+}
+
 impl ProfileLane {
     fn open(root: &Path) -> Result<Self> {
         let manifest: ProfileManifest = serde_json::from_slice(
@@ -1359,6 +1720,7 @@ impl ProfileLane {
             root: root.to_path_buf(),
             manifest,
             files: RwLock::new(HashMap::new()),
+            grid_cache: RwLock::new(HashMap::new()),
         })
     }
 
@@ -1507,6 +1869,156 @@ impl ProfileLane {
             scale_factor: file.header.scale_factor,
             add_offset: file.header.add_offset,
         })
+    }
+
+    fn read_pressure_grid_product(
+        &self,
+        product: &str,
+        forecast_hour: u32,
+    ) -> Result<Option<SpatialGrid>> {
+        let Some(spec) = parse_pressure_grid_product(product, &self.manifest.levels_hpa) else {
+            return Ok(None);
+        };
+        let cache_key = format!("{}|{}|{}", spec.output_name, spec.level_hpa, forecast_hour);
+        if let Some(grid) = self
+            .grid_cache
+            .read()
+            .ok()
+            .and_then(|cache| cache.get(&cache_key).cloned())
+        {
+            return Ok(Some((*grid).clone()));
+        }
+
+        let values = match spec.kind {
+            PressureGridKind::Variable(variable) => {
+                if !self.has_variable(variable) {
+                    bail!(
+                        "pressure product '{}' needs profile variable '{}' which is not in this profile lane",
+                        product,
+                        variable
+                    );
+                }
+                self.read_pressure_variable_values(variable, spec.level_hpa, forecast_hour)?
+            }
+            PressureGridKind::Dewpoint => {
+                let temp = self.read_pressure_variable_values("TMP", spec.level_hpa, forecast_hour)?;
+                let q = self.read_pressure_variable_values("SPFH", spec.level_hpa, forecast_hour)?;
+                temp.iter()
+                    .zip(q.iter())
+                    .map(|(temp, q)| {
+                        finite2(*temp, *q)
+                            .and_then(|(_, q)| specific_humidity_to_dewpoint_c(f64::from(q), f64::from(spec.level_hpa)).map(|v| v as f32))
+                            .unwrap_or(f32::NAN)
+                    })
+                    .collect::<Vec<_>>()
+            }
+            PressureGridKind::RelativeHumidity => {
+                let temp = self.read_pressure_variable_values("TMP", spec.level_hpa, forecast_hour)?;
+                let q = self.read_pressure_variable_values("SPFH", spec.level_hpa, forecast_hour)?;
+                temp.iter()
+                    .zip(q.iter())
+                    .map(|(temp, q)| {
+                        if !temp.is_finite() || !q.is_finite() {
+                            return f32::NAN;
+                        }
+                        let Some(td) = specific_humidity_to_dewpoint_c(f64::from(*q), f64::from(spec.level_hpa)) else {
+                            return f32::NAN;
+                        };
+                        relative_humidity_from_temp_dewpoint_c(*temp, td as f32)
+                    })
+                    .collect::<Vec<_>>()
+            }
+            PressureGridKind::WindSpeed => {
+                let u = self.read_pressure_variable_values("UGRD", spec.level_hpa, forecast_hour)?;
+                let v = self.read_pressure_variable_values("VGRD", spec.level_hpa, forecast_hour)?;
+                u.iter()
+                    .zip(v.iter())
+                    .map(|(u, v)| finite2(*u, *v).map_or(f32::NAN, |(u, v)| (u * u + v * v).sqrt()))
+                    .collect::<Vec<_>>()
+            }
+        };
+
+        let grid = SpatialGrid {
+            model: self.manifest.model.clone(),
+            run_id: self.manifest.run_id.clone(),
+            member: None,
+            variable: spec.output_name,
+            units: spec.units.to_string(),
+            forecast_hour,
+            nx: self.manifest.nx,
+            ny: self.manifest.ny,
+            values: Arc::new(values),
+        };
+        if let Ok(mut cache) = self.grid_cache.write() {
+            if cache.len() > 16 {
+                cache.clear();
+            }
+            cache.insert(cache_key, Arc::new(grid.clone()));
+        }
+        Ok(Some(grid))
+    }
+
+    fn read_pressure_variable_values(
+        &self,
+        variable: &str,
+        level_hpa: u16,
+        forecast_hour: u32,
+    ) -> Result<Vec<f32>> {
+        let hour_u8 = u8::try_from(forecast_hour)
+            .map_err(|_| anyhow!("forecast hour f{forecast_hour:03} is outside this profile lane"))?;
+        let hour_index = self
+            .manifest
+            .forecast_hours
+            .iter()
+            .position(|stored| *stored == hour_u8)
+            .ok_or_else(|| anyhow!("forecast hour f{forecast_hour:03} is not available"))?;
+        let level_index = self
+            .manifest
+            .levels_hpa
+            .iter()
+            .position(|stored| *stored == level_hpa)
+            .ok_or_else(|| anyhow!("pressure level {level_hpa} hPa is not available"))?;
+        let file = self.file_for_variable(variable)?;
+        let chunks_per_row = self.manifest.nx.div_ceil(file.header.chunk_x);
+        let mut values = vec![f32::NAN; self.manifest.nx * self.manifest.ny];
+        for y in 0..self.manifest.ny {
+            for chunk_x in 0..chunks_per_row {
+                let chunk_id = y * chunks_per_row + chunk_x;
+                let record = *file
+                    .index
+                    .get(chunk_id)
+                    .ok_or_else(|| anyhow!("missing chunk {chunk_id} for {variable}"))?;
+                let end = record.offset + record.len;
+                if end > file.mmap.len() {
+                    bail!("chunk range exceeds file length");
+                }
+                let decoded = zstd::stream::decode_all(&file.mmap[record.offset..end])
+                    .with_context(|| format!("decode {variable} chunk {chunk_id}"))?;
+                let expected_len = record.x_count * file.header.levels_len * file.header.hours_len * 2;
+                if decoded.len() != expected_len {
+                    bail!("decoded chunk length mismatch: {} != {expected_len}", decoded.len());
+                }
+                for local_x in 0..record.x_count {
+                    let x = chunk_x * file.header.chunk_x + local_x;
+                    if x >= self.manifest.nx {
+                        continue;
+                    }
+                    let value_index =
+                        ((local_x * file.header.levels_len + level_index) * file.header.hours_len)
+                            + hour_index;
+                    let byte_offset = value_index * 2;
+                    let encoded = i16::from_le_bytes([
+                        decoded[byte_offset],
+                        decoded[byte_offset + 1],
+                    ]);
+                    if encoded != MISSING_I16 {
+                        values[y * self.manifest.nx + x] =
+                            f32::from(encoded) / file.header.scale_factor - file.header.add_offset;
+                    }
+                }
+            }
+        }
+        Ok(values)
     }
 
     fn file_for_variable(&self, variable: &str) -> Result<Arc<ProfileFile>> {
@@ -2519,6 +3031,207 @@ fn write_spatial_wxa_grids(
     Ok(path)
 }
 
+fn parse_tile_y(value: &str) -> Result<u32> {
+    let clean = value.strip_suffix(".png").unwrap_or(value);
+    clean.parse::<u32>().context("parse tile y")
+}
+
+fn parse_frame_hour(frame: &str) -> Result<u32> {
+    let clean = frame.strip_prefix('f').unwrap_or(frame);
+    clean.parse::<u32>().with_context(|| format!("parse frame '{frame}'"))
+}
+
+fn parse_range_pair(value: &str) -> Option<(f32, f32)> {
+    let (min, max) = value.split_once(',')?;
+    let min = min.trim().parse::<f32>().ok()?;
+    let max = max.trim().parse::<f32>().ok()?;
+    (max > min).then_some((min, max))
+}
+
+fn available_hours_for_layer(
+    state: &AppState,
+    model: &str,
+    run: &str,
+    member: Option<&str>,
+    variable: &str,
+) -> Result<Vec<u32>> {
+    if let Some(spatial) = state.spatial.as_deref() {
+        if let Ok(resolved_run) = spatial.resolve_run(model, Some(run)) {
+            if let Ok(hours) = spatial.available_hours_for(model, &resolved_run, member, variable) {
+                return Ok(hours);
+            }
+        }
+    }
+    if model == state.profile.manifest.model
+        && (run == "latest" || run == state.profile.manifest.run_id || run == state.profile.manifest.cycle)
+        && parse_pressure_grid_product(variable, &state.profile.manifest.levels_hpa).is_some()
+    {
+        return Ok(state
+            .profile
+            .manifest
+            .forecast_hours
+            .iter()
+            .map(|hour| u32::from(*hour))
+            .collect());
+    }
+    bail!("no tile hours are available for {model}/{run}/{variable}");
+}
+
+fn render_raster_tile_png(grid: &SpatialGrid, z: u32, x: u32, y: u32, query: &TileQuery) -> Result<Vec<u8>> {
+    if z > 14 {
+        bail!("max raster tile zoom is 14 for this proof renderer");
+    }
+    let tile_size = 256usize;
+    let (min, max) = match (query.min, query.max) {
+        (Some(min), Some(max)) if max > min => (min, max),
+        _ => default_range_for_variable(&grid.variable, grid.values.as_ref()),
+    };
+    let palette = query.palette.as_deref().unwrap_or_else(|| default_palette_for_variable(&grid.variable));
+    let mut rgba = vec![0u8; tile_size * tile_size * 4];
+    for py in 0..tile_size {
+        for px in 0..tile_size {
+            let (lon, lat) = web_mercator_tile_lon_lat(z, x, y, px, py, tile_size);
+            let Some(index) = grid_index_for_latlon(grid, lat, lon) else {
+                continue;
+            };
+            let value = grid.values.get(index).copied().unwrap_or(f32::NAN);
+            let color = color_for_value(value, min, max, palette);
+            let dst = (py * tile_size + px) * 4;
+            rgba[dst..dst + 4].copy_from_slice(&color);
+        }
+    }
+    encode_png_rgba(tile_size as u32, tile_size as u32, &rgba)
+}
+
+fn encode_png_rgba(width: u32, height: u32, rgba: &[u8]) -> Result<Vec<u8>> {
+    let mut out = Vec::new();
+    {
+        let mut encoder = png::Encoder::new(&mut out, width, height);
+        encoder.set_color(png::ColorType::Rgba);
+        encoder.set_depth(png::BitDepth::Eight);
+        encoder.set_compression(png::Compression::Fast);
+        let mut writer = encoder.write_header()?;
+        writer.write_image_data(rgba)?;
+    }
+    Ok(out)
+}
+
+fn web_mercator_tile_lon_lat(z: u32, x: u32, y: u32, px: usize, py: usize, tile_size: usize) -> (f64, f64) {
+    let n = 2.0_f64.powi(z as i32);
+    let fx = (x as f64 + (px as f64 + 0.5) / tile_size as f64) / n;
+    let fy = (y as f64 + (py as f64 + 0.5) / tile_size as f64) / n;
+    let lon = fx * 360.0 - 180.0;
+    let lat_rad = (std::f64::consts::PI * (1.0 - 2.0 * fy)).sinh().atan();
+    (lon, lat_rad.to_degrees())
+}
+
+fn grid_index_for_latlon(grid: &SpatialGrid, lat: f64, lon: f64) -> Option<usize> {
+    if grid.model == "hrrr" && grid.nx == 1799 && grid.ny == 1059 {
+        let hrrr = HrrrLambert::default();
+        let (xf, yf) = hrrr.project_relative(lat, lon);
+        let x = (xf / hrrr.dx).round();
+        let y = (yf / hrrr.dy).round();
+        if x < 0.0 || y < 0.0 || x > (grid.nx - 1) as f64 || y > (grid.ny - 1) as f64 {
+            return None;
+        }
+        return Some(y as usize * grid.nx + x as usize);
+    }
+    if !lat.is_finite() || !lon.is_finite() {
+        return None;
+    }
+    let lon_east = if lon < 0.0 { lon + 360.0 } else { lon };
+    let x = (lon_east / 360.0 * grid.nx as f64)
+        .floor()
+        .rem_euclid(grid.nx as f64) as usize;
+    let y = ((90.0 - lat) / 180.0 * grid.ny as f64).floor() as isize;
+    if y < 0 || y >= grid.ny as isize {
+        return None;
+    }
+    Some(y as usize * grid.nx + x.min(grid.nx - 1))
+}
+
+fn default_range_for_variable(variable: &str, values: &[f32]) -> (f32, f32) {
+    let lower = variable.to_ascii_lowercase();
+    if lower.contains("rh") || lower.contains("humidity") && !lower.contains("specific") {
+        return (0.0, 100.0);
+    }
+    if lower.contains("vpd") {
+        return (0.0, 5.0);
+    }
+    if lower.contains("temperature") || lower.contains("dewpoint") || lower.contains("heat_index") || lower.contains("wind_chill") {
+        return (-35.0, 45.0);
+    }
+    if lower.contains("wind") {
+        return (0.0, 45.0);
+    }
+    if lower.contains("cape") {
+        return (0.0, 5000.0);
+    }
+    if lower.contains("precip") || lower.contains("qpf") {
+        return (0.0, 75.0);
+    }
+    if lower.contains("visibility") {
+        return (0.0, 16093.0);
+    }
+    if lower.contains("height") {
+        return finite_min_max(values).unwrap_or((0.0, 12000.0));
+    }
+    finite_min_max(values).unwrap_or((0.0, 1.0))
+}
+
+fn finite_min_max(values: &[f32]) -> Option<(f32, f32)> {
+    let mut min = f32::INFINITY;
+    let mut max = f32::NEG_INFINITY;
+    for value in values.iter().copied().filter(|value| value.is_finite()) {
+        min = min.min(value);
+        max = max.max(value);
+    }
+    if min.is_finite() && max.is_finite() && max > min {
+        Some((min, max))
+    } else {
+        None
+    }
+}
+
+fn default_palette_for_variable(variable: &str) -> &'static str {
+    let lower = variable.to_ascii_lowercase();
+    if lower.contains("rh") || lower.contains("humidity") && !lower.contains("specific") {
+        "humidity"
+    } else if lower.contains("vpd") || lower.contains("cape") || lower.contains("precip") || lower.contains("qpf") {
+        "magma"
+    } else if lower.contains("wind") {
+        "wind"
+    } else {
+        "temperature"
+    }
+}
+
+fn color_for_value(value: f32, min: f32, max: f32, palette: &str) -> [u8; 4] {
+    if !value.is_finite() || max <= min {
+        return [0, 0, 0, 0];
+    }
+    let t = ((value - min) / (max - min)).clamp(0.0, 1.0);
+    let stops: &[[u8; 3]] = match palette {
+        "humidity" => &[[120, 72, 32], [214, 180, 92], [120, 190, 110], [20, 120, 90], [15, 70, 110]],
+        "magma" => &[[18, 10, 38], [78, 18, 90], [150, 38, 85], [220, 87, 50], [252, 190, 75]],
+        "wind" => &[[238, 245, 255], [127, 184, 214], [62, 146, 135], [230, 190, 80], [190, 70, 60]],
+        "gray" | "grey" => &[[30, 30, 30], [90, 90, 90], [150, 150, 150], [210, 210, 210], [250, 250, 250]],
+        _ => &[[52, 84, 180], [42, 170, 220], [70, 180, 110], [245, 210, 70], [210, 60, 50]],
+    };
+    let scaled = t * (stops.len() - 1) as f32;
+    let i = scaled.floor() as usize;
+    let j = (i + 1).min(stops.len() - 1);
+    let local = scaled - i as f32;
+    let mut out = [0u8; 4];
+    for channel in 0..3 {
+        out[channel] = (stops[i][channel] as f32 * (1.0 - local) + stops[j][channel] as f32 * local)
+            .round()
+            .clamp(0.0, 255.0) as u8;
+    }
+    out[3] = 210;
+    out
+}
+
 fn read_spatial_wxa_grid(path: &Path, forecast_hour: u32) -> Result<SpatialGrid> {
     let (bytes, meta, index) = read_wxa_dense2d(path)?;
     let mut values = vec![f32::NAN; meta.nx * meta.ny];
@@ -2749,6 +3462,51 @@ fn raw_variable_for_product(product: &str) -> Option<&'static str> {
     }
 }
 
+fn parse_pressure_grid_product(product: &str, available_levels: &[u16]) -> Option<PressureGridSpec> {
+    let lower = product.to_ascii_lowercase();
+    let (level_text, rest) = lower.split_once("mb_")?;
+    let level_hpa = level_text.parse::<u16>().ok()?;
+    if !available_levels.contains(&level_hpa) {
+        return None;
+    }
+    let kind = if rest == "temperature" || rest == "temperature_height_winds" {
+        PressureGridKind::Variable("TMP")
+    } else if rest == "height" || rest == "height_winds" {
+        PressureGridKind::Variable("HGT")
+    } else if rest == "specific_humidity" || rest == "q" {
+        PressureGridKind::Variable("SPFH")
+    } else if rest == "u_wind" || rest == "ugrd" {
+        PressureGridKind::Variable("UGRD")
+    } else if rest == "v_wind" || rest == "vgrd" {
+        PressureGridKind::Variable("VGRD")
+    } else if rest == "wind_speed" || rest == "winds" {
+        PressureGridKind::WindSpeed
+    } else if rest == "dewpoint" || rest == "dewpoint_height_winds" {
+        PressureGridKind::Dewpoint
+    } else if rest == "rh" || rest == "relative_humidity" || rest == "rh_height_winds" {
+        PressureGridKind::RelativeHumidity
+    } else if rest == "absolute_vorticity" || rest == "absolute_vorticity_height_winds" {
+        PressureGridKind::Variable("ABSV")
+    } else {
+        return None;
+    };
+    let units = match kind {
+        PressureGridKind::Variable("TMP") | PressureGridKind::Dewpoint => "degC",
+        PressureGridKind::Variable("HGT") => "m",
+        PressureGridKind::Variable("SPFH") => "kg/kg",
+        PressureGridKind::Variable("UGRD") | PressureGridKind::Variable("VGRD") | PressureGridKind::WindSpeed => "m/s",
+        PressureGridKind::Variable("ABSV") => "s^-1",
+        PressureGridKind::RelativeHumidity => "%",
+        PressureGridKind::Variable(_) => "unknown",
+    };
+    Some(PressureGridSpec {
+        output_name: product.to_string(),
+        units,
+        level_hpa,
+        kind,
+    })
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum WindowReducer {
     Min,
@@ -2814,6 +3572,12 @@ fn finite3(a: f32, b: f32, c: f32) -> Option<(f32, f32, f32)> {
 fn vapor_pressure_deficit_kpa(temp_c: f32, rh_pct: f32) -> f32 {
     let es = 0.6108 * ((17.27 * temp_c) / (temp_c + 237.3)).exp();
     es * (1.0 - (rh_pct / 100.0).clamp(0.0, 1.5))
+}
+
+fn relative_humidity_from_temp_dewpoint_c(temp_c: f32, dewpoint_c: f32) -> f32 {
+    let es_td = ((17.625 * dewpoint_c) / (243.04 + dewpoint_c)).exp();
+    let es_t = ((17.625 * temp_c) / (243.04 + temp_c)).exp();
+    (100.0 * es_td / es_t).clamp(0.0, 150.0)
 }
 
 fn heat_index_c(temp_c: f32, rh_pct: f32) -> f32 {
