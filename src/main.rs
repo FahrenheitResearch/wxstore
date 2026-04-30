@@ -26,6 +26,12 @@ const WXP_MAGIC: &[u8; 8] = b"ORWXWXP0";
 const WXP_VERSION: u32 = 1;
 const WXP_HEADER_LEN: usize = 64;
 const WXP_INDEX_RECORD_LEN: usize = 16;
+const WXA_DENSE2D_MAGIC: &[u8; 8] = b"WXAD2D1!";
+const WXA_DENSE2D_VERSION: u32 = 1;
+const WXA_DENSE2D_HEADER_LEN: usize = 64;
+const WXA_DENSE2D_INDEX_RECORD_LEN: usize = 64;
+const WXA_SPATIAL_CHUNK_Y: usize = 256;
+const WXA_SPATIAL_CHUNK_X: usize = 256;
 const WXBIN_MAGIC: &[u8; 8] = b"WXPTBIN1";
 const MISSING_I16: i16 = i16::MIN;
 const CACHE_LIMIT: usize = 512;
@@ -135,6 +141,8 @@ struct MaterializeSpatialArgs {
     products: String,
     #[arg(long, default_value = "0-2")]
     hours: String,
+    #[arg(long, default_value = "wxa")]
+    output_format: String,
 }
 
 #[tokio::main]
@@ -222,52 +230,102 @@ fn materialize_spatial(args: MaterializeSpatialArgs) -> Result<()> {
     let lane = SpatialLane::open(&args.spatial_root)?;
     let products = split_csv(&args.products);
     let hours = parse_hours_u32(&args.hours)?;
+    let output_format = args.output_format.to_ascii_lowercase();
     if products.is_empty() {
         bail!("--products must list at least one product");
     }
     if hours.is_empty() {
         bail!("--hours must list at least one hour");
     }
+    if output_format != "wxa" && output_format != "zarr" {
+        bail!("--output-format must be 'wxa' or 'zarr'");
+    }
 
     let mut wrote = Vec::new();
     let mut errors = Vec::new();
+
     for product in products {
-        for hour in &hours {
-            let item_started = Instant::now();
-            match lane.read_grid(&args.model, &args.run, args.member.as_deref(), &product, *hour) {
-                Ok(grid) => {
-                    let path = match write_spatial_zarr_grid(
-                        &args.spatial_root,
-                        &args.model,
-                        &args.run,
-                        args.member.as_deref(),
-                        &product,
-                        *hour,
-                        &grid,
-                    ) {
-                        Ok(path) => path,
-                        Err(err) => {
-                            errors.push(json!({
-                                "product": product,
-                                "hour": hour,
-                                "error": err.to_string()
-                            }));
-                            continue;
-                        }
-                    };
-                    wrote.push(json!({
+        if output_format == "wxa" {
+            let product_started = Instant::now();
+            let mut grids = Vec::new();
+            for hour in &hours {
+                match lane.read_grid(&args.model, &args.run, args.member.as_deref(), &product, *hour) {
+                    Ok(grid) => grids.push(grid),
+                    Err(err) => errors.push(json!({
                         "product": product,
                         "hour": hour,
-                        "path": path,
-                        "bytes": fs::metadata(&path).map(|meta| meta.len()).unwrap_or(0),
-                        "elapsed_ms": item_started.elapsed().as_millis()
-                    }));
+                        "error": err.to_string()
+                    })),
                 }
-                Err(err) => errors.push(json!({
-                    "product": product,
-                    "hour": hour,
-                    "error": err.to_string()
-                })),
+            }
+            if !grids.is_empty() {
+                match write_spatial_wxa_grids(
+                    &args.spatial_root,
+                    &args.model,
+                    &args.run,
+                    args.member.as_deref(),
+                    &product,
+                    &grids,
+                ) {
+                    Ok(path) => {
+                        let bytes = fs::metadata(&path).map(|meta| meta.len()).unwrap_or(0);
+                        for grid in &grids {
+                            wrote.push(json!({
+                                "product": product,
+                                "hour": grid.forecast_hour,
+                                "path": path,
+                                "bytes": bytes,
+                                "format": "wxa_dense2d",
+                                "elapsed_ms": product_started.elapsed().as_millis()
+                            }));
+                        }
+                    }
+                    Err(err) => errors.push(json!({
+                        "product": product,
+                        "hours": hours,
+                        "error": err.to_string()
+                    })),
+                }
+            }
+        } else {
+            for hour in &hours {
+                let item_started = Instant::now();
+                match lane.read_grid(&args.model, &args.run, args.member.as_deref(), &product, *hour) {
+                    Ok(grid) => {
+                        let path = match write_spatial_zarr_grid(
+                            &args.spatial_root,
+                            &args.model,
+                            &args.run,
+                            args.member.as_deref(),
+                            &product,
+                            *hour,
+                            &grid,
+                        ) {
+                            Ok(path) => path,
+                            Err(err) => {
+                                errors.push(json!({
+                                    "product": product,
+                                    "hour": hour,
+                                    "error": err.to_string()
+                                }));
+                                continue;
+                            }
+                        };
+                        wrote.push(json!({
+                            "product": product,
+                            "hour": hour,
+                            "path": path,
+                            "bytes": fs::metadata(&path).map(|meta| meta.len()).unwrap_or(0),
+                            "format": "zarr_v2",
+                            "elapsed_ms": item_started.elapsed().as_millis()
+                        }));
+                    }
+                    Err(err) => errors.push(json!({
+                        "product": product,
+                        "hour": hour,
+                        "error": err.to_string()
+                    })),
+                }
             }
         }
     }
@@ -278,6 +336,7 @@ fn materialize_spatial(args: MaterializeSpatialArgs) -> Result<()> {
             "model": args.model,
             "run": args.run,
             "member": args.member,
+            "output_format": output_format,
             "hours": hours,
             "wrote_count": wrote.len(),
             "error_count": errors.len(),
@@ -841,7 +900,7 @@ fn run_manifest_json(
             "notes": [
                 "No Open-Meteo file format or code is used by this service.",
                 "Diagnostic lane currently wraps a sparse precomputed diagnostic brick until dense diagnostics are built.",
-                "Spatial lane is a read-only adapter for local model-run spatial arrays until native WXA spatial files are built."
+                "Spatial lane serves native WXA dense2d products and falls back to local model-run Zarr arrays only when a WXA product is unavailable."
             ]
         }
     })
@@ -1536,6 +1595,47 @@ struct ZarrCompressor {
     id: String,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct WxaDense2dMeta {
+    schema: String,
+    model: String,
+    run: String,
+    member: Option<String>,
+    variable: String,
+    units: String,
+    nx: usize,
+    ny: usize,
+    forecast_hours: Vec<u32>,
+    chunk_y: usize,
+    chunk_x: usize,
+    dtype: String,
+    codec: String,
+    grid: Value,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct WxaDense2dHeader {
+    metadata_len: usize,
+    index_count: usize,
+    index_offset: usize,
+    payload_offset: usize,
+}
+
+#[derive(Debug, Clone)]
+struct WxaDense2dIndexRecord {
+    forecast_hour: u32,
+    chunk_y: usize,
+    chunk_x: usize,
+    y_count: usize,
+    x_count: usize,
+    raw_len: usize,
+    offset: usize,
+    len: usize,
+    min: f32,
+    max: f32,
+    valid_count: u32,
+}
+
 struct SpatialLane {
     root: PathBuf,
     grid_cache: RwLock<HashMap<String, Arc<SpatialGrid>>>,
@@ -1595,8 +1695,8 @@ impl SpatialLane {
             "schema": "wxstore.lane.v1",
             "id": "surface_spatial",
             "status": "ready",
-            "role": "canonical_surface_spatial_adapter",
-            "format": "zarr_v2_read_adapter",
+            "role": "native_surface_and_map_spatial_lane",
+            "format": "wxa_dense2d_native_with_zarr_v2_source_adapter",
             "products": ["forecast_point", "grid_field", "map_source"],
             "models": models,
             "cache": {
@@ -1604,8 +1704,8 @@ impl SpatialLane {
                 "entries": self.grid_cache.read().map(|cache| cache.len()).unwrap_or(0)
             },
             "notes": [
-                "The API surface is WxStore-native; this adapter reads existing local spatial model arrays.",
-                "Native WXA spatial containers can replace the adapter without changing endpoint contracts."
+                "WXA dense2d files are the native WxStore spatial serving format.",
+                "Existing local Zarr-v2 arrays are still readable as source/proof adapters."
             ]
         })
     }
@@ -1692,12 +1792,14 @@ impl SpatialLane {
                     let path = entry.path();
                     if path.is_dir() && path.extension().is_some_and(|ext| ext == "zarr") {
                         path.file_stem().map(|name| name.to_string_lossy().to_string())
+                    } else if path.is_file() && path.extension().is_some_and(|ext| ext == "wxa") {
+                        path.file_stem().map(|name| name.to_string_lossy().to_string())
                     } else {
                         None
                     }
                 })
-                .collect::<Vec<_>>();
-            let mut vars = vars;
+                .collect::<BTreeSet<_>>();
+            let mut vars = vars.into_iter().collect::<Vec<_>>();
             vars.sort();
             return Ok(vars);
         }
@@ -1717,6 +1819,11 @@ impl SpatialLane {
         member: Option<&str>,
         variable: &str,
     ) -> Result<Vec<u32>> {
+        let wxa_path = self.wxa_file_path(model, run, member, variable);
+        if wxa_path.is_file() {
+            let (_, meta, _) = read_wxa_dense2d(&wxa_path)?;
+            return Ok(meta.forecast_hours);
+        }
         let array_dir = self.array_dir(model, run, member, variable)?;
         let mut hours = BTreeSet::new();
         for entry in fs::read_dir(&array_dir).with_context(|| format!("read {}", array_dir.display()))? {
@@ -1774,6 +1881,19 @@ impl SpatialLane {
             .and_then(|cache| cache.get(&cache_key).cloned())
         {
             return Ok((*grid).clone());
+        }
+
+        let wxa_path = self.wxa_file_path(model, run, member, variable);
+        if wxa_path.is_file() {
+            let grid = read_spatial_wxa_grid(&wxa_path, forecast_hour)
+                .with_context(|| format!("read native WXA {}", wxa_path.display()))?;
+            if let Ok(mut cache) = self.grid_cache.write() {
+                if cache.len() > 64 {
+                    cache.clear();
+                }
+                cache.insert(cache_key, Arc::new(grid.clone()));
+            }
+            return Ok(grid);
         }
 
         let array_dir = self.array_dir(model, run, member, variable)?;
@@ -2136,6 +2256,16 @@ impl SpatialLane {
         bail!("spatial variable '{variable}' is not available for {model}/{run}");
     }
 
+    fn wxa_file_path(
+        &self,
+        model: &str,
+        run: &str,
+        member: Option<&str>,
+        variable: &str,
+    ) -> PathBuf {
+        self.array_base(model, run, member).join(format!("{variable}.wxa"))
+    }
+
     fn array_exists(&self, model: &str, run: &str, member: Option<&str>, variable: &str) -> bool {
         let key = format!("{}|{}|{}|{}", model, run, member.unwrap_or("-"), variable);
         if let Some(value) = self
@@ -2146,7 +2276,8 @@ impl SpatialLane {
         {
             return value;
         }
-        let exists = self.array_dir(model, run, member, variable).is_ok();
+        let exists = self.wxa_file_path(model, run, member, variable).is_file()
+            || self.array_dir(model, run, member, variable).is_ok();
         if let Ok(mut cache) = self.array_exists_cache.write() {
             cache.insert(key, exists);
         }
@@ -2254,6 +2385,251 @@ fn write_spatial_zarr_grid(
     Ok(data_dir)
 }
 
+fn write_spatial_wxa_grids(
+    root: &Path,
+    model: &str,
+    run: &str,
+    member: Option<&str>,
+    product: &str,
+    grids: &[SpatialGrid],
+) -> Result<PathBuf> {
+    let first = grids
+        .first()
+        .ok_or_else(|| anyhow!("cannot write empty WXA product"))?;
+    for grid in grids {
+        if grid.nx != first.nx || grid.ny != first.ny {
+            bail!("all WXA grids for a product must share dimensions");
+        }
+    }
+
+    let mut base = root.join(model).join(run);
+    if let Some(member) = member {
+        base = base.join("members").join(member);
+    }
+    fs::create_dir_all(&base)?;
+    let path = base.join(format!("{product}.wxa"));
+    let tmp_path = base.join(format!("{product}.wxa.tmp"));
+
+    let cy = WXA_SPATIAL_CHUNK_Y.min(first.ny);
+    let cx = WXA_SPATIAL_CHUNK_X.min(first.nx);
+    let n_chunks_y = first.ny.div_ceil(cy);
+    let n_chunks_x = first.nx.div_ceil(cx);
+
+    let mut records = Vec::<WxaDense2dIndexRecord>::new();
+    let mut payload = Vec::<u8>::new();
+    for grid in grids {
+        for chunk_y in 0..n_chunks_y {
+            for chunk_x in 0..n_chunks_x {
+                let y0 = chunk_y * cy;
+                let x0 = chunk_x * cx;
+                let y1 = (y0 + cy).min(grid.ny);
+                let x1 = (x0 + cx).min(grid.nx);
+                let y_count = y1 - y0;
+                let x_count = x1 - x0;
+                let mut raw = Vec::with_capacity(y_count * x_count * 4);
+                let mut min = f32::INFINITY;
+                let mut max = f32::NEG_INFINITY;
+                let mut valid_count = 0u32;
+                for yy in 0..y_count {
+                    for xx in 0..x_count {
+                        let value = grid.values[(y0 + yy) * grid.nx + (x0 + xx)];
+                        if value.is_finite() {
+                            min = min.min(value);
+                            max = max.max(value);
+                            valid_count += 1;
+                        }
+                        raw.extend_from_slice(&value.to_le_bytes());
+                    }
+                }
+                if valid_count == 0 {
+                    min = f32::NAN;
+                    max = f32::NAN;
+                }
+                let compressed = zstd::stream::encode_all(raw.as_slice(), 1)
+                    .with_context(|| format!("compress WXA {product} f{:03}", grid.forecast_hour))?;
+                let offset = payload.len();
+                let len = compressed.len();
+                payload.extend_from_slice(&compressed);
+                records.push(WxaDense2dIndexRecord {
+                    forecast_hour: grid.forecast_hour,
+                    chunk_y,
+                    chunk_x,
+                    y_count,
+                    x_count,
+                    raw_len: raw.len(),
+                    offset,
+                    len,
+                    min,
+                    max,
+                    valid_count,
+                });
+            }
+        }
+    }
+
+    let mut forecast_hours = grids.iter().map(|grid| grid.forecast_hour).collect::<Vec<_>>();
+    forecast_hours.sort_unstable();
+    forecast_hours.dedup();
+    let meta = WxaDense2dMeta {
+        schema: "wxstore.wxa.dense2d.v1".to_string(),
+        model: model.to_string(),
+        run: run.to_string(),
+        member: member.map(str::to_string),
+        variable: product.to_string(),
+        units: first.units.clone(),
+        nx: first.nx,
+        ny: first.ny,
+        forecast_hours,
+        chunk_y: cy,
+        chunk_x: cx,
+        dtype: "f32_le".to_string(),
+        codec: "zstd_level_1".to_string(),
+        grid: first.grid_meta(),
+    };
+    let meta_bytes = serde_json::to_vec(&meta)?;
+    let index_offset = WXA_DENSE2D_HEADER_LEN + meta_bytes.len();
+    let payload_offset = index_offset + records.len() * WXA_DENSE2D_INDEX_RECORD_LEN;
+
+    let mut output = Vec::with_capacity(payload_offset + payload.len());
+    output.extend_from_slice(WXA_DENSE2D_MAGIC);
+    output.extend_from_slice(&WXA_DENSE2D_VERSION.to_le_bytes());
+    output.extend_from_slice(&(meta_bytes.len() as u32).to_le_bytes());
+    output.extend_from_slice(&(records.len() as u64).to_le_bytes());
+    output.extend_from_slice(&(index_offset as u64).to_le_bytes());
+    output.extend_from_slice(&(payload_offset as u64).to_le_bytes());
+    output.resize(WXA_DENSE2D_HEADER_LEN, 0);
+    output.extend_from_slice(&meta_bytes);
+    for record in &records {
+        output.extend_from_slice(&record.forecast_hour.to_le_bytes());
+        output.extend_from_slice(&(record.chunk_y as u32).to_le_bytes());
+        output.extend_from_slice(&(record.chunk_x as u32).to_le_bytes());
+        output.extend_from_slice(&(record.y_count as u32).to_le_bytes());
+        output.extend_from_slice(&(record.x_count as u32).to_le_bytes());
+        output.extend_from_slice(&(record.raw_len as u32).to_le_bytes());
+        output.extend_from_slice(&((payload_offset + record.offset) as u64).to_le_bytes());
+        output.extend_from_slice(&(record.len as u64).to_le_bytes());
+        output.extend_from_slice(&record.min.to_le_bytes());
+        output.extend_from_slice(&record.max.to_le_bytes());
+        output.extend_from_slice(&record.valid_count.to_le_bytes());
+        output.resize(output.len() + 12, 0);
+    }
+    output.extend_from_slice(&payload);
+    fs::write(&tmp_path, output)?;
+    fs::rename(&tmp_path, &path)?;
+    Ok(path)
+}
+
+fn read_spatial_wxa_grid(path: &Path, forecast_hour: u32) -> Result<SpatialGrid> {
+    let (bytes, meta, index) = read_wxa_dense2d(path)?;
+    let mut values = vec![f32::NAN; meta.nx * meta.ny];
+    let mut found = false;
+    for record in index
+        .iter()
+        .filter(|record| record.forecast_hour == forecast_hour)
+    {
+        let end = record.offset + record.len;
+        if end > bytes.len() {
+            bail!("WXA chunk exceeds file length");
+        }
+        let decoded = zstd::stream::decode_all(&bytes[record.offset..end])
+            .with_context(|| format!("decompress WXA chunk f{forecast_hour:03}"))?;
+        if decoded.len() != record.raw_len {
+            bail!(
+                "WXA chunk raw length mismatch: got {}, expected {}",
+                decoded.len(),
+                record.raw_len
+            );
+        }
+        let y0 = record.chunk_y * meta.chunk_y;
+        let x0 = record.chunk_x * meta.chunk_x;
+        let mut src = 0usize;
+        for yy in 0..record.y_count {
+            for xx in 0..record.x_count {
+                let dst = (y0 + yy) * meta.nx + (x0 + xx);
+                values[dst] = f32::from_le_bytes([
+                    decoded[src],
+                    decoded[src + 1],
+                    decoded[src + 2],
+                    decoded[src + 3],
+                ]);
+                src += 4;
+            }
+        }
+        found = true;
+    }
+    if !found {
+        bail!("forecast hour f{forecast_hour:03} is not available in {}", path.display());
+    }
+    Ok(SpatialGrid {
+        model: meta.model,
+        run_id: meta.run,
+        member: meta.member,
+        variable: meta.variable,
+        units: meta.units,
+        forecast_hour,
+        nx: meta.nx,
+        ny: meta.ny,
+        values: Arc::new(values),
+    })
+}
+
+fn read_wxa_dense2d(path: &Path) -> Result<(Vec<u8>, WxaDense2dMeta, Vec<WxaDense2dIndexRecord>)> {
+    let bytes = fs::read(path).with_context(|| format!("read {}", path.display()))?;
+    let header = parse_wxa_dense2d_header(&bytes)?;
+    let meta_end = WXA_DENSE2D_HEADER_LEN + header.metadata_len;
+    if meta_end > bytes.len() {
+        bail!("WXA metadata exceeds file length");
+    }
+    let meta: WxaDense2dMeta = serde_json::from_slice(&bytes[WXA_DENSE2D_HEADER_LEN..meta_end])
+        .with_context(|| format!("parse WXA metadata {}", path.display()))?;
+    let index_end = header.index_offset + header.index_count * WXA_DENSE2D_INDEX_RECORD_LEN;
+    if index_end > bytes.len() || header.payload_offset > bytes.len() {
+        bail!("WXA index exceeds file length");
+    }
+    let mut records = Vec::with_capacity(header.index_count);
+    let mut offset = header.index_offset;
+    for _ in 0..header.index_count {
+        records.push(WxaDense2dIndexRecord {
+            forecast_hour: u32_from(&bytes[offset..offset + 4])?,
+            chunk_y: u32_from(&bytes[offset + 4..offset + 8])? as usize,
+            chunk_x: u32_from(&bytes[offset + 8..offset + 12])? as usize,
+            y_count: u32_from(&bytes[offset + 12..offset + 16])? as usize,
+            x_count: u32_from(&bytes[offset + 16..offset + 20])? as usize,
+            raw_len: u32_from(&bytes[offset + 20..offset + 24])? as usize,
+            offset: u64_from(&bytes[offset + 24..offset + 32])? as usize,
+            len: u64_from(&bytes[offset + 32..offset + 40])? as usize,
+            min: f32_from(&bytes[offset + 40..offset + 44])?,
+            max: f32_from(&bytes[offset + 44..offset + 48])?,
+            valid_count: u32_from(&bytes[offset + 48..offset + 52])?,
+        });
+        offset += WXA_DENSE2D_INDEX_RECORD_LEN;
+    }
+    Ok((bytes, meta, records))
+}
+
+fn parse_wxa_dense2d_header(bytes: &[u8]) -> Result<WxaDense2dHeader> {
+    if bytes.len() < WXA_DENSE2D_HEADER_LEN {
+        bail!("file too short for WXA header");
+    }
+    if &bytes[0..8] != WXA_DENSE2D_MAGIC {
+        bail!("bad WXA dense2d magic");
+    }
+    let version = u32_from(&bytes[8..12])?;
+    if version != WXA_DENSE2D_VERSION {
+        bail!("unsupported WXA dense2d version {version}");
+    }
+    let header = WxaDense2dHeader {
+        metadata_len: u32_from(&bytes[12..16])? as usize,
+        index_count: u64_from(&bytes[16..24])? as usize,
+        index_offset: u64_from(&bytes[24..32])? as usize,
+        payload_offset: u64_from(&bytes[32..40])? as usize,
+    };
+    if header.index_offset < WXA_DENSE2D_HEADER_LEN || header.payload_offset < header.index_offset {
+        bail!("invalid WXA dense2d offsets");
+    }
+    Ok(header)
+}
+
 fn compress_zlib(data: &[u8], level: u32) -> Result<Vec<u8>> {
     use flate2::write::ZlibEncoder;
     use flate2::Compression;
@@ -2323,8 +2699,19 @@ fn spatial_grid_meta(model: &str, nx: usize, ny: usize) -> Value {
 }
 
 fn units_for_variable(variable: &str) -> &'static str {
+    if let Some(window) = parse_windowed_product(variable) {
+        return units_for_variable(window.raw_variable);
+    }
     match variable {
-        "temperature_2m" | "dew_point_2m" | "apparent_temperature" | "temperature" | "dew_point" => "degC",
+        "temperature_2m"
+        | "dew_point_2m"
+        | "dewpoint_depression_2m"
+        | "heat_index_2m"
+        | "wind_chill_2m"
+        | "apparent_temperature_2m"
+        | "apparent_temperature"
+        | "temperature"
+        | "dew_point" => "degC",
         "relative_humidity_2m" | "relative_humidity" | "cloud_cover" | "cloud_cover_low" | "cloud_cover_mid" | "cloud_cover_high" => "%",
         "pressure_msl" | "surface_pressure" => "hPa",
         "wind_speed_10m" | "wind_gusts_10m" | "u_component_of_wind_10m" | "v_component_of_wind_10m" | "wind_speed" | "u_component_of_wind" | "v_component_of_wind" => "m/s",
@@ -2335,6 +2722,7 @@ fn units_for_variable(variable: &str) -> &'static str {
         "shortwave_radiation" | "direct_radiation" | "diffuse_radiation" => "W/m^2",
         "cape" | "convective_inhibition" => "J/kg",
         "visibility" => "m",
+        "vpd_2m" => "kPa",
         _ => "unknown",
     }
 }

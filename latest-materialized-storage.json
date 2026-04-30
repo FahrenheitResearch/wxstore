@@ -1,42 +1,102 @@
 [
     {
-        "path":  "hrrr\\20260405_18z\\dewpoint_depression_2m.zarr",
-        "mb":  6.48,
-        "bytes":  6794701
+        "path":  "ecmwf_ens\\20260412_00z\\members\\001\\dewpoint_depression_2m.wxa",
+        "bytes":  1453139,
+        "mb":  1.386
     },
     {
-        "path":  "hrrr\\20260405_18z\\vpd_2m.zarr",
-        "mb":  14.843,
-        "bytes":  15563586
+        "path":  "ecmwf_ifs\\20260411_12z\\dewpoint_depression_2m.wxa",
+        "bytes":  2893211,
+        "mb":  2.759
     },
     {
-        "path":  "hrrr\\20260405_18z\\heat_index_2m.zarr",
-        "mb":  6.029,
-        "bytes":  6321374
+        "path":  "gfs\\20260405_12z\\2m_dewpoint_0_24h_max.wxa",
+        "bytes":  2058621,
+        "mb":  1.963
     },
     {
-        "path":  "gfs\\20260405_12z\\dewpoint_depression_2m.zarr",
-        "mb":  3.494,
-        "bytes":  3663682
+        "path":  "gfs\\20260405_12z\\2m_dewpoint_0_24h_min.wxa",
+        "bytes":  2144343,
+        "mb":  2.045
     },
     {
-        "path":  "gfs\\20260405_12z\\vpd_2m.zarr",
-        "mb":  8.51,
-        "bytes":  8923701
+        "path":  "gfs\\20260405_12z\\2m_rh_0_24h_max.wxa",
+        "bytes":  1290031,
+        "mb":  1.23
     },
     {
-        "path":  "gfs\\20260405_12z\\heat_index_2m.zarr",
-        "mb":  3.67,
-        "bytes":  3848107
+        "path":  "gfs\\20260405_12z\\2m_rh_0_24h_min.wxa",
+        "bytes":  1544550,
+        "mb":  1.473
     },
     {
-        "path":  "ecmwf_ifs\\20260411_12z\\dewpoint_depression_2m.zarr",
-        "mb":  2.851,
-        "bytes":  2989920
+        "path":  "gfs\\20260405_12z\\2m_temp_0_24h_max.wxa",
+        "bytes":  2043395,
+        "mb":  1.949
     },
     {
-        "path":  "ecmwf_ens\\20260412_00z\\members\\001\\dewpoint_depression_2m.zarr",
-        "mb":  1.429,
-        "bytes":  1498451
+        "path":  "gfs\\20260405_12z\\2m_temp_0_24h_min.wxa",
+        "bytes":  2082680,
+        "mb":  1.986
+    },
+    {
+        "path":  "gfs\\20260405_12z\\dewpoint_depression_2m.wxa",
+        "bytes":  3915277,
+        "mb":  3.734
+    },
+    {
+        "path":  "gfs\\20260405_12z\\heat_index_2m.wxa",
+        "bytes":  4624376,
+        "mb":  4.41
+    },
+    {
+        "path":  "gfs\\20260405_12z\\vpd_2m.wxa",
+        "bytes":  10210139,
+        "mb":  9.737
+    },
+    {
+        "path":  "hrrr\\20260405_18z\\2m_dewpoint_0_24h_max.wxa",
+        "bytes":  3029813,
+        "mb":  2.889
+    },
+    {
+        "path":  "hrrr\\20260405_18z\\2m_dewpoint_0_24h_min.wxa",
+        "bytes":  3233075,
+        "mb":  3.083
+    },
+    {
+        "path":  "hrrr\\20260405_18z\\2m_rh_0_24h_max.wxa",
+        "bytes":  2617530,
+        "mb":  2.496
+    },
+    {
+        "path":  "hrrr\\20260405_18z\\2m_rh_0_24h_min.wxa",
+        "bytes":  2751957,
+        "mb":  2.624
+    },
+    {
+        "path":  "hrrr\\20260405_18z\\2m_temp_0_24h_max.wxa",
+        "bytes":  2596186,
+        "mb":  2.476
+    },
+    {
+        "path":  "hrrr\\20260405_18z\\2m_temp_0_24h_min.wxa",
+        "bytes":  2739113,
+        "mb":  2.612
+    },
+    {
+        "path":  "hrrr\\20260405_18z\\dewpoint_depression_2m.wxa",
+        "bytes":  6608594,
+        "mb":  6.302
+    },
+    {
+        "path":  "hrrr\\20260405_18z\\heat_index_2m.wxa",
+        "bytes":  6291803,
+        "mb":  6
+    },
+    {
+        "path":  "hrrr\\20260405_18z\\vpd_2m.wxa",
+        "bytes":  18199153,
+        "mb":  17.356
     }
 ]

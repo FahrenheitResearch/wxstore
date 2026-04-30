@@ -38,7 +38,8 @@ New service capabilities:
 
 - `/v1/products` exposes service products plus the rustwx HRRR product inventory.
 - `/v1/grid` now accepts raw variables, rustwx-style direct aliases, stored derived products, cheap virtual derived products, and windowed product patterns.
-- `materialize-spatial` command computes product grids and writes them as served Zarr-v2 spatial arrays.
+- `materialize-spatial` command computes product grids and writes native `.wxa` dense2d spatial arrays by default.
+- The same command can still write Zarr-v2 with `--output-format zarr`, but Zarr is now only a source/proof adapter.
 - Stored product arrays now take priority over virtual compute paths.
 - Product existence is cached so point-forecast routing does not hit the filesystem on every request.
 
@@ -50,7 +51,8 @@ C:\Users\drew\wxstore\target\release\wxstore.exe materialize-spatial `
   --model hrrr `
   --run 20260405_18z `
   --products dewpoint_depression_2m,vpd_2m,heat_index_2m `
-  --hours 0-2
+  --hours 0-2 `
+  --output-format wxa
 ```
 
 ## Local Materialization Timing
@@ -59,32 +61,39 @@ Products materialized from currently available local fields:
 
 | Model | Run | Member | Products | Hours | Product-hour grids | Time |
 | --- | --- | --- | --- | --- | ---: | ---: |
-| HRRR | `20260405_18z` | control | `dewpoint_depression_2m,vpd_2m,heat_index_2m` | `0-2` | 9 | 1.356 s |
-| GFS | `20260405_12z` | control | `dewpoint_depression_2m,vpd_2m,heat_index_2m` | `0-2` | 9 | 0.721 s |
-| ECMWF IFS | `20260411_12z` | control | `dewpoint_depression_2m` | `0,3` | 2 | 0.195 s |
-| ECMWF ENS | `20260412_00z` | `001` | `dewpoint_depression_2m` | `3` | 1 | 0.091 s |
+| HRRR | `20260405_18z` | control | `dewpoint_depression_2m,vpd_2m,heat_index_2m` | `0-2` | 9 | 0.467 s |
+| GFS | `20260405_12z` | control | `dewpoint_depression_2m,vpd_2m,heat_index_2m` | `0-2` | 9 | 0.254 s |
+| ECMWF IFS | `20260411_12z` | control | `dewpoint_depression_2m` | `0,3` | 2 | 0.060 s |
+| ECMWF ENS | `20260412_00z` | `001` | `dewpoint_depression_2m` | `3` | 1 | 0.029 s |
+| HRRR | `20260405_18z` | control | 6 windowed 24h products | `0` | 6 | 0.350 s |
+| GFS | `20260405_12z` | control | 6 windowed 24h products | `0` | 6 | 0.187 s |
 
-Total proof: 21 product-hour grids in 2.363 s.
+Total WXA proof: 33 product-hour grids in 1.347 s.
 
 ## Materialized Storage
 
 | Product directory | Size |
 | --- | ---: |
-| `hrrr/20260405_18z/dewpoint_depression_2m.zarr` | 6.48 MiB |
-| `hrrr/20260405_18z/vpd_2m.zarr` | 14.84 MiB |
-| `hrrr/20260405_18z/heat_index_2m.zarr` | 6.03 MiB |
-| `gfs/20260405_12z/dewpoint_depression_2m.zarr` | 3.49 MiB |
-| `gfs/20260405_12z/vpd_2m.zarr` | 8.51 MiB |
-| `gfs/20260405_12z/heat_index_2m.zarr` | 3.67 MiB |
-| `ecmwf_ifs/20260411_12z/dewpoint_depression_2m.zarr` | 2.85 MiB |
-| `ecmwf_ens/20260412_00z/member 001/dewpoint_depression_2m.zarr` | 1.43 MiB |
+| `hrrr/20260405_18z/dewpoint_depression_2m.wxa` | 6.30 MiB |
+| `hrrr/20260405_18z/vpd_2m.wxa` | 17.36 MiB |
+| `hrrr/20260405_18z/heat_index_2m.wxa` | 6.00 MiB |
+| `hrrr/20260405_18z/6 windowed .wxa files` | 16.18 MiB |
+| `gfs/20260405_12z/dewpoint_depression_2m.wxa` | 3.73 MiB |
+| `gfs/20260405_12z/vpd_2m.wxa` | 9.74 MiB |
+| `gfs/20260405_12z/heat_index_2m.wxa` | 4.41 MiB |
+| `gfs/20260405_12z/6 windowed .wxa files` | 10.65 MiB |
+| `ecmwf_ifs/20260411_12z/dewpoint_depression_2m.wxa` | 2.76 MiB |
+| `ecmwf_ens/20260412_00z/member 001/dewpoint_depression_2m.wxa` | 1.39 MiB |
 
-Current HRRR `20260405_18z` local spatial run after adding derived products:
+Current WXA proof storage:
 
 ```text
-variables: 11
-total:     0.674 GiB
-average:   62.76 MiB per variable
+files:     20
+total:     78.5 MiB
+HRRR:      45.8 MiB
+GFS:       28.5 MiB
+ECMWF IFS: 2.8 MiB
+ECMWF ENS: 1.4 MiB
 ```
 
 ## Serving Benchmarks
@@ -93,12 +102,16 @@ Sequential local raw HTTP, release service on `127.0.0.1:8897`.
 
 | Product | Req/s | P50 | P95 | P99 | Avg payload |
 | --- | ---: | ---: | ---: | ---: | ---: |
-| HRRR raw surface forecast, 3 vars x 3h | 14,592.6 | 5.67 ms | 7.04 ms | 8.44 ms | 1.06 KiB |
-| HRRR materialized derived forecast, 3 vars x 3h | 19,319.1 | 5.74 ms | 7.27 ms | 22.88 ms | 1.08 KiB |
-| GFS materialized derived forecast, 3 vars x 3h | 6,280.0 | 21.16 ms | 38.38 ms | 45.83 ms | 1.06 KiB |
-| HRRR materialized VPD grid binary, `f000` | 475.2 | 32.45 ms | 43.86 ms | 50.98 ms | 7.27 MiB |
-| HRRR 48h temporal sounding binary + diagnostics | 10,925.0 | 15.51 ms | 27.10 ms | 37.94 ms | 30.3 KiB |
-| HRRR 48h temporal sounding compact JSON + diagnostics | 3,852.4 | 24.60 ms | 32.76 ms | 36.25 ms | 112.6 KiB |
+| HRRR WXA derived forecast, 3 vars x 3h | 19,485.6 | 4.76 ms | 5.41 ms | 8.96 ms | 1.07 KiB |
+| GFS WXA derived forecast, 3 vars x 3h | 19,469.0 | 4.65 ms | 5.32 ms | 24.84 ms | 1.05 KiB |
+| ECMWF IFS WXA dewpoint depression, 2h | 19,293.4 | 4.61 ms | 5.47 ms | 25.35 ms | 0.83 KiB |
+| ECMWF ENS member 001 WXA dewpoint depression, 1h | 19,405.3 | 4.65 ms | 5.44 ms | 16.76 ms | 0.80 KiB |
+| HRRR WXA 24h windowed forecast, 3 vars x 1h | 19,508.5 | 4.83 ms | 5.70 ms | 26.51 ms | 0.94 KiB |
+| HRRR WXA VPD grid binary, `f000` | 540.2 | 28.37 ms | 40.05 ms | 46.45 ms | 7.27 MiB |
+| GFS WXA VPD grid binary, `f000` | 1,046.4 | 14.76 ms | 21.47 ms | 23.76 ms | 3.96 MiB |
+| HRRR WXA 24h max temp grid binary, `f000` | 528.2 | 29.01 ms | 41.57 ms | 47.19 ms | 7.27 MiB |
+| HRRR 48h temporal sounding binary + diagnostics | 11,313.2 | 14.91 ms | 27.07 ms | 34.87 ms | 30.3 KiB |
+| HRRR 48h temporal sounding compact JSON + diagnostics | 4,433.0 | 27.85 ms | 40.74 ms | 47.20 ms | 112.6 KiB |
 
 ## Storage Math For Full HRRR Map Product Lanes
 
@@ -112,12 +125,14 @@ one raw f32 grid: 7.27 MiB
 75 fields, 49h raw i16: ~13.0 GiB before compression
 ```
 
-Empirical current Zarr/zlib HRRR spatial average after materialized fields:
+Empirical current WXA proof products:
 
 ```text
-~62.8 MiB per variable for the current mixed 49h/sparse local run
-75 fields estimate from current empirical average: ~4.6 GiB
-safer production range for 75 HRRR 2D fields: ~5-8 GiB/run
+HRRR 3 derived products over 3 hours: 29.7 MiB
+HRRR 6 windowed single-grid products: 16.2 MiB
+75 hourly fields over 49h raw f32: ~26.1 GiB
+75 hourly fields over 49h raw i16: ~13.0 GiB before compression
+safer production range for 75 HRRR WXA 2D fields: ~5-8 GiB/run
 ```
 
 This is only for scalar 2D map/grid fields. Temporal profile lanes are separate:
@@ -131,16 +146,16 @@ native flat intermediate estimate: ~150 GiB, so it should not be retained
 
 ## Important Boundary
 
-The API can now expose and materialize product grids, but the local proof only materialized products whose dependencies are present locally. The final production builder needs to feed WxStore from rustwx direct/derived outputs for every supported product, then write native WXA dense lanes instead of relying on the current proof Zarr adapter.
+The API can now expose and materialize product grids, but the local proof only materialized products whose dependencies are present locally. The final production builder needs to feed WxStore from rustwx direct/derived outputs for every supported product.
 
-The next storage format step is a native WXA dense lane:
+The native WXA dense lane implemented here is:
 
 ```text
 axes: field_id, forecast_hour, y, x
 chunk: field=1, hour=1, y=256, x=256
-payload: append-only compressed chunks
-index: mmap-friendly offsets, codec, stats, checksums
-manifest: field provenance, formula versions, units, dependencies
+payload: zstd-compressed f32 chunks
+index: fixed records with offsets, lengths, min/max, valid counts
+manifest: inline JSON metadata per product file
 ```
 
 The current Zarr adapter remains useful as a source/proof adapter, not the final on-disk serving format.

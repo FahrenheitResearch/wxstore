@@ -14,8 +14,9 @@ Date: 2026-04-29 local
 - Open-Meteo-shaped point forecast output for surface/spatial fields;
 - compact JSON temporal sounding output;
 - custom binary point payloads;
+- native WXA dense2d spatial product materialization and serving;
 - full-grid binary map-source extraction;
-- read-only multi-model spatial lane adapter;
+- read-only multi-model Zarr spatial source adapter for data not yet materialized to WXA;
 - mmap/zstd reader for the custom point-temporal pressure-profile lane;
 - precomputed diagnostic lane integration.
 
@@ -43,7 +44,7 @@ ecmwf_ifs:  20260411_12z, local sparse leads f000/f003
 ecmwf_ens:  20260412_00z, member 001, local sparse lead f003
 ```
 
-The ECMWF local files are sparse because that is what is present on disk. The API advertises available hours through `/v1/variables`.
+Native WXA product files were materialized from those local lanes for currently available dependencies. The ECMWF local files are sparse because that is what is present on disk. The API advertises available hours through `/v1/variables`.
 
 ## Service Command
 
@@ -91,21 +92,43 @@ Point forecast products:
 
 | Scenario | Requests | Concurrency | Failures | Req/s | P50 | P95 | P99 | Avg payload |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| HRRR surface forecast, 3 vars x 3h | 30,000 | 192 | 0 | 19,317.7 | 4.69 ms | 5.40 ms | 5.89 ms | 1.06 KB |
-| GFS surface forecast, 3 vars x 3h | 30,000 | 192 | 0 | 19,634.2 | 4.80 ms | 5.81 ms | 6.22 ms | 1.04 KB |
-| ECMWF IFS surface forecast, 3 vars x 2h | 30,000 | 192 | 0 | 19,334.7 | 4.72 ms | 5.69 ms | 6.18 ms | 0.96 KB |
-| ECMWF ENS member 001 surface forecast, 3 vars x 1h | 30,000 | 192 | 0 | 19,284.5 | 4.30 ms | 5.10 ms | 5.93 ms | 0.90 KB |
-| HRRR 48h temporal sounding binary + basic diagnostics | 30,000 | 192 | 0 | 10,925.0 | 15.51 ms | 27.10 ms | 37.94 ms | 30.3 KB |
-| HRRR 48h temporal sounding compact JSON + basic diagnostics | 10,000 | 96 | 0 | 3,852.4 | 24.60 ms | 32.76 ms | 36.25 ms | 112.6 KB |
+| HRRR WXA derived forecast, 3 vars x 3h | 30,000 | 192 | 0 | 19,485.6 | 4.76 ms | 5.41 ms | 8.96 ms | 1.07 KB |
+| GFS WXA derived forecast, 3 vars x 3h | 30,000 | 192 | 0 | 19,469.0 | 4.65 ms | 5.32 ms | 24.84 ms | 1.05 KB |
+| ECMWF IFS WXA dewpoint depression, 2h | 30,000 | 192 | 0 | 19,293.4 | 4.61 ms | 5.47 ms | 25.35 ms | 0.83 KB |
+| ECMWF ENS member 001 WXA dewpoint depression, 1h | 30,000 | 192 | 0 | 19,405.3 | 4.65 ms | 5.44 ms | 16.76 ms | 0.80 KB |
+| HRRR WXA 24h windowed forecast, 3 vars x 1h | 30,000 | 192 | 0 | 19,508.5 | 4.83 ms | 5.70 ms | 26.51 ms | 0.94 KB |
+| HRRR 48h temporal sounding binary + basic diagnostics | 30,000 | 192 | 0 | 11,313.2 | 14.91 ms | 27.07 ms | 34.87 ms | 30.3 KB |
+| HRRR 48h temporal sounding compact JSON + basic diagnostics | 10,000 | 128 | 0 | 4,433.0 | 27.85 ms | 40.74 ms | 47.20 ms | 112.6 KB |
 
 Full-grid binary map-source products:
 
 | Scenario | Requests | Concurrency | Failures | Req/s | P50 | P95 | P99 | Avg payload |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| HRRR CONUS temperature grid `f000` | 300 | 16 | 0 | 535.1 | 29.39 ms | 40.67 ms | 47.47 ms | 7.27 MB |
-| GFS global temperature grid `f000` | 300 | 16 | 0 | 998.8 | 15.40 ms | 22.91 ms | 27.08 ms | 3.96 MB |
-| ECMWF IFS global temperature grid `f000` | 300 | 16 | 0 | 952.0 | 15.06 ms | 22.96 ms | 27.88 ms | 3.96 MB |
-| ECMWF ENS member 001 global temperature grid `f003` | 300 | 16 | 0 | 995.6 | 14.98 ms | 24.91 ms | 30.89 ms | 3.96 MB |
+| HRRR WXA VPD grid `f000` | 300 | 16 | 0 | 540.2 | 28.37 ms | 40.05 ms | 46.45 ms | 7.27 MB |
+| GFS WXA VPD grid `f000` | 300 | 16 | 0 | 1,046.4 | 14.76 ms | 21.47 ms | 23.76 ms | 3.96 MB |
+| HRRR WXA 24h max temp grid `f000` | 300 | 16 | 0 | 528.2 | 29.01 ms | 41.57 ms | 47.19 ms | 7.27 MB |
+
+## WXA Materialization Timing And Storage
+
+| Model | Run | Member | Products | Hours | Product-hour grids | Time |
+| --- | --- | --- | --- | --- | ---: | ---: |
+| HRRR | `20260405_18z` | control | `dewpoint_depression_2m,vpd_2m,heat_index_2m` | `0-2` | 9 | 0.467 s |
+| GFS | `20260405_12z` | control | `dewpoint_depression_2m,vpd_2m,heat_index_2m` | `0-2` | 9 | 0.254 s |
+| ECMWF IFS | `20260411_12z` | control | `dewpoint_depression_2m` | `0,3` | 2 | 0.060 s |
+| ECMWF ENS | `20260412_00z` | `001` | `dewpoint_depression_2m` | `3` | 1 | 0.029 s |
+| HRRR | `20260405_18z` | control | 6 windowed 24h products | `0` | 6 | 0.350 s |
+| GFS | `20260405_12z` | control | 6 windowed 24h products | `0` | 6 | 0.187 s |
+
+WXA proof storage:
+
+```text
+files:     20
+total:     78.5 MiB
+HRRR:      45.8 MiB
+GFS:       28.5 MiB
+ECMWF IFS: 2.8 MiB
+ECMWF ENS: 1.4 MiB
+```
 
 ## Profile Lane Build Matrix
 
