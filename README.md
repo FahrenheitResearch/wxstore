@@ -106,6 +106,11 @@ The `.wxa` files are WxStore-native: JSON metadata, fixed chunk index, zstd-comp
 
 Sequential raw HTTP benchmark on this local Windows workstation, release build, service on `127.0.0.1:8897`.
 
+Local smoke and lightweight benchmark tooling is documented in
+[`docs/LOCAL_VALIDATION.md`](docs/LOCAL_VALIDATION.md). A release/data-refresh
+gate checklist is in
+[`docs/PRODUCTION_READINESS_CHECKLIST.md`](docs/PRODUCTION_READINESS_CHECKLIST.md).
+
 | Scenario | Requests | Concurrency | Req/s | P50 | P95 | P99 | Avg payload |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
 | HRRR WXA derived forecast, 3 vars x 3h | 30,000 | 192 | 19,485.6 | 4.76 ms | 5.41 ms | 8.96 ms | 1.07 KB |

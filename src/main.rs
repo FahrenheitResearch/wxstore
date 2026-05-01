@@ -1,6 +1,7 @@
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap, VecDeque},
     fs::{self, File},
+    io::Write,
     net::SocketAddr,
     path::{Path, PathBuf},
     sync::{Arc, RwLock},
@@ -9,8 +10,10 @@ use std::{
 
 use anyhow::{anyhow, bail, Context, Result};
 use axum::{
+    body::Body,
     extract::{Path as AxumPath, Query, State},
-    http::{header, HeaderMap, HeaderValue, StatusCode},
+    http::{header, HeaderMap, HeaderValue, Method, Request, StatusCode},
+    middleware::{self, Next},
     response::{Html, IntoResponse, Response},
     routing::get,
     Json, Router,
@@ -20,7 +23,7 @@ use clap::{Parser, Subcommand};
 use memmap2::{Mmap, MmapOptions};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
-use tower_http::cors::CorsLayer;
+use tower_http::cors::{Any, CorsLayer};
 
 const WXP_MAGIC: &[u8; 8] = b"ORWXWXP0";
 const WXP_VERSION: u32 = 1;
@@ -35,6 +38,11 @@ const WXA_SPATIAL_CHUNK_X: usize = 256;
 const WXBIN_MAGIC: &[u8; 8] = b"WXPTBIN1";
 const MISSING_I16: i16 = i16::MIN;
 const CACHE_LIMIT: usize = 512;
+const CACHE_BYTES_LIMIT: usize = 512 * 1024 * 1024;
+const MAX_QUERY_HOURS: usize = 400;
+const MAX_FORECAST_VARIABLES: usize = 96;
+const MAX_GRID_JSON_CELLS: usize = 4_000_000;
+const MAX_TILE_ZOOM: u32 = 14;
 
 const SOUNDING_CORE: &[&str] = &["TMP", "SPFH", "UGRD", "VGRD", "HGT"];
 const BASIC_DIAGNOSTICS: &[&str] = &[
@@ -100,8 +108,11 @@ struct Cli {
 enum Command {
     Serve(ServeArgs),
     Inspect(InspectArgs),
+    InspectSpatial(InspectSpatialArgs),
     MaterializeSpatial(MaterializeSpatialArgs),
     ImportRustwxGrids(ImportRustwxGridsArgs),
+    PublishLatest(PublishLatestArgs),
+    GcSpatial(GcSpatialArgs),
 }
 
 #[derive(Parser, Clone)]
@@ -126,6 +137,14 @@ struct InspectArgs {
     diagnostic_store: Option<PathBuf>,
     #[arg(long)]
     spatial_root: Option<PathBuf>,
+}
+
+#[derive(Parser, Clone)]
+struct InspectSpatialArgs {
+    #[arg(long)]
+    spatial_root: PathBuf,
+    #[arg(long)]
+    model: Option<String>,
 }
 
 #[derive(Parser, Clone)]
@@ -158,6 +177,30 @@ struct ImportRustwxGridsArgs {
     run: Option<String>,
     #[arg(long)]
     member: Option<String>,
+    #[arg(long)]
+    publish_latest: bool,
+}
+
+#[derive(Parser, Clone)]
+struct PublishLatestArgs {
+    #[arg(long)]
+    spatial_root: PathBuf,
+    #[arg(long)]
+    model: String,
+    #[arg(long)]
+    run: String,
+}
+
+#[derive(Parser, Clone)]
+struct GcSpatialArgs {
+    #[arg(long)]
+    spatial_root: PathBuf,
+    #[arg(long)]
+    model: String,
+    #[arg(long, default_value_t = 2)]
+    keep_runs: usize,
+    #[arg(long)]
+    apply: bool,
 }
 
 #[tokio::main]
@@ -182,13 +225,28 @@ async fn main() -> Result<()> {
                 serde_json::to_string_pretty(&store_status(
                     &profile,
                     diagnostic.as_ref(),
-                    spatial.as_ref()
+                    spatial.as_ref(),
+                    None,
                 ))?
             );
             Ok(())
         }
+        Command::InspectSpatial(args) => inspect_spatial(args),
         Command::MaterializeSpatial(args) => materialize_spatial(args),
         Command::ImportRustwxGrids(args) => import_rustwx_grids(args),
+        Command::PublishLatest(args) => {
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&publish_latest_pointer(
+                    &args.spatial_root,
+                    &args.model,
+                    &args.run,
+                    "manual"
+                )?)?
+            );
+            Ok(())
+        }
+        Command::GcSpatial(args) => gc_spatial(args),
     }
 }
 
@@ -212,6 +270,8 @@ async fn serve(args: ServeArgs) -> Result<()> {
 
     let app = Router::new()
         .route("/", get(index))
+        .route("/livez", get(livez))
+        .route("/readyz", get(readyz))
         .route("/v1/status", get(status))
         .route("/api/status", get(status))
         .route("/v1/models", get(models))
@@ -252,7 +312,12 @@ async fn serve(args: ServeArgs) -> Result<()> {
             "/v1/runs/{model}/{domain}/{run}/grid/{x}/{y}/temporal-sounding.bin",
             get(canonical_point_bin),
         )
-        .layer(CorsLayer::permissive())
+        .layer(middleware::from_fn(add_standard_headers))
+        .layer(CorsLayer::new().allow_origin(Any).allow_methods([
+            Method::GET,
+            Method::HEAD,
+            Method::OPTIONS,
+        ]))
         .with_state(state);
 
     let addr: SocketAddr = format!("{}:{}", args.host, args.port).parse()?;
@@ -260,6 +325,36 @@ async fn serve(args: ServeArgs) -> Result<()> {
     let listener = tokio::net::TcpListener::bind(addr).await?;
     axum::serve(listener, app).await?;
     Ok(())
+}
+
+async fn add_standard_headers(request: Request<Body>, next: Next) -> Response {
+    let path = request.uri().path().to_string();
+    let mut response = next.run(request).await;
+    let headers = response.headers_mut();
+    headers.insert(
+        "x-content-type-options",
+        HeaderValue::from_static("nosniff"),
+    );
+    headers.insert("x-frame-options", HeaderValue::from_static("DENY"));
+    headers.insert(
+        "referrer-policy",
+        HeaderValue::from_static("strict-origin-when-cross-origin"),
+    );
+    if !headers.contains_key(header::CACHE_CONTROL) {
+        let cache_control = if path == "/livez" || path == "/readyz" || path.ends_with("/status") {
+            "no-store"
+        } else if path.starts_with("/v1/latest/") || path == "/v1/models" || path == "/v1/variables"
+        {
+            "public, max-age=30"
+        } else {
+            "no-store"
+        };
+        headers.insert(
+            header::CACHE_CONTROL,
+            HeaderValue::from_static(cache_control),
+        );
+    }
+    response
 }
 
 fn materialize_spatial(args: MaterializeSpatialArgs) -> Result<()> {
@@ -469,6 +564,25 @@ fn import_rustwx_grids(args: ImportRustwxGridsArgs) -> Result<()> {
         }));
     }
 
+    let run_manifest = write_spatial_run_manifest(
+        &args.spatial_root,
+        &model,
+        &run,
+        &manifest_path,
+        &manifest.blockers,
+        started.elapsed().as_millis(),
+    )?;
+    let latest_pointer = if args.publish_latest {
+        Some(publish_latest_pointer(
+            &args.spatial_root,
+            &model,
+            &run,
+            "import-rustwx-grids",
+        )?)
+    } else {
+        None
+    };
+
     println!(
         "{}",
         serde_json::to_string_pretty(&json!({
@@ -479,11 +593,468 @@ fn import_rustwx_grids(args: ImportRustwxGridsArgs) -> Result<()> {
             "member": member,
             "product_count": wrote.len(),
             "elapsed_ms": started.elapsed().as_millis(),
+            "run_manifest": run_manifest,
+            "latest_pointer": latest_pointer,
             "wrote": wrote,
             "source_blockers": manifest.blockers
         }))?
     );
     Ok(())
+}
+
+fn inspect_spatial(args: InspectSpatialArgs) -> Result<()> {
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&inspect_spatial_value(
+            &args.spatial_root,
+            args.model.as_deref(),
+        )?)?
+    );
+    Ok(())
+}
+
+fn gc_spatial(args: GcSpatialArgs) -> Result<()> {
+    if args.keep_runs == 0 {
+        bail!("--keep-runs must be at least 1");
+    }
+    let model_dir = args.spatial_root.join(&args.model);
+    if !model_dir.is_dir() {
+        bail!("model directory does not exist: {}", model_dir.display());
+    }
+
+    let runs = list_dirs(&model_dir);
+    let latest_run =
+        read_latest_pointer_run(&args.spatial_root, &args.model).or_else(|| runs.last().cloned());
+    let mut protected = BTreeSet::new();
+    if let Some(run) = latest_run.as_ref() {
+        protected.insert(run.clone());
+    }
+    for run in runs.iter().rev().take(args.keep_runs) {
+        protected.insert(run.clone());
+    }
+
+    let candidates = runs
+        .iter()
+        .filter(|run| !protected.contains(*run))
+        .cloned()
+        .collect::<Vec<_>>();
+
+    let mut deleted = Vec::new();
+    if args.apply {
+        let model_canon = model_dir
+            .canonicalize()
+            .with_context(|| format!("canonicalize {}", model_dir.display()))?;
+        for run in &candidates {
+            let target = model_dir.join(run);
+            let target_canon = target
+                .canonicalize()
+                .with_context(|| format!("canonicalize {}", target.display()))?;
+            if target_canon == model_canon || !target_canon.starts_with(&model_canon) {
+                bail!(
+                    "refusing to delete path outside model directory: {}",
+                    target_canon.display()
+                );
+            }
+            fs::remove_dir_all(&target_canon)
+                .with_context(|| format!("delete {}", target_canon.display()))?;
+            deleted.push(json!({
+                "run": run,
+                "path": target_canon
+            }));
+        }
+    }
+
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&json!({
+            "schema": "wxstore.spatial.gc.v1",
+            "spatial_root": args.spatial_root,
+            "model": args.model,
+            "apply": args.apply,
+            "keep_runs": args.keep_runs,
+            "latest_run": latest_run,
+            "protected_runs": protected.into_iter().collect::<Vec<_>>(),
+            "candidate_count": candidates.len(),
+            "candidates": candidates,
+            "deleted": deleted,
+            "note": if args.apply { "deleted local run directories" } else { "dry run; pass --apply to delete local run directories" }
+        }))?
+    );
+    Ok(())
+}
+
+fn inspect_spatial_value(root: &Path, model_filter: Option<&str>) -> Result<Value> {
+    if !root.is_dir() {
+        bail!("spatial root does not exist: {}", root.display());
+    }
+    let model_ids = if let Some(model) = model_filter {
+        vec![model.to_string()]
+    } else {
+        list_dirs(root)
+    };
+    let mut models = Vec::new();
+    for model in model_ids {
+        let model_dir = root.join(&model);
+        if !model_dir.is_dir() {
+            bail!("model directory does not exist: {}", model_dir.display());
+        }
+        let runs = list_dirs(&model_dir);
+        let latest_pointer = read_latest_pointer_value(root, &model);
+        let latest_run = latest_pointer
+            .as_ref()
+            .and_then(|pointer| {
+                pointer
+                    .get("run")
+                    .and_then(Value::as_str)
+                    .map(str::to_string)
+            })
+            .or_else(|| runs.last().cloned());
+        let run_summaries = runs
+            .iter()
+            .map(|run| spatial_run_summary(root, &model, run))
+            .collect::<Result<Vec<_>>>()?;
+        models.push(json!({
+            "model": model,
+            "run_count": runs.len(),
+            "latest_run": latest_run,
+            "latest_pointer": latest_pointer.unwrap_or_else(|| json!({"status": "missing"})),
+            "runs": run_summaries
+        }));
+    }
+    Ok(json!({
+        "schema": "wxstore.spatial.inspect.v1",
+        "spatial_root": root,
+        "models": models
+    }))
+}
+
+fn spatial_run_summary(root: &Path, model: &str, run: &str) -> Result<Value> {
+    let run_dir = root.join(model).join(run);
+    let manifest_path = run_manifest_path(root, model, run);
+    let manifest = fs::read(&manifest_path)
+        .ok()
+        .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok());
+    let product_count = manifest
+        .as_ref()
+        .and_then(|value| value.get("product_count").and_then(Value::as_u64))
+        .unwrap_or_else(|| count_wxa_files(&run_dir) as u64);
+    let updated_at = manifest
+        .as_ref()
+        .and_then(|value| value.get("updated_at").cloned());
+    let source_count = manifest
+        .as_ref()
+        .and_then(|value| value.get("sources").and_then(Value::as_array))
+        .map(Vec::len)
+        .unwrap_or(0);
+    Ok(json!({
+        "run": run,
+        "path": display_path(&run_dir),
+        "run_manifest": if manifest_path.is_file() { json!(display_path(&manifest_path)) } else { json!(null) },
+        "product_count": product_count,
+        "source_count": source_count,
+        "updated_at": updated_at,
+        "bytes": sum_wxa_bytes(&run_dir)
+    }))
+}
+
+fn write_spatial_run_manifest(
+    root: &Path,
+    model: &str,
+    run: &str,
+    source_manifest: &Path,
+    blockers: &[Value],
+    elapsed_ms: u128,
+) -> Result<Value> {
+    let run_dir = root.join(model).join(run);
+    if !run_dir.is_dir() {
+        bail!("run directory does not exist: {}", run_dir.display());
+    }
+    let manifest_path = run_manifest_path(root, model, run);
+    let mut sources = fs::read(&manifest_path)
+        .ok()
+        .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
+        .and_then(|value| value.get("sources").and_then(Value::as_array).cloned())
+        .unwrap_or_default();
+    sources.push(json!({
+        "kind": "rustwx_grid_export",
+        "source_manifest": display_path(&source_manifest.canonicalize().unwrap_or_else(|_| source_manifest.to_path_buf())),
+        "imported_at": utc_now_string(),
+        "elapsed_ms": elapsed_ms,
+        "blocker_count": blockers.len(),
+        "blockers": blockers
+    }));
+    if sources.len() > 100 {
+        sources.drain(0..sources.len() - 100);
+    }
+    write_spatial_run_manifest_with_sources(root, model, run, sources)
+}
+
+fn write_spatial_run_manifest_with_sources(
+    root: &Path,
+    model: &str,
+    run: &str,
+    sources: Vec<Value>,
+) -> Result<Value> {
+    let run_dir = root.join(model).join(run);
+    if !run_dir.is_dir() {
+        bail!("run directory does not exist: {}", run_dir.display());
+    }
+    let manifest_path = run_manifest_path(root, model, run);
+    let products = collect_spatial_run_products(root, model, run)?;
+    let members = products
+        .iter()
+        .filter_map(|product| {
+            product
+                .get("member")
+                .and_then(Value::as_str)
+                .map(str::to_string)
+        })
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect::<Vec<_>>();
+    let now = utc_now_string();
+    let manifest = json!({
+        "schema": "wxstore.spatial.run_manifest.v1",
+        "model": model,
+        "run": run,
+        "run_path": display_path(&run_dir),
+        "updated_at": now,
+        "product_count": products.len(),
+        "members": members,
+        "products": products,
+        "sources": sources
+    });
+    atomic_write_json(&manifest_path, &manifest)?;
+    Ok(json!({
+        "path": display_path(&manifest_path),
+        "product_count": manifest.get("product_count").cloned().unwrap_or_else(|| json!(0)),
+        "updated_at": now
+    }))
+}
+
+fn reindex_spatial_run_manifest(
+    root: &Path,
+    model: &str,
+    run: &str,
+    source: &str,
+) -> Result<Value> {
+    let manifest_path = run_manifest_path(root, model, run);
+    let mut sources = fs::read(&manifest_path)
+        .ok()
+        .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
+        .and_then(|value| value.get("sources").and_then(Value::as_array).cloned())
+        .unwrap_or_default();
+    sources.push(json!({
+        "kind": "local_reindex",
+        "source": source,
+        "indexed_at": utc_now_string()
+    }));
+    if sources.len() > 100 {
+        sources.drain(0..sources.len() - 100);
+    }
+    write_spatial_run_manifest_with_sources(root, model, run, sources)
+}
+
+fn collect_spatial_run_products(root: &Path, model: &str, run: &str) -> Result<Vec<Value>> {
+    let run_dir = root.join(model).join(run);
+    let mut products = Vec::new();
+    collect_wxa_products_in_dir(root, &run_dir, None, &mut products)?;
+    let members_dir = run_dir.join("members");
+    for member in list_dirs(&members_dir) {
+        collect_wxa_products_in_dir(
+            root,
+            &members_dir.join(&member),
+            Some(member.as_str()),
+            &mut products,
+        )?;
+    }
+    products.sort_by_key(|value| {
+        format!(
+            "{}|{}",
+            value.get("member").and_then(Value::as_str).unwrap_or(""),
+            value.get("product").and_then(Value::as_str).unwrap_or("")
+        )
+    });
+    Ok(products)
+}
+
+fn collect_wxa_products_in_dir(
+    root: &Path,
+    dir: &Path,
+    member: Option<&str>,
+    products: &mut Vec<Value>,
+) -> Result<()> {
+    if !dir.is_dir() {
+        return Ok(());
+    }
+    for entry in fs::read_dir(dir).with_context(|| format!("read {}", dir.display()))? {
+        let entry = entry?;
+        let path = entry.path();
+        if !path.is_file() || !path.extension().is_some_and(|ext| ext == "wxa") {
+            continue;
+        }
+        let (_, meta, index) =
+            read_wxa_dense2d(&path).with_context(|| format!("inspect WXA {}", path.display()))?;
+        let chunks = index.len();
+        let valid_points = index
+            .iter()
+            .map(|record| u64::from(record.valid_count))
+            .sum::<u64>();
+        products.push(json!({
+            "product": meta.variable,
+            "member": member,
+            "path": relative_path_string(root, &path),
+            "format": "wxa_dense2d",
+            "bytes": fs::metadata(&path).map(|meta| meta.len()).unwrap_or(0),
+            "units": meta.units,
+            "nx": meta.nx,
+            "ny": meta.ny,
+            "forecast_hours": meta.forecast_hours,
+            "chunk_y": meta.chunk_y,
+            "chunk_x": meta.chunk_x,
+            "chunk_count": chunks,
+            "valid_points": valid_points,
+            "grid": meta.grid
+        }));
+    }
+    Ok(())
+}
+
+fn publish_latest_pointer(root: &Path, model: &str, run: &str, source: &str) -> Result<Value> {
+    let run_dir = root.join(model).join(run);
+    if !run_dir.is_dir() {
+        bail!(
+            "cannot publish missing run directory: {}",
+            run_dir.display()
+        );
+    }
+    let pointer_path = latest_pointer_path(root, model);
+    let manifest_path = run_manifest_path(root, model, run);
+    if !manifest_path.is_file() {
+        reindex_spatial_run_manifest(root, model, run, source)?;
+    }
+    let pointer = json!({
+        "schema": "wxstore.spatial.latest.v1",
+        "model": model,
+        "run": run,
+        "published_at": utc_now_string(),
+        "source": source,
+        "run_path": relative_path_string(root, &run_dir),
+        "run_manifest": if manifest_path.is_file() { json!(relative_path_string(root, &manifest_path)) } else { json!(null) }
+    });
+    atomic_write_json(&pointer_path, &pointer)?;
+    Ok(json!({
+        "path": display_path(&pointer_path),
+        "model": model,
+        "run": run,
+        "published_at": pointer.get("published_at").cloned()
+    }))
+}
+
+fn read_latest_pointer_run(root: &Path, model: &str) -> Option<String> {
+    let pointer = read_latest_pointer_value(root, model)?;
+    let run = pointer.get("run")?.as_str()?.to_string();
+    root.join(model).join(&run).is_dir().then_some(run)
+}
+
+fn read_latest_pointer_value(root: &Path, model: &str) -> Option<Value> {
+    serde_json::from_slice::<Value>(&fs::read(latest_pointer_path(root, model)).ok()?).ok()
+}
+
+fn latest_pointer_path(root: &Path, model: &str) -> PathBuf {
+    root.join(model).join("latest.json")
+}
+
+fn run_manifest_path(root: &Path, model: &str, run: &str) -> PathBuf {
+    root.join(model).join(run).join("run-manifest.json")
+}
+
+fn atomic_write_json(path: &Path, value: &Value) -> Result<()> {
+    let mut bytes = serde_json::to_vec_pretty(value)?;
+    bytes.push(b'\n');
+    atomic_write_bytes(path, &bytes)
+}
+
+fn atomic_write_bytes(path: &Path, bytes: &[u8]) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let file_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("wxstore");
+    let tmp_path = path.with_file_name(format!(
+        ".{file_name}.tmp-{}-{}",
+        std::process::id(),
+        chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default()
+    ));
+    {
+        let mut file =
+            File::create(&tmp_path).with_context(|| format!("create {}", tmp_path.display()))?;
+        file.write_all(bytes)
+            .with_context(|| format!("write {}", tmp_path.display()))?;
+        file.sync_all()
+            .with_context(|| format!("sync {}", tmp_path.display()))?;
+    }
+    fs::rename(&tmp_path, path)
+        .with_context(|| format!("publish {} -> {}", tmp_path.display(), path.display()))?;
+    Ok(())
+}
+
+fn utc_now_string() -> String {
+    chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
+}
+
+fn display_path(path: &Path) -> String {
+    path.display().to_string()
+}
+
+fn relative_path_string(root: &Path, path: &Path) -> String {
+    path.strip_prefix(root)
+        .unwrap_or(path)
+        .display()
+        .to_string()
+}
+
+fn count_wxa_files(dir: &Path) -> usize {
+    if !dir.is_dir() {
+        return 0;
+    }
+    let direct = fs::read_dir(dir)
+        .ok()
+        .into_iter()
+        .flatten()
+        .filter_map(|entry| entry.ok())
+        .filter(|entry| {
+            let path = entry.path();
+            path.is_file() && path.extension().is_some_and(|ext| ext == "wxa")
+        })
+        .count();
+    let member_count = list_dirs(&dir.join("members"))
+        .iter()
+        .map(|member| count_wxa_files(&dir.join("members").join(member)))
+        .sum::<usize>();
+    direct + member_count
+}
+
+fn sum_wxa_bytes(dir: &Path) -> u64 {
+    if !dir.is_dir() {
+        return 0;
+    }
+    let direct = fs::read_dir(dir)
+        .ok()
+        .into_iter()
+        .flatten()
+        .filter_map(|entry| entry.ok())
+        .map(|entry| entry.path())
+        .filter(|path| path.is_file() && path.extension().is_some_and(|ext| ext == "wxa"))
+        .filter_map(|path| fs::metadata(path).ok().map(|meta| meta.len()))
+        .sum::<u64>();
+    let member_bytes = list_dirs(&dir.join("members"))
+        .iter()
+        .map(|member| sum_wxa_bytes(&dir.join("members").join(member)))
+        .sum::<u64>();
+    direct + member_bytes
 }
 
 struct AppState {
@@ -497,6 +1068,21 @@ struct AppState {
 struct ResponseCache {
     entries: HashMap<String, Bytes>,
     order: VecDeque<String>,
+    bytes: usize,
+    hits: u64,
+    misses: u64,
+    evictions: u64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct CacheStats {
+    entries: usize,
+    entries_limit: usize,
+    bytes: usize,
+    bytes_limit: usize,
+    hits: u64,
+    misses: u64,
+    evictions: u64,
 }
 
 async fn index() -> Html<&'static str> {
@@ -1125,23 +1711,61 @@ const INDEX_HTML: &str = r#"<!doctype html>
 
 impl AppState {
     fn cache_get(&self, key: &str) -> Option<Bytes> {
-        self.cache.read().ok()?.entries.get(key).cloned()
+        let Ok(mut cache) = self.cache.write() else {
+            return None;
+        };
+        let value = cache.entries.get(key).cloned();
+        if value.is_some() {
+            cache.hits = cache.hits.saturating_add(1);
+        } else {
+            cache.misses = cache.misses.saturating_add(1);
+        }
+        value
     }
 
     fn cache_insert(&self, key: String, value: Bytes) {
         let Ok(mut cache) = self.cache.write() else {
             return;
         };
-        if !cache.entries.contains_key(&key) {
+        if let Some(old) = cache.entries.remove(&key) {
+            cache.bytes = cache.bytes.saturating_sub(old.len());
+        } else {
             cache.order.push_back(key.clone());
         }
+        cache.bytes = cache.bytes.saturating_add(value.len());
         cache.entries.insert(key, value);
-        while cache.entries.len() > CACHE_LIMIT {
+        while cache.entries.len() > CACHE_LIMIT || cache.bytes > CACHE_BYTES_LIMIT {
             if let Some(oldest) = cache.order.pop_front() {
-                cache.entries.remove(&oldest);
+                if let Some(old) = cache.entries.remove(&oldest) {
+                    cache.bytes = cache.bytes.saturating_sub(old.len());
+                    cache.evictions = cache.evictions.saturating_add(1);
+                }
             } else {
                 break;
             }
+        }
+    }
+
+    fn cache_stats(&self) -> CacheStats {
+        let Ok(cache) = self.cache.read() else {
+            return CacheStats {
+                entries: 0,
+                entries_limit: CACHE_LIMIT,
+                bytes: 0,
+                bytes_limit: CACHE_BYTES_LIMIT,
+                hits: 0,
+                misses: 0,
+                evictions: 0,
+            };
+        };
+        CacheStats {
+            entries: cache.entries.len(),
+            entries_limit: CACHE_LIMIT,
+            bytes: cache.bytes,
+            bytes_limit: CACHE_BYTES_LIMIT,
+            hits: cache.hits,
+            misses: cache.misses,
+            evictions: cache.evictions,
         }
     }
 }
@@ -1286,11 +1910,39 @@ struct CanonicalQuery {
 
 type ApiError = (StatusCode, Json<Value>);
 
+async fn livez() -> Json<Value> {
+    Json(json!({
+        "schema": "wxstore.health.v1",
+        "ok": true,
+        "kind": "live",
+        "service": "wxstore"
+    }))
+}
+
+async fn readyz(State(state): State<Arc<AppState>>) -> (StatusCode, Json<Value>) {
+    let status = store_status(
+        &state.profile,
+        state.diagnostic.as_deref(),
+        state.spatial.as_deref(),
+        Some(state.cache_stats()),
+    );
+    let ok = status.get("ok").and_then(Value::as_bool).unwrap_or(false);
+    (
+        if ok {
+            StatusCode::OK
+        } else {
+            StatusCode::SERVICE_UNAVAILABLE
+        },
+        Json(status),
+    )
+}
+
 async fn status(State(state): State<Arc<AppState>>) -> Json<Value> {
     Json(store_status(
         &state.profile,
         state.diagnostic.as_deref(),
         state.spatial.as_deref(),
+        Some(state.cache_stats()),
     ))
 }
 
@@ -1299,22 +1951,41 @@ async fn latest(
     AxumPath((model, domain)): AxumPath<(String, String)>,
 ) -> Result<Json<Value>, ApiError> {
     let manifest = &state.profile.manifest;
-    if model != manifest.model || domain != manifest.domain {
-        return Err(not_found("model/domain is not loaded on this node"));
+    if model == manifest.model && domain == manifest.domain {
+        return Ok(Json(json!({
+            "schema": "wxstore.latest.v1",
+            "model": manifest.model,
+            "domain": manifest.domain,
+            "run_id": manifest.run_id,
+            "cycle": manifest.cycle,
+            "products": {
+                "profile_pressure_core": "ready",
+                "diag_scalar_basic": if state.diagnostic.is_some() { "ready_sparse_v0" } else { "unavailable" },
+                "surface_spatial": if state.spatial.is_some() { "ready" } else { "unavailable" }
+            },
+            "canonical_run_url": format!("/v1/runs/{}/{}/{}", manifest.model, manifest.domain, manifest.run_id),
+        })));
     }
-    Ok(Json(json!({
-        "schema": "wxstore.latest.v1",
-        "model": manifest.model,
-        "domain": manifest.domain,
-        "run_id": manifest.run_id,
-        "cycle": manifest.cycle,
-        "products": {
-            "profile_pressure_core": "ready",
-            "diag_scalar_basic": if state.diagnostic.is_some() { "ready_sparse_v0" } else { "unavailable" },
-            "surface_spatial": if state.spatial.is_some() { "ready" } else { "unavailable" }
-        },
-        "canonical_run_url": format!("/v1/runs/{}/{}/{}", manifest.model, manifest.domain, manifest.run_id),
-    })))
+
+    if let Some(spatial) = state.spatial.as_deref() {
+        if let Some(run) = spatial.latest_run_for_model(&model) {
+            return Ok(Json(json!({
+                "schema": "wxstore.latest.v1",
+                "model": model,
+                "domain": domain,
+                "run_id": run,
+                "products": {
+                    "surface_spatial": "ready",
+                    "profile_pressure_core": "unavailable",
+                    "diag_scalar_basic": "unavailable"
+                },
+                "readiness": spatial.run_readiness(&model, &run),
+                "canonical_run_url": format!("/v1/spatial/{}/{}/{}", model, domain, run),
+            })));
+        }
+    }
+
+    Err(not_found("model/domain is not loaded on this node"))
 }
 
 async fn models(State(state): State<Arc<AppState>>) -> Json<Value> {
@@ -1480,6 +2151,13 @@ async fn grid_field(
     .await
     .map_err(|err| internal_error(format!("join error: {err}")))?
     .map_err(|err| bad_request(err.to_string()))?;
+
+    if format != "bin" && read.values.len() > MAX_GRID_JSON_CELLS {
+        return Err(payload_too_large(format!(
+            "grid JSON response would contain {} cells; use format=bin or a tile endpoint",
+            read.values.len()
+        )));
+    }
 
     if format == "bin" {
         let mut body = Vec::with_capacity(read.values.len() * 4);
@@ -1862,6 +2540,11 @@ async fn raster_tile(
     )>,
     Query(query): Query<TileQuery>,
 ) -> Result<Response, ApiError> {
+    if z > MAX_TILE_ZOOM {
+        return Err(bad_request(format!(
+            "tile zoom {z} exceeds max supported zoom {MAX_TILE_ZOOM}"
+        )));
+    }
     let y = parse_tile_y(&y).map_err(bad_anyhow)?;
     let transparent_below = query
         .transparent_below
@@ -2132,6 +2815,13 @@ async fn forecast(
     if variables.is_empty() {
         return Err(bad_request("hourly must list at least one variable"));
     }
+    if variables.len() > MAX_FORECAST_VARIABLES {
+        return Err(payload_too_large(format!(
+            "too many hourly variables requested: {} > {}",
+            variables.len(),
+            MAX_FORECAST_VARIABLES
+        )));
+    }
     let hours = query
         .forecast_hours
         .or(query.hours)
@@ -2339,18 +3029,43 @@ fn store_status(
     profile: &ProfileLane,
     diagnostic: Option<&DiagnosticLane>,
     spatial: Option<&SpatialLane>,
+    cache: Option<CacheStats>,
 ) -> Value {
+    let spatial_models = spatial.map(SpatialLane::model_ids).unwrap_or_default();
+    let profile_ready = !profile.manifest.variables.is_empty()
+        && !profile.manifest.forecast_hours.is_empty()
+        && !profile.manifest.levels_hpa.is_empty();
+    let spatial_ready = spatial.map(|_| !spatial_models.is_empty()).unwrap_or(true);
+    let ok = profile_ready && spatial_ready;
     json!({
         "schema": "wxstore.status.v1",
         "service": "wxstore",
-        "ok": true,
+        "ok": ok,
+        "readiness": {
+            "profile_pressure_core": if profile_ready { "ready" } else { "unavailable" },
+            "diag_scalar_basic": if diagnostic.is_some() { "ready_sparse_v0" } else { "unavailable" },
+            "surface_spatial": if spatial.is_some() {
+                if spatial_ready { "ready" } else { "empty" }
+            } else {
+                "unavailable"
+            },
+            "spatial_models": spatial_models
+        },
         "loaded_run": run_manifest_json(profile, diagnostic, spatial),
         "lanes": {
             "profile_pressure_core": profile.lane_manifest_json(),
             "diag_scalar_basic": diagnostic.map(DiagnosticLane::lane_manifest_json).unwrap_or_else(|| json!({"status": "unavailable"})),
             "surface_spatial": spatial.map(SpatialLane::lane_manifest_json).unwrap_or_else(|| json!({"status": "unavailable"}))
         },
-        "cache": {"entries_limit": CACHE_LIMIT}
+        "cache": cache.unwrap_or(CacheStats {
+            entries: 0,
+            entries_limit: CACHE_LIMIT,
+            bytes: 0,
+            bytes_limit: CACHE_BYTES_LIMIT,
+            hits: 0,
+            misses: 0,
+            evictions: 0,
+        })
     })
 }
 
@@ -3442,7 +4157,8 @@ impl SpatialLane {
                 json!({
                     "model": model,
                     "run_count": runs.len(),
-                    "latest_run": runs.last().cloned(),
+                    "latest_run": self.latest_run_for_model(&model),
+                    "latest_pointer": read_latest_pointer_value(&self.root, &model).unwrap_or_else(|| json!({"status": "missing"})),
                     "runs": runs
                 })
             })
@@ -3472,7 +4188,7 @@ impl SpatialLane {
             .into_iter()
             .map(|model| {
                 let runs = self.runs_for_model(&model);
-                let latest = runs.last().cloned();
+                let latest = self.latest_run_for_model(&model);
                 let variables = latest
                     .as_deref()
                     .and_then(|run| self.variables_for(&model, run, None).ok())
@@ -3481,12 +4197,17 @@ impl SpatialLane {
                     .as_deref()
                     .map(|run| self.members_for(&model, run))
                     .unwrap_or_default();
+                let readiness = latest
+                    .as_deref()
+                    .map(|run| self.run_readiness(&model, run))
+                    .unwrap_or_else(|| json!({"status": "unavailable"}));
                 json!({
                     "id": model,
                     "runs": runs,
                     "latest_run": latest,
                     "members": members,
-                    "latest_variables": variables
+                    "latest_variables": variables,
+                    "latest_readiness": readiness
                 })
             })
             .collect::<Vec<_>>();
@@ -3494,6 +4215,45 @@ impl SpatialLane {
             "status": "ready",
             "root": self.root,
             "models": models
+        })
+    }
+
+    fn run_readiness(&self, model: &str, run: &str) -> Value {
+        let run_dir = self.root.join(model).join(run);
+        if !run_dir.is_dir() {
+            return json!({
+                "status": "unavailable",
+                "reason": "run directory is missing"
+            });
+        }
+        let manifest_path = run_manifest_path(&self.root, model, run);
+        let manifest = fs::read(&manifest_path)
+            .ok()
+            .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok());
+        let variables = self.variables_for(model, run, None).unwrap_or_default();
+        let mut available_hours = Map::new();
+        for variable in &variables {
+            if let Ok(hours) = self.available_hours_for(model, run, None, variable) {
+                available_hours.insert(variable.clone(), json!(hours));
+            }
+        }
+        let has_data = !variables.is_empty();
+        let status = if manifest.is_some() && has_data {
+            "complete"
+        } else if has_data {
+            "partial_legacy"
+        } else {
+            "unavailable"
+        };
+        json!({
+            "status": status,
+            "run_manifest": if manifest_path.is_file() { json!(relative_path_string(&self.root, &manifest_path)) } else { json!(null) },
+            "variables": variables,
+            "available_hours": available_hours,
+            "members": self.members_for(model, run),
+            "product_count": manifest
+                .as_ref()
+                .and_then(|value| value.get("product_count").and_then(Value::as_u64))
         })
     }
 
@@ -3531,14 +4291,17 @@ impl SpatialLane {
                 "run '{run}' is not available for model '{model}'"
             )));
         }
-        self.runs_for_model(model)
-            .last()
-            .cloned()
+        self.latest_run_for_model(model)
             .ok_or_else(|| not_found(format!("no runs are available for model '{model}'")))
     }
 
     fn runs_for_model(&self, model: &str) -> Vec<String> {
         list_dirs(&self.root.join(model))
+    }
+
+    fn latest_run_for_model(&self, model: &str) -> Option<String> {
+        read_latest_pointer_run(&self.root, model)
+            .or_else(|| self.runs_for_model(model).last().cloned())
     }
 
     fn members_for(&self, model: &str, run: &str) -> Vec<String> {
@@ -4266,7 +5029,6 @@ fn write_spatial_wxa_grids(
     }
     fs::create_dir_all(&base)?;
     let path = base.join(format!("{product}.wxa"));
-    let tmp_path = base.join(format!("{product}.wxa.tmp"));
 
     let incoming_hours = grids
         .iter()
@@ -4405,8 +5167,7 @@ fn write_spatial_wxa_grids(
         output.resize(output.len() + 12, 0);
     }
     output.extend_from_slice(&payload);
-    fs::write(&tmp_path, output)?;
-    fs::rename(&tmp_path, &path)?;
+    atomic_write_bytes(&path, &output)?;
     Ok(path)
 }
 
@@ -6349,6 +7110,13 @@ fn parse_hours(value: &str) -> Result<Vec<u8>> {
     }
     hours.sort_unstable();
     hours.dedup();
+    if hours.len() > MAX_QUERY_HOURS {
+        bail!(
+            "too many forecast hours requested: {} > {}",
+            hours.len(),
+            MAX_QUERY_HOURS
+        );
+    }
     Ok(hours)
 }
 
@@ -6379,6 +7147,13 @@ fn parse_hours_u32(value: &str) -> Result<Vec<u32>> {
     }
     hours.sort_unstable();
     hours.dedup();
+    if hours.len() > MAX_QUERY_HOURS {
+        bail!(
+            "too many forecast hours requested: {} > {}",
+            hours.len(),
+            MAX_QUERY_HOURS
+        );
+    }
     Ok(hours)
 }
 
@@ -6511,7 +7286,12 @@ fn insert_header(headers: &mut HeaderMap, name: &'static str, value: &str) {
 fn bad_request(reason: impl AsRef<str>) -> ApiError {
     (
         StatusCode::BAD_REQUEST,
-        Json(json!({"error": true, "reason": reason.as_ref()})),
+        Json(json!({
+            "error": true,
+            "code": "bad_request",
+            "message": reason.as_ref(),
+            "reason": reason.as_ref()
+        })),
     )
 }
 
@@ -6522,13 +7302,35 @@ fn bad_anyhow(err: anyhow::Error) -> ApiError {
 fn not_found(reason: impl AsRef<str>) -> ApiError {
     (
         StatusCode::NOT_FOUND,
-        Json(json!({"error": true, "reason": reason.as_ref()})),
+        Json(json!({
+            "error": true,
+            "code": "not_found",
+            "message": reason.as_ref(),
+            "reason": reason.as_ref()
+        })),
+    )
+}
+
+fn payload_too_large(reason: impl AsRef<str>) -> ApiError {
+    (
+        StatusCode::PAYLOAD_TOO_LARGE,
+        Json(json!({
+            "error": true,
+            "code": "response_too_large",
+            "message": reason.as_ref(),
+            "reason": reason.as_ref()
+        })),
     )
 }
 
 fn internal_error(reason: impl AsRef<str>) -> ApiError {
     (
         StatusCode::INTERNAL_SERVER_ERROR,
-        Json(json!({"error": true, "reason": reason.as_ref()})),
+        Json(json!({
+            "error": true,
+            "code": "internal_error",
+            "message": reason.as_ref(),
+            "reason": reason.as_ref()
+        })),
     )
 }
