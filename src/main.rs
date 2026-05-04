@@ -1328,7 +1328,7 @@ impl PlotLabLane {
                 "total_cloud_cover",
                 "sbcape"
             ],
-            "projection_variants": ["auto", "pivotal", "albers", "mercator", "robinson"],
+            "projection_variants": ["auto", "rectangular", "pivotal", "albers", "mercator", "robinson"],
             "plot_styles": ["clean_atlas", "default"]
         })
     }
