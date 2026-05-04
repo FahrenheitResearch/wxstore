@@ -1,11 +1,12 @@
 use std::{
+    cmp::Ordering,
     collections::{BTreeMap, BTreeSet, HashMap, VecDeque},
     fs::{self, File},
-    io::Write,
+    io::{Read, Seek, SeekFrom, Write},
     net::SocketAddr,
     path::{Path, PathBuf},
     sync::{Arc, RwLock},
-    time::Instant,
+    time::{Instant, UNIX_EPOCH},
 };
 
 use anyhow::{anyhow, bail, Context, Result};
@@ -43,6 +44,9 @@ const MAX_QUERY_HOURS: usize = 400;
 const MAX_FORECAST_VARIABLES: usize = 96;
 const MAX_GRID_JSON_CELLS: usize = 4_000_000;
 const MAX_TILE_ZOOM: u32 = 14;
+const STATIC_PLOT_MANIFEST_CACHE_TTL_SECS: u64 = 5;
+const STATIC_PLOT_DEFAULT_MANIFEST_LIMIT: usize = 500;
+const STATIC_PLOT_MAX_MANIFEST_LIMIT: usize = 20_000;
 
 const SOUNDING_CORE: &[&str] = &["TMP", "SPFH", "UGRD", "VGRD", "HGT"];
 const BASIC_DIAGNOSTICS: &[&str] = &[
@@ -123,10 +127,22 @@ struct ServeArgs {
     diagnostic_store: Option<PathBuf>,
     #[arg(long)]
     spatial_root: Option<PathBuf>,
+    #[arg(long)]
+    static_plots_root: Option<PathBuf>,
     #[arg(long, default_value = "127.0.0.1")]
     host: String,
     #[arg(long, default_value_t = 8897)]
     port: u16,
+}
+
+fn infer_ops_root(args: &ServeArgs) -> PathBuf {
+    args.static_plots_root
+        .as_ref()
+        .and_then(|path| path.parent())
+        .or_else(|| args.spatial_root.as_ref().and_then(|path| path.parent()))
+        .or_else(|| args.profile_store.parent())
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| PathBuf::from("."))
 }
 
 #[derive(Parser, Clone)]
@@ -137,6 +153,8 @@ struct InspectArgs {
     diagnostic_store: Option<PathBuf>,
     #[arg(long)]
     spatial_root: Option<PathBuf>,
+    #[arg(long)]
+    static_plots_root: Option<PathBuf>,
 }
 
 #[derive(Parser, Clone)]
@@ -167,8 +185,8 @@ struct MaterializeSpatialArgs {
 
 #[derive(Parser, Clone)]
 struct ImportRustwxGridsArgs {
-    #[arg(long)]
-    manifest: PathBuf,
+    #[arg(long = "manifest", required = true)]
+    manifests: Vec<PathBuf>,
     #[arg(long)]
     spatial_root: PathBuf,
     #[arg(long)]
@@ -220,12 +238,18 @@ async fn main() -> Result<()> {
                 .as_ref()
                 .map(|path| SpatialLane::open(path))
                 .transpose()?;
+            let static_plots = args
+                .static_plots_root
+                .as_ref()
+                .map(|path| StaticPlotLane::open(path))
+                .transpose()?;
             println!(
                 "{}",
                 serde_json::to_string_pretty(&store_status(
                     &profile,
                     diagnostic.as_ref(),
                     spatial.as_ref(),
+                    static_plots.as_ref(),
                     None,
                 ))?
             );
@@ -265,11 +289,21 @@ async fn serve(args: ServeArgs) -> Result<()> {
             .map(|path| SpatialLane::open(path))
             .transpose()
             .map(|lane| lane.map(Arc::new))?,
+        static_plots: args
+            .static_plots_root
+            .as_ref()
+            .map(|path| StaticPlotLane::open(path))
+            .transpose()
+            .map(|lane| lane.map(Arc::new))?,
+        ops_root: infer_ops_root(&args),
         cache: RwLock::new(ResponseCache::default()),
     });
 
     let app = Router::new()
         .route("/", get(index))
+        .route("/plots", get(plots))
+        .route("/projection-demo", get(projection_demo))
+        .route("/ops", get(ops))
         .route("/livez", get(livez))
         .route("/readyz", get(readyz))
         .route("/v1/status", get(status))
@@ -277,6 +311,12 @@ async fn serve(args: ServeArgs) -> Result<()> {
         .route("/v1/models", get(models))
         .route("/v1/variables", get(variables))
         .route("/v1/products", get(products))
+        .route("/v1/static-plots", get(static_plots))
+        .route("/v1/ops/live", get(ops_live))
+        .route(
+            "/v1/static-plots/artifacts/{manifest_id}/{artifact_index}",
+            get(static_plot_artifact),
+        )
         .route("/v1/grid", get(grid_field))
         .route("/v1/sample", get(sample_point))
         .route("/v1/wind-field", get(wind_field))
@@ -494,67 +534,81 @@ fn materialize_spatial(args: MaterializeSpatialArgs) -> Result<()> {
 
 fn import_rustwx_grids(args: ImportRustwxGridsArgs) -> Result<()> {
     let started = Instant::now();
-    let manifest_path = args.manifest;
-    let manifest_dir = manifest_path
-        .parent()
-        .map(Path::to_path_buf)
-        .unwrap_or_else(|| PathBuf::from("."));
-    let manifest: RustwxGridExportManifest = serde_json::from_slice(
-        &fs::read(&manifest_path).with_context(|| format!("read {}", manifest_path.display()))?,
-    )
-    .with_context(|| format!("parse {}", manifest_path.display()))?;
-    let model = args.model.unwrap_or(manifest.model.clone());
-    let run = args.run.unwrap_or(manifest.run_id.clone());
-    let member = args.member.or_else(|| Some("control".to_string()));
+    let source_count = args.manifests.len();
+    let mut source_manifests = Vec::with_capacity(source_count);
+    let mut batch_model = args.model.clone();
+    let mut batch_run = args.run.clone();
+    let member = args.member.clone().or_else(|| Some("control".to_string()));
 
-    let mut by_product = BTreeMap::<String, Vec<SpatialGrid>>::new();
-    for record in manifest.fields {
-        let values_path = resolve_export_path(&manifest_dir, &record.values_path);
-        let lat_path = resolve_export_path(&manifest_dir, &record.lat_path);
-        let lon_path = resolve_export_path(&manifest_dir, &record.lon_path);
-        let values = read_f32_file(&values_path)
-            .with_context(|| format!("read values {}", values_path.display()))?;
-        let lat = read_f32_file(&lat_path)
-            .with_context(|| format!("read latitudes {}", lat_path.display()))?;
-        let lon = read_f32_file(&lon_path)
-            .with_context(|| format!("read longitudes {}", lon_path.display()))?;
-        if values.len() != record.nx * record.ny
-            || lat.len() != record.nx * record.ny
-            || lon.len() != record.nx * record.ny
-        {
+    let mut records_by_product = BTreeMap::<String, Vec<(PathBuf, RustwxGridExportRecord)>>::new();
+    let mut source_records = Vec::<(PathBuf, Vec<Value>)>::with_capacity(source_count);
+    for manifest_path in args.manifests {
+        let manifest_dir = manifest_path
+            .parent()
+            .map(Path::to_path_buf)
+            .unwrap_or_else(|| PathBuf::from("."));
+        let manifest: RustwxGridExportManifest = serde_json::from_slice(
+            &fs::read(&manifest_path)
+                .with_context(|| format!("read {}", manifest_path.display()))?,
+        )
+        .with_context(|| format!("parse {}", manifest_path.display()))?;
+        let model = batch_model.get_or_insert_with(|| manifest.model.clone());
+        if model != &manifest.model {
             bail!(
-                "grid '{}' f{:03} has inconsistent dimensions",
-                record.product_slug,
-                record.forecast_hour
+                "manifest model mismatch in batch import: expected '{}', got '{}' from {}",
+                model,
+                manifest.model,
+                manifest_path.display()
             );
         }
-        let grid_meta = grid_meta_from_latlon(&model, record.nx, record.ny, &lat, &lon, &record);
-        by_product
-            .entry(record.product_slug.clone())
-            .or_default()
-            .push(SpatialGrid {
-                model: model.clone(),
-                run_id: run.clone(),
-                member: member.clone(),
-                variable: record.product_slug,
-                units: record.units,
-                forecast_hour: u32::from(record.forecast_hour),
-                nx: record.nx,
-                ny: record.ny,
-                grid_meta,
-                values: Arc::new(values),
-            });
+        let run = batch_run.get_or_insert_with(|| manifest.run_id.clone());
+        if run != &manifest.run_id {
+            bail!(
+                "manifest run mismatch in batch import: expected '{}', got '{}' from {}",
+                run,
+                manifest.run_id,
+                manifest_path.display()
+            );
+        }
+        for record in manifest.fields {
+            records_by_product
+                .entry(record.product_slug.clone())
+                .or_default()
+                .push((manifest_dir.clone(), record));
+        }
+        source_manifests.push(display_path(
+            &manifest_path
+                .canonicalize()
+                .unwrap_or_else(|_| manifest_path.clone()),
+        ));
+        source_records.push((manifest_path, manifest.blockers));
     }
+    let model = batch_model.ok_or_else(|| anyhow!("batch import did not include a model"))?;
+    let run = batch_run.ok_or_else(|| anyhow!("batch import did not include a run"))?;
+
+    let mut latlon_cache = HashMap::<PathBuf, Arc<Vec<f32>>>::new();
 
     let mut wrote = Vec::new();
-    for (product, grids) in &by_product {
+    for (product, records) in records_by_product {
+        let mut grids = Vec::with_capacity(records.len());
+        for (manifest_dir, record) in records {
+            grids.push(load_rustwx_export_grid(
+                manifest_dir.as_path(),
+                &model,
+                &run,
+                member.as_deref(),
+                record,
+                &mut latlon_cache,
+            )?);
+        }
+        grids.sort_by_key(|grid| grid.forecast_hour);
         let path = write_spatial_wxa_grids(
             &args.spatial_root,
             &model,
             &run,
             member.as_deref(),
-            product,
-            grids,
+            &product,
+            &grids,
         )?;
         wrote.push(json!({
             "product": product,
@@ -564,12 +618,11 @@ fn import_rustwx_grids(args: ImportRustwxGridsArgs) -> Result<()> {
         }));
     }
 
-    let run_manifest = write_spatial_run_manifest(
+    let run_manifest = write_spatial_run_manifest_batch(
         &args.spatial_root,
         &model,
         &run,
-        &manifest_path,
-        &manifest.blockers,
+        source_records.as_slice(),
         started.elapsed().as_millis(),
     )?;
     let latest_pointer = if args.publish_latest {
@@ -587,7 +640,9 @@ fn import_rustwx_grids(args: ImportRustwxGridsArgs) -> Result<()> {
         "{}",
         serde_json::to_string_pretty(&json!({
             "schema": "wxstore.import_rustwx_grids.report.v1",
-            "source_manifest": manifest_path,
+            "source_manifest": source_manifests.first().cloned().unwrap_or_default(),
+            "source_manifests": source_manifests,
+            "source_count": source_count,
             "model": model,
             "run": run,
             "member": member,
@@ -596,10 +651,59 @@ fn import_rustwx_grids(args: ImportRustwxGridsArgs) -> Result<()> {
             "run_manifest": run_manifest,
             "latest_pointer": latest_pointer,
             "wrote": wrote,
-            "source_blockers": manifest.blockers
+            "source_blockers": source_records.iter().flat_map(|(_, blockers)| blockers.iter().cloned()).collect::<Vec<_>>()
         }))?
     );
     Ok(())
+}
+
+fn load_rustwx_export_grid(
+    manifest_dir: &Path,
+    model: &str,
+    run: &str,
+    member: Option<&str>,
+    record: RustwxGridExportRecord,
+    latlon_cache: &mut HashMap<PathBuf, Arc<Vec<f32>>>,
+) -> Result<SpatialGrid> {
+    let values_path = resolve_export_path(manifest_dir, &record.values_path);
+    let lat_path = resolve_export_path(manifest_dir, &record.lat_path);
+    let lon_path = resolve_export_path(manifest_dir, &record.lon_path);
+    let values = read_f32_file(&values_path)
+        .with_context(|| format!("read values {}", values_path.display()))?;
+    let lat = cached_f32_file(latlon_cache, &lat_path)
+        .with_context(|| format!("read latitudes {}", lat_path.display()))?;
+    let lon = cached_f32_file(latlon_cache, &lon_path)
+        .with_context(|| format!("read longitudes {}", lon_path.display()))?;
+    if values.len() != record.nx * record.ny
+        || lat.len() != record.nx * record.ny
+        || lon.len() != record.nx * record.ny
+    {
+        bail!(
+            "grid '{}' f{:03} has inconsistent dimensions",
+            record.product_slug,
+            record.forecast_hour
+        );
+    }
+    let grid_meta = grid_meta_from_latlon(
+        model,
+        record.nx,
+        record.ny,
+        lat.as_slice(),
+        lon.as_slice(),
+        &record,
+    );
+    Ok(SpatialGrid {
+        model: model.to_string(),
+        run_id: run.to_string(),
+        member: member.map(str::to_string),
+        variable: record.product_slug,
+        units: record.units,
+        forecast_hour: u32::from(record.forecast_hour),
+        nx: record.nx,
+        ny: record.ny,
+        grid_meta,
+        values: Arc::new(values),
+    })
 }
 
 fn inspect_spatial(args: InspectSpatialArgs) -> Result<()> {
@@ -757,12 +861,11 @@ fn spatial_run_summary(root: &Path, model: &str, run: &str) -> Result<Value> {
     }))
 }
 
-fn write_spatial_run_manifest(
+fn write_spatial_run_manifest_batch(
     root: &Path,
     model: &str,
     run: &str,
-    source_manifest: &Path,
-    blockers: &[Value],
+    source_records: &[(PathBuf, Vec<Value>)],
     elapsed_ms: u128,
 ) -> Result<Value> {
     let run_dir = root.join(model).join(run);
@@ -775,14 +878,17 @@ fn write_spatial_run_manifest(
         .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
         .and_then(|value| value.get("sources").and_then(Value::as_array).cloned())
         .unwrap_or_default();
-    sources.push(json!({
-        "kind": "rustwx_grid_export",
-        "source_manifest": display_path(&source_manifest.canonicalize().unwrap_or_else(|_| source_manifest.to_path_buf())),
-        "imported_at": utc_now_string(),
-        "elapsed_ms": elapsed_ms,
-        "blocker_count": blockers.len(),
-        "blockers": blockers
-    }));
+    let imported_at = utc_now_string();
+    for (source_manifest, blockers) in source_records {
+        sources.push(json!({
+            "kind": "rustwx_grid_export",
+            "source_manifest": display_path(&source_manifest.canonicalize().unwrap_or_else(|_| source_manifest.to_path_buf())),
+            "imported_at": imported_at,
+            "elapsed_ms": elapsed_ms,
+            "blocker_count": blockers.len(),
+            "blockers": blockers
+        }));
+    }
     if sources.len() > 100 {
         sources.drain(0..sources.len() - 100);
     }
@@ -893,8 +999,8 @@ fn collect_wxa_products_in_dir(
         if !path.is_file() || !path.extension().is_some_and(|ext| ext == "wxa") {
             continue;
         }
-        let (_, meta, index) =
-            read_wxa_dense2d(&path).with_context(|| format!("inspect WXA {}", path.display()))?;
+        let (meta, index) = read_wxa_dense2d_metadata(&path)
+            .with_context(|| format!("inspect WXA {}", path.display()))?;
         let chunks = index.len();
         let valid_points = index
             .iter()
@@ -933,6 +1039,22 @@ fn publish_latest_pointer(root: &Path, model: &str, run: &str, source: &str) -> 
     if !manifest_path.is_file() {
         reindex_spatial_run_manifest(root, model, run, source)?;
     }
+    if let Some(current) = read_latest_pointer_value(root, model) {
+        if let Some(current_run) = current.get("run").and_then(Value::as_str) {
+            if run_cycle_order(current_run, run) == Some(Ordering::Greater) {
+                return Ok(json!({
+                    "path": display_path(&pointer_path),
+                    "model": model,
+                    "run": run,
+                    "published": false,
+                    "skipped": true,
+                    "reason": "existing_latest_is_newer",
+                    "current_run": current_run,
+                    "current_published_at": current.get("published_at").cloned().unwrap_or(Value::Null)
+                }));
+            }
+        }
+    }
     let pointer = json!({
         "schema": "wxstore.spatial.latest.v1",
         "model": model,
@@ -947,8 +1069,13 @@ fn publish_latest_pointer(root: &Path, model: &str, run: &str, source: &str) -> 
         "path": display_path(&pointer_path),
         "model": model,
         "run": run,
+        "published": true,
         "published_at": pointer.get("published_at").cloned()
     }))
+}
+
+fn run_cycle_order(left: &str, right: &str) -> Option<Ordering> {
+    Some(parse_run_id_cycle_utc(left)?.cmp(&parse_run_id_cycle_utc(right)?))
 }
 
 fn read_latest_pointer_run(root: &Path, model: &str) -> Option<String> {
@@ -1061,6 +1188,8 @@ struct AppState {
     profile: Arc<ProfileLane>,
     diagnostic: Option<Arc<DiagnosticLane>>,
     spatial: Option<Arc<SpatialLane>>,
+    static_plots: Option<Arc<StaticPlotLane>>,
+    ops_root: PathBuf,
     cache: RwLock<ResponseCache>,
 }
 
@@ -1085,9 +1214,1460 @@ struct CacheStats {
     evictions: u64,
 }
 
-async fn index() -> Html<&'static str> {
-    Html(INDEX_HTML)
+struct StaticPlotLane {
+    root: PathBuf,
+    manifest_cache: RwLock<StaticPlotManifestCache>,
 }
+
+#[derive(Default)]
+struct StaticPlotManifestCache {
+    loaded_at: Option<Instant>,
+    records: Vec<StaticPlotManifestRecord>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct StaticPlotRunManifest {
+    run_kind: String,
+    run_label: String,
+    output_root: PathBuf,
+    #[serde(default)]
+    model: Option<String>,
+    #[serde(default)]
+    date_yyyymmdd: Option<String>,
+    #[serde(default)]
+    cycle_utc: Option<u8>,
+    #[serde(default)]
+    forecast_hour: Option<u16>,
+    #[serde(default)]
+    source: Option<String>,
+    #[serde(default)]
+    domain_slug: Option<String>,
+    #[serde(default)]
+    member: Option<String>,
+    #[serde(default)]
+    ensemble_kind: Option<String>,
+    #[serde(default)]
+    ensemble_stat: Option<String>,
+    #[serde(default)]
+    projection_variant: Option<String>,
+    #[serde(default)]
+    plot_variant: Option<String>,
+    #[serde(default)]
+    variant: Option<String>,
+    state: String,
+    #[serde(default)]
+    detail: Option<String>,
+    #[serde(default)]
+    artifacts: Vec<StaticPlotArtifact>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct StaticPlotArtifact {
+    artifact_key: String,
+    relative_path: PathBuf,
+    state: String,
+    #[serde(default)]
+    detail: Option<String>,
+    #[serde(default)]
+    content_identity: Option<Value>,
+    #[serde(default)]
+    input_fetch_keys: Vec<String>,
+}
+
+#[derive(Debug, Clone)]
+struct StaticPlotManifestRecord {
+    id: String,
+    path: PathBuf,
+    manifest: StaticPlotRunManifest,
+}
+
+#[derive(Debug, Clone)]
+struct StaticPlotIdentity {
+    model: Option<String>,
+    date_yyyymmdd: Option<String>,
+    cycle_utc: Option<u8>,
+    forecast_hour: Option<u16>,
+    source: Option<String>,
+    domain_slug: Option<String>,
+    member: Option<String>,
+    ensemble_kind: Option<String>,
+    ensemble_stat: Option<String>,
+    plot_variant: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize, Default)]
+struct StaticPlotCatalogQuery {
+    #[serde(default)]
+    include_artifacts: bool,
+    #[serde(default)]
+    include_coverage: bool,
+    #[serde(default)]
+    catalog_index: bool,
+    manifest_id: Option<String>,
+    model: Option<String>,
+    date: Option<String>,
+    cycle_utc: Option<u8>,
+    forecast_hour: Option<u16>,
+    domain: Option<String>,
+    member: Option<String>,
+    ensemble: Option<String>,
+    projection: Option<String>,
+    variant: Option<String>,
+    product: Option<String>,
+    state: Option<String>,
+    q: Option<String>,
+    limit: Option<usize>,
+    offset: Option<usize>,
+    manifest_limit: Option<usize>,
+    manifest_offset: Option<usize>,
+    artifact_limit: Option<usize>,
+    artifact_offset: Option<usize>,
+}
+
+#[derive(Debug, Clone, Deserialize, Default)]
+struct StaticPlotArtifactQuery {
+    path: Option<String>,
+    v: Option<String>,
+}
+
+impl StaticPlotLane {
+    fn open(root: &Path) -> Result<Self> {
+        if !root.is_dir() {
+            bail!("static plots root does not exist: {}", root.display());
+        }
+        Ok(Self {
+            root: root.to_path_buf(),
+            manifest_cache: RwLock::new(StaticPlotManifestCache::default()),
+        })
+    }
+
+    fn overview_json(&self) -> Value {
+        json!({
+            "status": "configured",
+            "root": self.root,
+            "cache_ttl_seconds": STATIC_PLOT_MANIFEST_CACHE_TTL_SECS
+        })
+    }
+
+    fn lane_manifest_json(&self) -> Value {
+        let summary = self.summary_json();
+        json!({
+            "schema": "wxstore.lane.v1",
+            "id": "static_plots",
+            "status": summary.get("status").cloned().unwrap_or_else(|| json!("unavailable")),
+            "role": "published_static_plot_artifact_lane",
+            "root": self.root,
+            "manifest_count": summary.get("manifest_count").cloned().unwrap_or_else(|| json!(0)),
+            "artifact_count": summary.get("artifact_count").cloned().unwrap_or_else(|| json!(0)),
+            "complete_count": summary.get("complete_count").cloned().unwrap_or_else(|| json!(0)),
+            "blocked_count": summary.get("blocked_count").cloned().unwrap_or_else(|| json!(0)),
+            "failed_count": summary.get("failed_count").cloned().unwrap_or_else(|| json!(0)),
+        })
+    }
+
+    fn summary_json(&self) -> Value {
+        match self.manifests() {
+            Ok(records) => static_plot_summary_json_with_coverage(&self.root, &records, false),
+            Err(err) => json!({
+                "status": "error",
+                "root": self.root,
+                "error": err.to_string(),
+                "coverage": []
+            }),
+        }
+    }
+
+    fn catalog_json(&self, query: &StaticPlotCatalogQuery) -> Value {
+        match self.manifests() {
+            Ok(records) => {
+                let summary = static_plot_summary_json_with_coverage(
+                    &self.root,
+                    &records,
+                    query.include_coverage,
+                );
+                let mut matched = records
+                    .iter()
+                    .filter(|record| static_plot_record_matches(record, query))
+                    .collect::<Vec<_>>();
+                matched.sort_by(|a, b| static_plot_record_compare_desc(a, b));
+                if query.catalog_index && !query.include_artifacts {
+                    matched = static_plot_catalog_index_records(matched);
+                }
+                let manifest_offset = query.manifest_offset.unwrap_or(0);
+                let manifest_limit = query
+                    .manifest_limit
+                    .or(query.limit)
+                    .unwrap_or(STATIC_PLOT_DEFAULT_MANIFEST_LIMIT)
+                    .min(STATIC_PLOT_MAX_MANIFEST_LIMIT);
+                let matched_count = matched.len();
+                let manifests = matched
+                    .into_iter()
+                    .skip(manifest_offset)
+                    .take(manifest_limit)
+                    .map(|record| static_plot_record_json(&self.root, record, query))
+                    .collect::<Vec<_>>();
+                json!({
+                    "schema": "wxstore.static_plots.v1",
+                    "status": summary.get("status").cloned().unwrap_or_else(|| json!("empty")),
+                    "root": self.root,
+                    "summary": summary,
+                    "query": {
+                        "include_artifacts": query.include_artifacts,
+                        "include_coverage": query.include_coverage,
+                        "catalog_index": query.catalog_index,
+                        "manifest_id": query.manifest_id,
+                        "model": query.model,
+                        "date": query.date,
+                        "cycle_utc": query.cycle_utc,
+                        "forecast_hour": query.forecast_hour,
+                        "domain": query.domain,
+                        "member": query.member,
+                        "ensemble": query.ensemble,
+                        "projection": query.projection,
+                        "variant": query.variant,
+                        "product": query.product,
+                        "state": query.state,
+                        "q": query.q,
+                        "limit": query.limit,
+                        "offset": query.offset,
+                        "manifest_limit": manifest_limit,
+                        "manifest_offset": manifest_offset,
+                        "artifact_limit": query.artifact_limit,
+                        "artifact_offset": query.artifact_offset
+                    },
+                    "matched_manifest_count": matched_count,
+                    "returned_manifest_count": manifests.len(),
+                    "manifests": manifests
+                })
+            }
+            Err(err) => json!({
+                "schema": "wxstore.static_plots.v1",
+                "status": "error",
+                "root": self.root,
+                "error": err.to_string(),
+                "manifests": []
+            }),
+        }
+    }
+
+    fn artifact_path(&self, manifest_id: &str, artifact_index: usize) -> Result<PathBuf> {
+        let records = self.manifests()?;
+        let record = records
+            .iter()
+            .find(|record| record.id == manifest_id)
+            .ok_or_else(|| anyhow!("static plot manifest '{manifest_id}' is not loaded"))?;
+        let artifact = record.manifest.artifacts.get(artifact_index).ok_or_else(|| {
+            anyhow!("static plot artifact index {artifact_index} is outside manifest '{manifest_id}'")
+        })?;
+        let path = resolve_static_artifact_path(&record.manifest, &artifact.relative_path);
+        if !path.is_file() {
+            bail!("static plot artifact is missing: {}", path.display());
+        }
+        Ok(path)
+    }
+
+    fn artifact_relative_path(&self, relative_path: &str) -> Result<PathBuf> {
+        let path = self.root.join(relative_path);
+        let root = fs::canonicalize(&self.root)
+            .with_context(|| format!("canonicalize static plot root {}", self.root.display()))?;
+        let path = fs::canonicalize(&path)
+            .with_context(|| format!("canonicalize static plot artifact {}", path.display()))?;
+        if !path.starts_with(&root) {
+            bail!("static plot artifact escapes root: {}", path.display());
+        }
+        if !path.is_file() {
+            bail!("static plot artifact is missing: {}", path.display());
+        }
+        Ok(path)
+    }
+
+    fn manifests(&self) -> Result<Vec<StaticPlotManifestRecord>> {
+        if let Ok(cache) = self.manifest_cache.read() {
+            if cache.loaded_at.is_some_and(|loaded_at| {
+                loaded_at.elapsed().as_secs() < STATIC_PLOT_MANIFEST_CACHE_TTL_SECS
+            }) {
+                return Ok(cache.records.clone());
+            }
+        }
+        let mut paths = Vec::new();
+        collect_static_plot_manifest_paths(&self.root, &mut paths)?;
+        paths.sort();
+        let mut records = Vec::new();
+        for path in paths {
+            let bytes = fs::read(&path).with_context(|| format!("read {}", path.display()))?;
+            let manifest: StaticPlotRunManifest = serde_json::from_slice(&bytes)
+                .with_context(|| format!("parse {}", path.display()))?;
+            let relative = path.strip_prefix(&self.root).unwrap_or(&path);
+            records.push(StaticPlotManifestRecord {
+                id: stable_static_plot_id(relative),
+                path,
+                manifest,
+            });
+        }
+        if let Ok(mut cache) = self.manifest_cache.write() {
+            cache.loaded_at = Some(Instant::now());
+            cache.records = records.clone();
+        }
+        Ok(records)
+    }
+}
+
+fn collect_static_plot_manifest_paths(dir: &Path, out: &mut Vec<PathBuf>) -> Result<()> {
+    if !dir.is_dir() {
+        return Ok(());
+    }
+    for entry in fs::read_dir(dir).with_context(|| format!("read {}", dir.display()))? {
+        let entry = entry?;
+        let path = entry.path();
+        if path.is_dir() {
+            collect_static_plot_manifest_paths(&path, out)?;
+        } else if path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| name.ends_with("_run_manifest.json"))
+        {
+            out.push(path);
+        }
+    }
+    Ok(())
+}
+
+fn static_plot_summary_json_with_coverage(
+    root: &Path,
+    records: &[StaticPlotManifestRecord],
+    include_coverage: bool,
+) -> Value {
+    let mut artifact_count = 0usize;
+    let mut complete_count = 0usize;
+    let mut blocked_count = 0usize;
+    let mut failed_count = 0usize;
+    let mut coverage = Vec::new();
+    for record in records {
+        let mut complete = 0usize;
+        let mut blocked = 0usize;
+        let mut failed = 0usize;
+        for artifact in &record.manifest.artifacts {
+            artifact_count += 1;
+            match normalized_state(&artifact.state).as_str() {
+                "complete" | "cache_hit" => {
+                    complete += 1;
+                    complete_count += 1;
+                }
+                "blocked" => {
+                    blocked += 1;
+                    blocked_count += 1;
+                }
+                "failed" => {
+                    failed += 1;
+                    failed_count += 1;
+                }
+                _ => {}
+            }
+        }
+        if include_coverage {
+            let identity = static_plot_record_identity(record);
+            let plot_variant = static_plot_variant_key(&identity);
+            coverage.push(json!({
+                "manifest_id": record.id,
+                "run_kind": record.manifest.run_kind,
+                "run_label": record.manifest.run_label,
+                "state": record.manifest.state,
+                "model": identity.model,
+                "date": identity.date_yyyymmdd,
+                "cycle_utc": identity.cycle_utc,
+                "forecast_hour": identity.forecast_hour,
+                "source": identity.source,
+                "domain": identity.domain_slug,
+                "member": identity.member,
+                "ensemble_kind": identity.ensemble_kind,
+                "ensemble_stat": identity.ensemble_stat,
+                "ensemble_key": static_plot_ensemble_key(&identity),
+                "projection_variant": &plot_variant,
+                "plot_variant": &plot_variant,
+                "variant": &plot_variant,
+                "manifest_path": relative_path_string(root, &record.path),
+                "artifact_count": record.manifest.artifacts.len(),
+                "complete_count": complete,
+                "blocked_count": blocked,
+                "failed_count": failed,
+            }));
+        }
+    }
+
+    let mut summary = json!({
+        "status": if records.is_empty() { "empty" } else { "ready" },
+        "root": root,
+        "manifest_count": records.len(),
+        "artifact_count": artifact_count,
+        "complete_count": complete_count,
+        "blocked_count": blocked_count,
+        "failed_count": failed_count,
+    });
+    if include_coverage {
+        summary["coverage"] = Value::Array(coverage);
+    }
+    summary
+}
+
+fn static_plot_record_compare_desc(
+    a: &StaticPlotManifestRecord,
+    b: &StaticPlotManifestRecord,
+) -> Ordering {
+    let a_id = static_plot_record_identity(a);
+    let b_id = static_plot_record_identity(b);
+    b_id.date_yyyymmdd
+        .cmp(&a_id.date_yyyymmdd)
+        .then_with(|| b_id.cycle_utc.cmp(&a_id.cycle_utc))
+        .then_with(|| a_id.model.cmp(&b_id.model))
+        .then_with(|| a_id.domain_slug.cmp(&b_id.domain_slug))
+        .then_with(|| static_plot_variant_key(&a_id).cmp(&static_plot_variant_key(&b_id)))
+        .then_with(|| a_id.forecast_hour.cmp(&b_id.forecast_hour))
+        .then_with(|| a.path.cmp(&b.path))
+}
+
+fn static_plot_catalog_index_records<'a>(
+    records: Vec<&'a StaticPlotManifestRecord>,
+) -> Vec<&'a StaticPlotManifestRecord> {
+    let mut seen = BTreeSet::<(
+        Option<String>,
+        Option<String>,
+        Option<u8>,
+        Option<String>,
+        Option<String>,
+        String,
+        String,
+    )>::new();
+    records
+        .into_iter()
+        .filter(|record| {
+            let identity = static_plot_record_identity(record);
+            let ensemble_key = static_plot_ensemble_key(&identity);
+            let variant_key = static_plot_variant_key(&identity);
+            let key = (
+                identity.model,
+                identity.date_yyyymmdd,
+                identity.cycle_utc,
+                identity.source,
+                identity.domain_slug,
+                ensemble_key,
+                variant_key,
+            );
+            seen.insert(key)
+        })
+        .collect()
+}
+
+fn static_plot_record_matches(
+    record: &StaticPlotManifestRecord,
+    query: &StaticPlotCatalogQuery,
+) -> bool {
+    if let Some(manifest_id) = query.manifest_id.as_deref() {
+        if record.id != manifest_id {
+            return false;
+        }
+    }
+    let identity = static_plot_record_identity(record);
+    if let Some(model) = query.model.as_deref() {
+        if identity.model.as_deref() != Some(model) {
+            return false;
+        }
+    }
+    if let Some(date) = query.date.as_deref() {
+        if identity.date_yyyymmdd.as_deref() != Some(date) {
+            return false;
+        }
+    }
+    if let Some(cycle_utc) = query.cycle_utc {
+        if identity.cycle_utc != Some(cycle_utc) {
+            return false;
+        }
+    }
+    if let Some(forecast_hour) = query.forecast_hour {
+        if identity.forecast_hour != Some(forecast_hour) {
+            return false;
+        }
+    }
+    if let Some(domain) = query.domain.as_deref() {
+        if identity.domain_slug.as_deref() != Some(domain) {
+            return false;
+        }
+    }
+    if let Some(member) = query.member.as_deref() {
+        if static_plot_ensemble_key(&identity) != member {
+            return false;
+        }
+    }
+    if let Some(ensemble) = query.ensemble.as_deref() {
+        if static_plot_ensemble_key(&identity) != ensemble {
+            return false;
+        }
+    }
+    if let Some(projection) = query.projection.as_deref() {
+        if !static_plot_variant_filter_matches(&identity, projection) {
+            return false;
+        }
+    }
+    if let Some(variant) = query.variant.as_deref() {
+        if !static_plot_variant_filter_matches(&identity, variant) {
+            return false;
+        }
+    }
+    if let Some(q) = normalized_optional_query(query.q.as_deref()) {
+        let haystack = format!(
+            "{} {} {} {} {} {}",
+            record.manifest.run_label,
+            record.manifest.run_kind,
+            identity.model.as_deref().unwrap_or_default(),
+            identity.domain_slug.as_deref().unwrap_or_default(),
+            static_plot_variant_key(&identity),
+            record.path.display()
+        )
+        .to_ascii_lowercase();
+        if !haystack.contains(&q)
+            && !record
+                .manifest
+                .artifacts
+                .iter()
+                .any(|artifact| static_plot_artifact_matches_query(artifact, &q))
+        {
+            return false;
+        }
+    }
+    true
+}
+
+fn static_plot_record_json(
+    root: &Path,
+    record: &StaticPlotManifestRecord,
+    query: &StaticPlotCatalogQuery,
+) -> Value {
+    let identity = static_plot_record_identity(record);
+    let plot_variant = static_plot_variant_key(&identity);
+    let artifact_limit = query
+        .artifact_limit
+        .or(query.limit)
+        .unwrap_or(250)
+        .min(1000);
+    let artifact_offset = query.artifact_offset.or(query.offset).unwrap_or(0);
+    let artifacts = if query.include_artifacts {
+        record
+            .manifest
+            .artifacts
+            .iter()
+            .enumerate()
+            .filter(|(_, artifact)| static_plot_artifact_matches_filter(artifact, query))
+            .skip(artifact_offset)
+            .take(artifact_limit)
+            .map(|(index, artifact)| {
+                let path = resolve_static_artifact_path(&record.manifest, &artifact.relative_path);
+                let version = static_plot_artifact_version(&path);
+                let relative_path = relative_path_string(root, &path);
+                let encoded_path = url_encode_query_component(&relative_path);
+                let mut url = format!(
+                    "/v1/static-plots/artifacts/{}/{}?path={}",
+                    record.id, index, encoded_path
+                );
+                if let Some(version) = version.as_deref() {
+                    url.push_str("&v=");
+                    url.push_str(&url_encode_query_component(version));
+                }
+                json!({
+                    "index": index,
+                    "artifact_key": artifact.artifact_key,
+                    "state": artifact.state,
+                    "detail": artifact.detail,
+                    "relative_path": artifact.relative_path,
+                    "path": relative_path,
+                    "exists": path.is_file(),
+                    "url": url,
+                    "version": version,
+                    "content_identity": artifact.content_identity,
+                    "input_fetch_keys": artifact.input_fetch_keys,
+                })
+            })
+            .collect::<Vec<_>>()
+    } else {
+        Vec::new()
+    };
+    let matched_artifact_count = record
+        .manifest
+        .artifacts
+        .iter()
+        .filter(|artifact| static_plot_artifact_matches_filter(artifact, query))
+        .count();
+    let mut complete_count = 0usize;
+    let mut blocked_count = 0usize;
+    let mut failed_count = 0usize;
+    for artifact in &record.manifest.artifacts {
+        match normalized_state(&artifact.state).as_str() {
+            "complete" | "cache_hit" => complete_count += 1,
+            "blocked" => blocked_count += 1,
+            "failed" => failed_count += 1,
+            _ => {}
+        }
+    }
+    json!({
+        "manifest_id": record.id,
+        "run_kind": record.manifest.run_kind,
+        "run_label": record.manifest.run_label,
+        "output_root": record.manifest.output_root,
+        "state": record.manifest.state,
+        "detail": record.manifest.detail,
+        "model": identity.model,
+        "date": identity.date_yyyymmdd,
+        "cycle_utc": identity.cycle_utc,
+        "forecast_hour": identity.forecast_hour,
+        "source": identity.source,
+        "domain": identity.domain_slug,
+        "member": identity.member,
+        "ensemble_kind": identity.ensemble_kind,
+        "ensemble_stat": identity.ensemble_stat,
+        "ensemble_key": static_plot_ensemble_key(&identity),
+        "projection_variant": &plot_variant,
+        "plot_variant": &plot_variant,
+        "variant": &plot_variant,
+        "manifest_path": relative_path_string(root, &record.path),
+        "artifact_count": record.manifest.artifacts.len(),
+        "complete_count": complete_count,
+        "blocked_count": blocked_count,
+        "failed_count": failed_count,
+        "matched_artifact_count": matched_artifact_count,
+        "artifact_limit": if query.include_artifacts { json!(artifact_limit) } else { json!(null) },
+        "artifact_offset": if query.include_artifacts { json!(artifact_offset) } else { json!(null) },
+        "artifacts": artifacts
+    })
+}
+
+fn static_plot_artifact_matches_filter(
+    artifact: &StaticPlotArtifact,
+    query: &StaticPlotCatalogQuery,
+) -> bool {
+    if let Some(product) = normalized_optional_query(query.product.as_deref()) {
+        if normalized_static_plot_product_key(&artifact.artifact_key)
+            != normalized_static_plot_product_key(&product)
+        {
+            return false;
+        }
+    }
+    if let Some(state) = query.state.as_deref() {
+        if state != "all" && normalized_state(&artifact.state) != state {
+            return false;
+        }
+    }
+    if let Some(q) = normalized_optional_query(query.q.as_deref()) {
+        return static_plot_artifact_matches_query(artifact, &q);
+    }
+    true
+}
+
+fn static_plot_artifact_version(path: &Path) -> Option<String> {
+    let metadata = fs::metadata(path).ok()?;
+    let modified_ms = metadata
+        .modified()
+        .ok()?
+        .duration_since(UNIX_EPOCH)
+        .ok()?
+        .as_millis();
+    Some(format!("{modified_ms:x}-{:x}", metadata.len()))
+}
+
+fn url_encode_query_component(value: &str) -> String {
+    let mut encoded = String::new();
+    for byte in value.bytes() {
+        if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b'~') {
+            encoded.push(char::from(byte));
+        } else {
+            encoded.push_str(&format!("%{byte:02X}"));
+        }
+    }
+    encoded
+}
+
+fn static_plot_artifact_matches_query(artifact: &StaticPlotArtifact, query: &str) -> bool {
+    let haystack = format!(
+        "{} {} {}",
+        artifact.artifact_key,
+        artifact.detail.as_deref().unwrap_or_default(),
+        artifact.relative_path.display()
+    )
+    .to_ascii_lowercase();
+    haystack.contains(query)
+}
+
+fn normalized_static_plot_product_key(key: &str) -> String {
+    key.trim()
+        .strip_prefix("direct:")
+        .or_else(|| key.trim().strip_prefix("derived:"))
+        .or_else(|| key.trim().strip_prefix("windowed:"))
+        .or_else(|| key.trim().strip_prefix("ensemble:"))
+        .or_else(|| key.trim().strip_prefix("animation:"))
+        .or_else(|| key.trim().strip_prefix("animation_webp:"))
+        .or_else(|| key.trim().strip_prefix("video_mp4:"))
+        .unwrap_or_else(|| key.trim())
+        .to_ascii_lowercase()
+}
+
+fn normalized_optional_query(query: Option<&str>) -> Option<String> {
+    let query = query?.trim().to_ascii_lowercase();
+    if query.is_empty() {
+        None
+    } else {
+        Some(query)
+    }
+}
+
+fn static_plot_record_identity(record: &StaticPlotManifestRecord) -> StaticPlotIdentity {
+    static_plot_identity_with_path(&record.manifest, Some(&record.path))
+}
+
+fn static_plot_identity_with_path(
+    manifest: &StaticPlotRunManifest,
+    manifest_path: Option<&Path>,
+) -> StaticPlotIdentity {
+    let inferred = infer_static_plot_identity_from_label(&manifest.run_label);
+    let model = manifest.model.clone().or(inferred.model);
+    let plot_variant = manifest
+        .projection_variant
+        .as_deref()
+        .or(manifest.plot_variant.as_deref())
+        .or(manifest.variant.as_deref())
+        .and_then(normalized_static_plot_variant)
+        .or(inferred.plot_variant)
+        .or_else(|| infer_static_plot_variant_from_path(manifest_path))
+        .or_else(|| infer_static_plot_variant_from_path(Some(&manifest.output_root)));
+    StaticPlotIdentity {
+        model,
+        date_yyyymmdd: manifest.date_yyyymmdd.clone().or(inferred.date_yyyymmdd),
+        cycle_utc: manifest.cycle_utc.or(inferred.cycle_utc),
+        forecast_hour: manifest.forecast_hour.or(inferred.forecast_hour),
+        source: manifest.source.clone(),
+        domain_slug: manifest.domain_slug.clone().or(inferred.domain_slug),
+        member: manifest.member.clone().or(inferred.member),
+        ensemble_kind: manifest.ensemble_kind.clone().or(inferred.ensemble_kind),
+        ensemble_stat: manifest.ensemble_stat.clone().or(inferred.ensemble_stat),
+        plot_variant,
+    }
+}
+
+fn infer_static_plot_identity_from_label(run_label: &str) -> StaticPlotIdentity {
+    let label = run_label.strip_prefix("rustwx_").unwrap_or(run_label);
+    let label = label.strip_suffix("_non_ecape_hour").unwrap_or(label);
+    let parts = label.split('_').collect::<Vec<_>>();
+    let Some(date_index) = parts
+        .iter()
+        .position(|part| part.len() == 8 && part.chars().all(|ch| ch.is_ascii_digit()))
+    else {
+        return StaticPlotIdentity {
+            model: None,
+            date_yyyymmdd: None,
+            cycle_utc: None,
+            forecast_hour: None,
+            source: None,
+            domain_slug: None,
+            member: None,
+            ensemble_kind: None,
+            ensemble_stat: None,
+            plot_variant: None,
+        };
+    };
+    let model = if date_index > 0 {
+        let slug = parts[..date_index].join("_");
+        if slug.is_empty() {
+            None
+        } else {
+            Some(static_plot_model_slug(&slug))
+        }
+    } else {
+        None
+    };
+    let date_yyyymmdd = Some(parts[date_index].to_string());
+    let cycle_utc = parts
+        .get(date_index + 1)
+        .and_then(|part| part.strip_suffix('z'))
+        .and_then(|part| part.parse::<u8>().ok());
+    let forecast_hour = parts
+        .get(date_index + 2)
+        .and_then(|part| part.strip_prefix('f'))
+        .and_then(|part| part.parse::<u16>().ok());
+    let (domain_slug, plot_variant) = if parts.len() > date_index + 3 {
+        let tail = parts[date_index + 3..].to_vec();
+        let (domain_parts, plot_variant) = split_static_plot_domain_variant_parts(&tail);
+        let domain_slug = if domain_parts.is_empty() {
+            None
+        } else {
+            Some(domain_parts.join("_"))
+        };
+        (domain_slug, plot_variant)
+    } else {
+        (None, None)
+    };
+    StaticPlotIdentity {
+        model,
+        date_yyyymmdd,
+        cycle_utc,
+        forecast_hour,
+        source: None,
+        domain_slug,
+        member: None,
+        ensemble_kind: None,
+        ensemble_stat: None,
+        plot_variant,
+    }
+}
+
+fn static_plot_ensemble_key(identity: &StaticPlotIdentity) -> String {
+    if let Some(member) = identity.member.as_deref() {
+        return member.to_string();
+    }
+    if let Some(stat) = identity.ensemble_stat.as_deref() {
+        return stat.to_string();
+    }
+    "control".to_string()
+}
+
+fn static_plot_variant_key(identity: &StaticPlotIdentity) -> String {
+    identity
+        .plot_variant
+        .clone()
+        .unwrap_or_else(|| "auto".to_string())
+}
+
+fn static_plot_variant_filter_matches(identity: &StaticPlotIdentity, filter: &str) -> bool {
+    let Some(filter) = normalized_static_plot_variant(filter) else {
+        return true;
+    };
+    filter == "all" || static_plot_variant_key(identity) == filter
+}
+
+fn normalized_static_plot_variant(value: &str) -> Option<String> {
+    let slug = normalized_static_plot_variant_slug(value)?;
+    Some(
+        known_static_plot_variant_alias(&slug)
+            .unwrap_or(slug.as_str())
+            .to_string(),
+    )
+}
+
+fn normalized_known_static_plot_variant(value: &str) -> Option<String> {
+    let slug = normalized_static_plot_variant_slug(value)?;
+    known_static_plot_variant_alias(&slug).map(str::to_string)
+}
+
+fn known_static_plot_variant_alias(slug: &str) -> Option<&'static str> {
+    match slug {
+        "all" => Some("all"),
+        "auto" | "default" | "standard" => Some("auto"),
+        "geo" | "geographic" | "latlon" | "lat_lon" | "plate_carree" | "equirectangular" => {
+            Some("geo")
+        }
+        "lambert" | "lambert_conformal" | "lambert_conformal_conic" | "lcc" => Some("lambert"),
+        "albers" | "albers_equal_area" | "aea" => Some("albers"),
+        "mercator" | "merc" | "web_mercator" | "webmercator" => Some("mercator"),
+        "robinson" | "robin" => Some("robinson"),
+        _ => None,
+    }
+}
+
+fn normalized_static_plot_variant_slug(value: &str) -> Option<String> {
+    let mut slug = value
+        .trim()
+        .to_ascii_lowercase()
+        .chars()
+        .map(|ch| if ch.is_ascii_alphanumeric() { ch } else { '_' })
+        .collect::<String>();
+    while slug.contains("__") {
+        slug = slug.replace("__", "_");
+    }
+    let slug = slug.trim_matches('_');
+    if slug.is_empty() {
+        return None;
+    }
+    let slug = slug
+        .strip_prefix("projection_variant_")
+        .or_else(|| slug.strip_prefix("plot_variant_"))
+        .or_else(|| slug.strip_prefix("projection_"))
+        .or_else(|| slug.strip_prefix("proj_"))
+        .or_else(|| slug.strip_prefix("variant_"))
+        .or_else(|| slug.strip_prefix("plot_"))
+        .or_else(|| slug.strip_prefix("style_"))
+        .unwrap_or(slug);
+    if slug.is_empty() {
+        None
+    } else {
+        Some(slug.to_string())
+    }
+}
+
+fn split_static_plot_domain_variant_parts<'a>(parts: &[&'a str]) -> (Vec<&'a str>, Option<String>) {
+    if parts.is_empty() {
+        return (Vec::new(), None);
+    }
+
+    for index in (0..parts.len()).rev() {
+        let variant_marker_after_pair = index > 0
+            && parts[index].eq_ignore_ascii_case("variant")
+            && (parts[index - 1].eq_ignore_ascii_case("projection")
+                || parts[index - 1].eq_ignore_ascii_case("plot"));
+        let marker_len = match parts[index].to_ascii_lowercase().as_str() {
+            "variant" if variant_marker_after_pair => 0,
+            "projection" | "proj" | "plot" | "style" | "variant" => 1,
+            _ => 0,
+        };
+        if marker_len == 0 || index + marker_len >= parts.len() {
+            continue;
+        }
+        if parts[index].eq_ignore_ascii_case("projection")
+            && parts
+                .get(index + 1)
+                .is_some_and(|part| part.eq_ignore_ascii_case("variant"))
+            && index + 2 < parts.len()
+        {
+            let candidate = parts[index + 2..].join("_");
+            if let Some(variant) = normalized_static_plot_variant(&candidate) {
+                return (parts[..index].to_vec(), Some(variant));
+            }
+        }
+        if parts[index].eq_ignore_ascii_case("plot")
+            && parts
+                .get(index + 1)
+                .is_some_and(|part| part.eq_ignore_ascii_case("variant"))
+            && index + 2 < parts.len()
+        {
+            let candidate = parts[index + 2..].join("_");
+            if let Some(variant) = normalized_static_plot_variant(&candidate) {
+                return (parts[..index].to_vec(), Some(variant));
+            }
+        }
+        let candidate = parts[index + marker_len..].join("_");
+        if let Some(variant) = normalized_static_plot_variant(&candidate) {
+            return (parts[..index].to_vec(), Some(variant));
+        }
+    }
+
+    for index in (0..parts.len()).rev() {
+        let candidate = parts[index..].join("_");
+        if let Some(variant) = normalized_known_static_plot_variant(&candidate) {
+            return (parts[..index].to_vec(), Some(variant));
+        }
+    }
+
+    (parts.to_vec(), None)
+}
+
+fn infer_static_plot_variant_from_path(path: Option<&Path>) -> Option<String> {
+    let path = path?;
+    for component in path.components().rev().take(8) {
+        let text = component.as_os_str().to_string_lossy();
+        if let Some(variant) = infer_static_plot_variant_from_text(&text) {
+            return Some(variant);
+        }
+    }
+    None
+}
+
+fn infer_static_plot_variant_from_text(text: &str) -> Option<String> {
+    let mut parts = text
+        .split(|ch: char| !ch.is_ascii_alphanumeric())
+        .filter(|part| !part.is_empty())
+        .collect::<Vec<_>>();
+    if parts
+        .last()
+        .is_some_and(|part| part.eq_ignore_ascii_case("json") || part.eq_ignore_ascii_case("png"))
+    {
+        parts.pop();
+    }
+    if parts.len() >= 2
+        && parts[parts.len() - 2].eq_ignore_ascii_case("run")
+        && parts[parts.len() - 1].eq_ignore_ascii_case("manifest")
+    {
+        parts.truncate(parts.len() - 2);
+    } else if parts
+        .last()
+        .is_some_and(|part| part.eq_ignore_ascii_case("manifest"))
+    {
+        parts.pop();
+    }
+    let (_, variant) = split_static_plot_domain_variant_parts(&parts);
+    variant
+}
+
+fn static_plot_model_slug(slug: &str) -> String {
+    match slug {
+        "ecmwf_open_data" => "ecmwf-open-data".to_string(),
+        value => value.replace('_', "-"),
+    }
+}
+
+fn resolve_static_artifact_path(manifest: &StaticPlotRunManifest, artifact_path: &Path) -> PathBuf {
+    if artifact_path.is_absolute() {
+        artifact_path.to_path_buf()
+    } else {
+        manifest.output_root.join(artifact_path)
+    }
+}
+
+fn normalized_state(value: &str) -> String {
+    value.trim().to_ascii_lowercase()
+}
+
+fn stable_static_plot_id(path: &Path) -> String {
+    let mut hash = 0xcbf29ce484222325u64;
+    for byte in path.display().to_string().as_bytes() {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    format!("{hash:016x}")
+}
+
+fn no_store_headers() -> HeaderMap {
+    let mut headers = HeaderMap::new();
+    headers.insert(
+        header::CACHE_CONTROL,
+        HeaderValue::from_static("no-store, no-cache, must-revalidate, max-age=0"),
+    );
+    headers.insert(header::PRAGMA, HeaderValue::from_static("no-cache"));
+    headers
+}
+
+async fn index() -> impl IntoResponse {
+    (no_store_headers(), Html(INDEX_HTML))
+}
+
+async fn plots() -> impl IntoResponse {
+    (no_store_headers(), Html(PLOTS_HTML))
+}
+
+async fn projection_demo() -> impl IntoResponse {
+    (no_store_headers(), Html(PROJECTION_DEMO_HTML))
+}
+
+async fn ops() -> impl IntoResponse {
+    (no_store_headers(), Html(OPS_HTML))
+}
+
+const PROJECTION_DEMO_HTML: &str = r###"<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Projection Style Demo</title>
+  <style>
+    :root {
+      color-scheme: dark;
+      --bg: #101418;
+      --panel: #171d24;
+      --panel-2: #202833;
+      --line: #344050;
+      --text: #eef3f8;
+      --muted: #aab5c2;
+      --accent: #4ea1ff;
+      --bad: #f87171;
+    }
+    * { box-sizing: border-box; }
+    html, body { margin: 0; min-height: 100%; }
+    body {
+      font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      background: var(--bg);
+      color: var(--text);
+    }
+    header {
+      position: sticky;
+      top: 0;
+      z-index: 10;
+      display: grid;
+      gap: 10px;
+      padding: 12px;
+      border-bottom: 1px solid var(--line);
+      background: rgba(16, 20, 24, 0.96);
+      backdrop-filter: blur(12px);
+    }
+    .topline {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 12px;
+    }
+    h1 { margin: 0; font-size: 18px; letter-spacing: 0; }
+    nav { display: flex; gap: 8px; align-items: center; }
+    a, button {
+      color: var(--text);
+      background: var(--panel-2);
+      border: 1px solid var(--line);
+      border-radius: 7px;
+      height: 34px;
+      padding: 0 10px;
+      font: inherit;
+      font-weight: 750;
+      text-decoration: none;
+      cursor: pointer;
+    }
+    button.primary { background: #1c5f9f; border-color: #2a78c3; }
+    .controls {
+      display: grid;
+      grid-template-columns: repeat(7, minmax(110px, 1fr));
+      gap: 8px;
+      align-items: end;
+    }
+    label {
+      display: grid;
+      gap: 4px;
+      min-width: 0;
+      color: var(--muted);
+      font-size: 11px;
+      font-weight: 800;
+      text-transform: uppercase;
+    }
+    select {
+      width: 100%;
+      height: 34px;
+      border-radius: 7px;
+      border: 1px solid var(--line);
+      background: #0f151d;
+      color: var(--text);
+      padding: 0 8px;
+      font: inherit;
+      font-size: 13px;
+      text-transform: none;
+    }
+    main { padding: 12px; }
+    .status {
+      margin-bottom: 12px;
+      color: var(--muted);
+      font-size: 13px;
+      line-height: 1.4;
+    }
+    .grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(420px, 1fr));
+      gap: 12px;
+      align-items: start;
+    }
+    .tile {
+      overflow: hidden;
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      background: var(--panel);
+    }
+    .tile-head {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 8px;
+      padding: 8px 10px;
+      border-bottom: 1px solid var(--line);
+      background: var(--panel-2);
+    }
+    .variant {
+      min-width: 0;
+      font-size: 14px;
+      font-weight: 850;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+    .meta {
+      color: var(--muted);
+      font-size: 12px;
+      white-space: nowrap;
+    }
+    .image-wrap {
+      display: grid;
+      place-items: center;
+      min-height: 280px;
+      background: #0a0e13;
+    }
+    img {
+      display: block;
+      width: 100%;
+      height: auto;
+      background: #0a0e13;
+    }
+    .missing {
+      padding: 28px;
+      color: var(--bad);
+      font-size: 13px;
+      text-align: center;
+    }
+    .empty {
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      padding: 18px;
+      color: var(--muted);
+      background: var(--panel);
+    }
+    @media (max-width: 980px) {
+      .controls { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+      .grid { grid-template-columns: 1fr; }
+      .topline { align-items: flex-start; flex-direction: column; }
+    }
+  </style>
+</head>
+<body>
+  <header>
+    <div class="topline">
+      <h1>Projection / Plot Style Demo</h1>
+      <nav>
+        <a href="/plots">Plots</a>
+        <a href="/ops">Ops</a>
+        <button id="refresh" class="primary">Refresh</button>
+      </nav>
+    </div>
+    <div class="controls">
+      <label>Model<select id="model"></select></label>
+      <label>Run<select id="run"></select></label>
+      <label>Domain<select id="domain"></select></label>
+      <label>Member<select id="member"></select></label>
+      <label>Hour<select id="hour"></select></label>
+      <label>Product<select id="product"></select></label>
+      <label>Variant Filter<select id="variant"></select></label>
+    </div>
+  </header>
+  <main>
+    <div id="status" class="status">Loading catalog...</div>
+    <section id="grid" class="grid"></section>
+  </main>
+  <script>
+    const els = {
+      model: document.getElementById("model"),
+      run: document.getElementById("run"),
+      domain: document.getElementById("domain"),
+      member: document.getElementById("member"),
+      hour: document.getElementById("hour"),
+      product: document.getElementById("product"),
+      variant: document.getElementById("variant"),
+      refresh: document.getElementById("refresh"),
+      status: document.getElementById("status"),
+      grid: document.getElementById("grid"),
+    };
+    let catalog = [];
+    let series = [];
+    let lastSeriesKey = "";
+
+    function setStatus(text) { els.status.textContent = text; }
+    function opt(select, value, label = value) {
+      const node = document.createElement("option");
+      node.value = value;
+      node.textContent = label;
+      select.appendChild(node);
+    }
+    function setOptions(select, values, previous, labels = new Map()) {
+      select.textContent = "";
+      values.forEach(value => opt(select, value, labels.get(value) || value));
+      if (values.includes(previous)) select.value = previous;
+      else if (values.length) select.value = values[0];
+    }
+    function modelOf(item) { return item.model || "unknown"; }
+    function runKey(item) { return `${item.date || "unknown"}_${String(item.cycle_utc ?? 0).padStart(2, "0")}z`; }
+    function runLabel(key) { return key.replace("_", " "); }
+    function memberOf(item) { return item.ensemble_key || item.member || "control"; }
+    function variantOf(item) { return item.projection_variant || item.plot_variant || item.variant || "auto"; }
+    function productLabel(key) {
+      return String(key || "")
+        .replace(/^(direct|derived|windowed|ensemble|animation|animation_webp):/, "")
+        .replaceAll("_", " ");
+    }
+    function productKey(artifact) { return artifact?.artifact_key || ""; }
+    function stripProductPrefix(key) {
+      return String(key || "").replace(/^(direct|derived|windowed|ensemble|animation|animation_webp):/, "");
+    }
+    function normalizedProductKey(artifact) {
+      return stripProductPrefix(productKey(artifact));
+    }
+    function artifactAvailable(artifact) { return artifact && artifact.exists !== false && artifact.url; }
+    function isProjectionGalleryManifest(item) {
+      return String(item.manifest_path || "").includes("experiments/projection_gallery/")
+        || String(item.output_root || "").includes("/experiments/projection_gallery/");
+    }
+    function unique(values) { return Array.from(new Set(values.filter(Boolean))).sort(); }
+    function selectedRunParts() {
+      const [date, cycleText] = els.run.value.split("_");
+      return { date, cycle: parseInt(cycleText, 10) || 0 };
+    }
+    function selectPreferred(select, preferred) {
+      for (const item of preferred) {
+        const found = Array.from(select.options).find(option => option.value === item);
+        if (found) {
+          select.value = item;
+          return;
+        }
+      }
+    }
+    function filteredCatalog() {
+      const parts = selectedRunParts();
+      return catalog.filter(item =>
+        modelOf(item) === els.model.value &&
+        item.date === parts.date &&
+        Number(item.cycle_utc) === Number(parts.cycle)
+      );
+    }
+    function populateModels(preserve = true) {
+      const previous = preserve ? els.model.value : "";
+      const models = unique(catalog.map(modelOf));
+      setOptions(els.model, models, previous);
+      selectPreferred(els.model, ["gfs", "gefs", "hrrr", "rap", "ecmwf-open-data"]);
+    }
+    function populateRuns(preserve = true) {
+      const previous = preserve ? els.run.value : "";
+      const labels = new Map();
+      const runs = unique(catalog.filter(item => modelOf(item) === els.model.value).map(item => {
+        const key = runKey(item);
+        labels.set(key, runLabel(key));
+        return key;
+      })).sort().reverse();
+      setOptions(els.run, runs, previous, labels);
+    }
+    function populateDomains(preserve = true) {
+      const previous = preserve ? els.domain.value : "";
+      const domains = unique(filteredCatalog().map(item => item.domain));
+      setOptions(els.domain, domains, previous);
+      selectPreferred(els.domain, ["conus", "global"]);
+    }
+    function populateMembers(preserve = true) {
+      const previous = preserve ? els.member.value : "";
+      const members = unique(filteredCatalog().filter(item => item.domain === els.domain.value).map(memberOf));
+      setOptions(els.member, members, previous);
+    }
+    function populateHours(preserve = true) {
+      const previous = preserve ? els.hour.value : "";
+      const hours = unique(filteredCatalog()
+        .filter(item => item.domain === els.domain.value && memberOf(item) === els.member.value)
+        .map(item => String(item.forecast_hour ?? 0).padStart(3, "0")));
+      setOptions(els.hour, hours, previous);
+    }
+    function populateVariants(preserve = true) {
+      const previous = preserve ? els.variant.value : "";
+      const variants = ["all", ...unique(series.map(variantOf))];
+      setOptions(els.variant, variants, previous);
+    }
+    function populateProducts(preserve = true) {
+      const previous = preserve ? els.product.value : "";
+      const products = unique(series.flatMap(item => (item.artifacts || []).map(productKey)));
+      const labels = new Map(products.map(key => [key, productLabel(key)]));
+      setOptions(els.product, products, previous, labels);
+      selectPreferred(els.product, [
+        "direct:500mb_height_winds",
+        "500mb_height_winds",
+        "direct:2m_temperature",
+        "direct:500mb_height_winds",
+        "direct:mslp_10m_winds",
+        "derived:2m_temperature",
+      ]);
+    }
+    async function fetchCatalog(preserve = true) {
+      setStatus("Loading plot manifest catalog...");
+      const url = `/v1/static-plots?include_artifacts=false&state=all&manifest_limit=20000&_=${Date.now()}`;
+      const res = await fetch(url, { cache: "no-store" });
+      if (!res.ok) throw new Error(`catalog ${res.status}`);
+      const data = await res.json();
+      catalog = data.manifests || [];
+      populateModels(preserve);
+      populateRuns(preserve);
+      populateDomains(preserve);
+      populateMembers(preserve);
+      populateHours(preserve);
+    }
+    async function fetchSeries(preserveProduct = true) {
+      if (!els.model.value || !els.run.value || !els.domain.value || !els.member.value || !els.hour.value) return;
+      const parts = selectedRunParts();
+      const hour = String(parseInt(els.hour.value, 10));
+      const key = [els.model.value, parts.date, parts.cycle, els.domain.value, els.member.value, hour].join("|");
+      setStatus("Loading images for selected run/domain/hour...");
+      const params = new URLSearchParams({
+        include_artifacts: "true",
+        state: "all",
+        model: els.model.value,
+        date: parts.date,
+        cycle_utc: String(parts.cycle),
+        domain: els.domain.value,
+        ensemble: els.member.value,
+        forecast_hour: hour,
+        artifact_limit: "1000",
+        manifest_limit: "20000",
+        _: String(Date.now()),
+      });
+      const res = await fetch(`/v1/static-plots?${params.toString()}`, { cache: "no-store" });
+      if (!res.ok) throw new Error(`series ${res.status}`);
+      const data = await res.json();
+      series = data.manifests || [];
+      lastSeriesKey = key;
+      populateProducts(preserveProduct);
+      populateVariants(true);
+      renderGrid();
+    }
+    function renderGrid() {
+      const product = els.product.value;
+      const variantFilter = els.variant.value || "all";
+      const candidates = series.filter(item => variantFilter === "all" || variantOf(item) === variantFilter);
+      const galleryCandidates = candidates.filter(isProjectionGalleryManifest);
+      const sourceRows = galleryCandidates.length >= 2 ? galleryCandidates : candidates;
+      const rows = sourceRows
+        .map(item => {
+          const normalizedProduct = stripProductPrefix(product);
+          const artifact = (item.artifacts || []).find(candidate => normalizedProductKey(candidate) === normalizedProduct);
+          return { item, artifact };
+        })
+        .sort((a, b) => variantOf(a.item).localeCompare(variantOf(b.item)));
+      els.grid.textContent = "";
+      if (!rows.length) {
+        els.grid.innerHTML = `<div class="empty">No matching manifests for this selection yet.</div>`;
+        setStatus("No matching manifests. Try another model/run/domain/hour.");
+        return;
+      }
+      for (const row of rows) {
+        const card = document.createElement("article");
+        card.className = "tile";
+        const variant = variantOf(row.item);
+        const state = row.artifact?.state || row.item.state || "unknown";
+        const manifest = row.item.manifest_path || row.item.run_label || "";
+        card.innerHTML = `
+          <div class="tile-head">
+            <div class="variant">${variant}</div>
+            <div class="meta">f${String(row.item.forecast_hour ?? 0).padStart(3, "0")} | ${state}</div>
+          </div>
+          <div class="image-wrap">
+            ${artifactAvailable(row.artifact)
+              ? `<img src="${row.artifact.url}" alt="${variant} ${productLabel(product)}" loading="lazy" />`
+              : `<div class="missing">No image for ${productLabel(product)}<br>${manifest}</div>`}
+          </div>`;
+        els.grid.appendChild(card);
+      }
+      const visible = rows.filter(row => artifactAvailable(row.artifact)).length;
+      setStatus(`${visible}/${rows.length} variants have an image for ${productLabel(product)}. ${els.model.value} ${runLabel(els.run.value)} ${els.domain.value} ${els.member.value} f${els.hour.value}.`);
+    }
+    async function reload(preserve = true) {
+      try {
+        await fetchCatalog(preserve);
+        await fetchSeries(preserve);
+      } catch (err) {
+        console.error(err);
+        setStatus(`Error: ${err.message}`);
+      }
+    }
+    function hook(select, fn) {
+      select.addEventListener("change", async () => {
+        try { await fn(); } catch (err) { setStatus(`Error: ${err.message}`); }
+      });
+    }
+    hook(els.model, async () => {
+      populateRuns(false); populateDomains(false); populateMembers(false); populateHours(false); await fetchSeries(false);
+    });
+    hook(els.run, async () => {
+      populateDomains(false); populateMembers(false); populateHours(false); await fetchSeries(false);
+    });
+    hook(els.domain, async () => {
+      populateMembers(false); populateHours(false); await fetchSeries(false);
+    });
+    hook(els.member, async () => {
+      populateHours(false); await fetchSeries(false);
+    });
+    hook(els.hour, async () => { await fetchSeries(true); });
+    hook(els.product, async () => { renderGrid(); });
+    hook(els.variant, async () => { renderGrid(); });
+    els.refresh.addEventListener("click", () => reload(true));
+    reload(false);
+  </script>
+</body>
+</html>"###;
 
 const INDEX_HTML: &str = r#"<!doctype html>
 <html lang="en">
@@ -1110,7 +2690,7 @@ const INDEX_HTML: &str = r#"<!doctype html>
       top: 12px;
       left: 12px;
       display: grid;
-      grid-template-columns: 150px 150px minmax(190px, 280px) 78px 96px 78px 78px 74px;
+      grid-template-columns: 130px 118px 118px 145px 145px minmax(180px, 260px) 76px 92px 74px 74px 72px;
       gap: 8px;
       align-items: end;
       padding: 10px;
@@ -1133,6 +2713,17 @@ const INDEX_HTML: &str = r#"<!doctype html>
     .check { display: flex; align-items: center; gap: 6px; height: 34px; }
     .check input { width: 16px; height: 16px; padding: 0; }
     button { cursor: pointer; background: #0f172a; color: #fff; border-color: #0f172a; font-weight: 700; }
+    .nav-button {
+      display: inline-grid;
+      place-items: center;
+      height: 32px;
+      border-radius: 6px;
+      background: #334155;
+      color: #fff;
+      font-size: 13px;
+      font-weight: 800;
+      text-decoration: none;
+    }
     .status {
       position: absolute;
       z-index: 1000;
@@ -1240,6 +2831,8 @@ const INDEX_HTML: &str = r#"<!doctype html>
   </div>
   <div class="panel">
     <label>Model<select id="model"></select></label>
+    <label>Domain<select id="domain"></select></label>
+    <label>Basemap<select id="basemap"></select></label>
     <label>Run A<select id="runA"></select></label>
     <label>Run B<select id="runB"></select></label>
     <label class="wide">Layer<select id="layer"></select></label>
@@ -1247,15 +2840,18 @@ const INDEX_HTML: &str = r#"<!doctype html>
     <label>Palette<select id="palette">
       <option value="auto">auto</option>
       <option value="vpd">vpd</option>
-      <option value="severe">severe</option>
-      <option value="temp">temp</option>
-      <option value="precip">precip</option>
-      <option value="viridis">viridis</option>
+      <option value="temperature">temperature</option>
+      <option value="humidity">humidity</option>
+      <option value="wind">wind</option>
+      <option value="magma">magma</option>
+      <option value="fire_weather">fire</option>
+      <option value="gray">gray</option>
     </select></label>
     <label>Min<input id="min" inputmode="decimal" /></label>
     <label>Max<input id="max" inputmode="decimal" /></label>
     <label>Compare<span class="check"><input id="compare" type="checkbox" /> side</span></label>
     <button id="apply">Apply</button>
+    <a class="nav-button" href="/plots">Plots</a>
   </div>
   <div id="status" class="status">Loading WxStore layers...</div>
   <div id="usagePanel" class="usage-panel">
@@ -1284,6 +2880,8 @@ const INDEX_HTML: &str = r#"<!doctype html>
   <script>
     const els = {
       model: document.getElementById("model"),
+      domain: document.getElementById("domain"),
+      basemap: document.getElementById("basemap"),
       runA: document.getElementById("runA"),
       runB: document.getElementById("runB"),
       layer: document.getElementById("layer"),
@@ -1311,14 +2909,37 @@ const INDEX_HTML: &str = r#"<!doctype html>
       usageAvg: document.getElementById("usageAvg"),
       usageRate: document.getElementById("usageRate"),
     };
+    const BASEMAPS = {
+      dark: {
+        label: "Dark",
+        url: "https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png",
+        options: { maxZoom: 19, subdomains: "abcd", attribution: "&copy; OpenStreetMap &copy; CARTO" },
+      },
+      light: {
+        label: "Light",
+        url: "https://{s}.basemaps.cartocdn.com/light_all/{z}/{x}/{y}{r}.png",
+        options: { maxZoom: 19, subdomains: "abcd", attribution: "&copy; OpenStreetMap &copy; CARTO" },
+      },
+      osm: {
+        label: "OSM",
+        url: "https://tile.openstreetmap.org/{z}/{x}/{y}.png",
+        options: { maxZoom: 19, attribution: "&copy; OpenStreetMap" },
+      },
+      topo: {
+        label: "Topo",
+        url: "https://{s}.tile.opentopomap.org/{z}/{x}/{y}.png",
+        options: { maxZoom: 17, attribution: "&copy; OpenStreetMap &copy; OpenTopoMap" },
+      },
+      satellite: {
+        label: "Satellite",
+        url: "https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}",
+        options: { maxZoom: 19, attribution: "Tiles &copy; Esri" },
+      },
+    };
     const mapA = L.map("mapA", { zoomControl: true }).setView([36.5, -116.5], 5);
     const mapB = L.map("mapB", { zoomControl: false }).setView([36.5, -116.5], 5);
-    for (const map of [mapA, mapB]) {
-      L.tileLayer("https://tile.openstreetmap.org/{z}/{x}/{y}.png", {
-        maxZoom: 12,
-        attribution: "&copy; OpenStreetMap"
-      }).addTo(map);
-    }
+    let baseA = null;
+    let baseB = null;
     let syncing = false;
     function syncMaps(source, target) {
       if (syncing) return;
@@ -1353,24 +2974,41 @@ const INDEX_HTML: &str = r#"<!doctype html>
       return location.origin;
     }
 
-    function addBase(map) {
-      return L.tileLayer("https://tile.openstreetmap.org/{z}/{x}/{y}.png", {
-      maxZoom: 12,
-      attribution: "&copy; OpenStreetMap"
-      }).addTo(map);
+    function populateBasemaps() {
+      els.basemap.innerHTML = Object.entries(BASEMAPS)
+        .map(([key, config]) => `<option value="${key}">${config.label}</option>`)
+        .join("");
+      els.basemap.value = localStorage.getItem("wxstore_basemap") || "dark";
+      if (!BASEMAPS[els.basemap.value]) els.basemap.value = "dark";
+    }
+
+    function addBase(map, key) {
+      const config = BASEMAPS[key] || BASEMAPS.dark;
+      return L.tileLayer(config.url, config.options).addTo(map);
+    }
+
+    function setBasemap(key) {
+      if (baseA) mapA.removeLayer(baseA);
+      if (baseB) mapB.removeLayer(baseB);
+      baseA = addBase(mapA, key);
+      baseB = addBase(mapB, key);
+      localStorage.setItem("wxstore_basemap", key);
+      updateUsageDisplay();
     }
 
     function defaultsFor(name) {
       const lower = name.toLowerCase();
-      if (lower.includes("vpd")) return ["vpd", "0", "5"];
-      if (lower.includes("stp") || lower.includes("scp") || lower.includes("ehi")) return ["severe", "0", "5"];
-      if (lower.includes("cape")) return ["severe", "0", "3000"];
-      if (lower.includes("cin")) return ["severe", "-250", "0"];
-      if (lower.includes("qpf") || lower.includes("precip")) return ["precip", "0", "0.25"];
-      if (lower.includes("temp") || lower.includes("dewpoint") || lower.includes("wetbulb")) return ["temp", "-20", "40"];
-      if (lower.includes("rh") || lower.includes("humidity") || lower.includes("cloud")) return ["viridis", "0", "100"];
-      if (lower.includes("wind") || lower.includes("shear")) return ["viridis", "0", "40"];
-      return ["viridis", "0", "1"];
+      if (lower.includes("rh") || lower.includes("humidity") || lower.includes("cloud")) return ["humidity", "0", "100"];
+      if (lower.includes("vpd")) return ["vpd", "0", "40"];
+      if (lower.includes("fire_weather")) return ["fire_weather", "0", "100"];
+      if (lower.includes("stp") || lower.includes("scp") || lower.includes("ehi")) return ["magma", "0", "5"];
+      if (lower.includes("cape")) return ["magma", "0", "5000"];
+      if (lower.includes("cin")) return ["magma", "-250", "0"];
+      if (lower.includes("qpf") || lower.includes("precip")) return ["magma", "0", "75"];
+      if (lower.includes("temp") || lower.includes("dewpoint") || lower.includes("wetbulb") || lower.includes("heat_index") || lower.includes("wind_chill")) return ["temperature", "-35", "45"];
+      if (lower.includes("wind") || lower.includes("shear")) return ["wind", "0", "45"];
+      if (lower.includes("visibility")) return ["gray", "0", "16093"];
+      return ["temperature", "0", "1"];
     }
 
     function setStatus(text) {
@@ -1596,6 +3234,20 @@ const INDEX_HTML: &str = r#"<!doctype html>
       }
       els.runA.value = runs[runs.length - 1] || "";
       els.runB.value = runs[0] || els.runA.value;
+      loadDomainList();
+    }
+
+    function loadDomainList() {
+      const model = modelInfoById[els.model.value];
+      const readiness = model && model.latest_readiness ? model.latest_readiness : {};
+      const domains = readiness.domains && readiness.domains.length ? readiness.domains : ["native"];
+      els.domain.innerHTML = "";
+      for (const domain of domains) {
+        const opt = document.createElement("option");
+        opt.value = domain;
+        opt.textContent = domain;
+        els.domain.appendChild(opt);
+      }
     }
 
     async function loadVariablesFor(run) {
@@ -1655,7 +3307,7 @@ const INDEX_HTML: &str = r#"<!doctype html>
       const frame = data.frames && data.frames[0];
       if (!frame) throw new Error(`${run} has no frame`);
       if (existingOverlay) map.removeLayer(existingOverlay);
-      const next = L.tileLayer(frame.tiles[0] + ".png", { opacity: 0.72, maxZoom: data.maxzoom || 9 }).addTo(map);
+      const next = L.tileLayer(frame.tiles[0], { opacity: 0.72, maxZoom: data.maxzoom || 9 }).addTo(map);
       next.on("tileload tileerror loading load", updateUsageDisplay);
       if (data.bounds) {
         map.fitBounds([[data.bounds[1], data.bounds[0]], [data.bounds[3], data.bounds[2]]], { padding: [18, 18] });
@@ -1675,13 +3327,15 @@ const INDEX_HTML: &str = r#"<!doctype html>
         overlayB = null;
       }
       const palette = els.palette.value === "auto" ? defaultsFor(els.layer.value)[0] : els.palette.value;
-      setStatus(`${els.model.value} ${els.layer.value} f${String(els.hour.value).padStart(3, "0")} | ${palette} ${els.min.value},${els.max.value} | A=${els.runA.value}${els.compare.checked ? " B=" + els.runB.value : ""}`);
+      setStatus(`${els.model.value} ${els.domain.value} ${els.layer.value} f${String(els.hour.value).padStart(3, "0")} | ${palette} ${els.min.value},${els.max.value} | A=${els.runA.value}${els.compare.checked ? " B=" + els.runB.value : ""}`);
     }
 
     els.model.addEventListener("change", () => {
       loadRunList();
       refreshLayerList().then(applyLayer).catch(err => setStatus(err.message));
     });
+    els.domain.addEventListener("change", () => applyLayer().catch(err => setStatus(err.message)));
+    els.basemap.addEventListener("change", () => setBasemap(els.basemap.value));
     els.runA.addEventListener("change", () => refreshLayerList().then(applyLayer).catch(err => setStatus(err.message)));
     els.runB.addEventListener("change", () => refreshHours().then(applyLayer).catch(err => setStatus(err.message)));
     els.layer.addEventListener("change", () => refreshHours().then(applyLayer).catch(err => setStatus(err.message)));
@@ -1703,7 +3357,1089 @@ const INDEX_HTML: &str = r#"<!doctype html>
         els.pickerMeta.textContent = "Samples the selected layer/hour from the WxStore grid.";
       });
     }
+    populateBasemaps();
+    setBasemap(els.basemap.value);
     loadModelList().then(refreshLayerList).then(applyLayer).catch(err => setStatus(err.message));
+  </script>
+</body>
+</html>
+"#;
+
+const PLOTS_HTML: &str = r#"<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>WxStore Plot Loop</title>
+  <style>
+    :root { color-scheme: light; }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      background: #f6f8fb;
+      color: #101828;
+    }
+    header {
+      position: sticky;
+      top: 0;
+      z-index: 20;
+      display: grid;
+      grid-template-columns: minmax(180px, 1fr) auto;
+      gap: 12px;
+      align-items: center;
+      padding: 10px 14px;
+      border-bottom: 1px solid #d0d5dd;
+      background: rgba(246,248,251,0.96);
+    }
+    h1 { margin: 0; font-size: 18px; line-height: 1.2; }
+    .navs { display: flex; gap: 8px; }
+    .nav, button {
+      display: inline-grid;
+      place-items: center;
+      min-height: 34px;
+      border: 1px solid #111827;
+      border-radius: 6px;
+      background: #111827;
+      color: #fff;
+      padding: 0 10px;
+      font: inherit;
+      font-size: 13px;
+      font-weight: 800;
+      text-decoration: none;
+      cursor: pointer;
+    }
+    button.secondary, .nav.secondary {
+      background: #fff;
+      color: #111827;
+      border-color: #cbd5e1;
+    }
+    button:disabled { opacity: 0.55; cursor: default; }
+    main {
+      display: grid;
+      grid-template-columns: 320px minmax(0, 1fr);
+      min-height: calc(100vh - 56px);
+    }
+    aside {
+      display: grid;
+      align-content: start;
+      gap: 10px;
+      padding: 12px;
+      border-right: 1px solid #d0d5dd;
+      background: #fff;
+    }
+    label {
+      display: grid;
+      gap: 5px;
+      min-width: 0;
+      font-size: 11px;
+      font-weight: 800;
+      color: #475467;
+      text-transform: uppercase;
+    }
+    select, input {
+      width: 100%;
+      min-height: 34px;
+      border: 1px solid #cbd5e1;
+      border-radius: 6px;
+      background: #fff;
+      color: #111827;
+      padding: 0 8px;
+      font: inherit;
+      font-size: 13px;
+      text-transform: none;
+    }
+    .controls {
+      display: grid;
+      grid-template-columns: 1fr 1fr 1fr;
+      gap: 8px;
+    }
+    .meta {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 8px;
+    }
+    .metric {
+      min-width: 0;
+      padding: 9px;
+      border: 1px solid #e2e8f0;
+      border-radius: 8px;
+      background: #f8fafc;
+    }
+    .metric span {
+      display: block;
+      color: #667085;
+      font-size: 10px;
+      font-weight: 800;
+      text-transform: uppercase;
+    }
+    .metric strong {
+      display: block;
+      margin-top: 3px;
+      font-size: 17px;
+      line-height: 1.1;
+      overflow-wrap: anywhere;
+    }
+    .viewer {
+      display: grid;
+      grid-template-rows: minmax(0, 1fr) auto;
+      min-width: 0;
+      min-height: 0;
+    }
+    .stage {
+      position: relative;
+      display: grid;
+      place-items: center;
+      min-width: 0;
+      min-height: 0;
+      padding: 14px;
+      background: #111827;
+    }
+    .stage img,
+    .stage video {
+      display: block;
+      max-width: 100%;
+      max-height: calc(100vh - 176px);
+      width: auto;
+      height: auto;
+      object-fit: contain;
+      background: #0b1220;
+      box-shadow: 0 12px 30px rgba(0,0,0,0.24);
+    }
+    .empty {
+      width: min(560px, 92vw);
+      padding: 18px;
+      border: 1px dashed #475467;
+      border-radius: 8px;
+      color: #e5e7eb;
+      background: rgba(15,23,42,0.72);
+      text-align: center;
+    }
+    .badge {
+      position: absolute;
+      left: 18px;
+      top: 18px;
+      max-width: calc(100% - 36px);
+      padding: 6px 9px;
+      border-radius: 6px;
+      background: rgba(255,255,255,0.92);
+      color: #111827;
+      font-size: 12px;
+      font-weight: 800;
+      overflow-wrap: anywhere;
+    }
+    .timeline {
+      display: grid;
+      gap: 8px;
+      padding: 10px 12px 12px;
+      border-top: 1px solid #d0d5dd;
+      background: #fff;
+    }
+    .hour-row {
+      display: flex;
+      gap: 6px;
+      overflow-x: auto;
+      padding-bottom: 2px;
+    }
+    .hour {
+      min-width: 48px;
+      height: 32px;
+      border: 1px solid #d0d5dd;
+      border-radius: 6px;
+      background: #fff;
+      color: #111827;
+      font-size: 12px;
+      font-weight: 800;
+    }
+    .hour.complete { background: #dcfce7; border-color: #86efac; color: #166534; }
+    .hour.pending { background: #fff7ed; border-color: #fdba74; color: #9a3412; }
+    .hour.blocked, .hour.failed { background: #fee2e2; border-color: #fca5a5; color: #991b1b; }
+    .hour.active { outline: 3px solid #2563eb; outline-offset: 1px; }
+    .status {
+      min-height: 18px;
+      color: #475467;
+      font-size: 12px;
+      overflow-wrap: anywhere;
+    }
+    .stage-actions {
+      position: absolute;
+      top: 14px;
+      right: 14px;
+      z-index: 2;
+      display: flex;
+      gap: 8px;
+    }
+    .stage-actions[hidden] { display: none; }
+    .stage-action {
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      min-height: 34px;
+      padding: 0 12px;
+      border: 1px solid rgba(255,255,255,.35);
+      border-radius: 6px;
+      background: rgba(15, 23, 42, .82);
+      color: #fff;
+      font-size: 12px;
+      font-weight: 800;
+      text-decoration: none;
+    }
+    @media (max-width: 980px) {
+      main { grid-template-columns: 1fr; }
+      aside { border-right: 0; border-bottom: 1px solid #d0d5dd; }
+      .stage img, .stage video { max-height: 62vh; }
+    }
+    @media (max-width: 560px) {
+      header { grid-template-columns: 1fr; }
+      .meta { grid-template-columns: 1fr; }
+    }
+  </style>
+</head>
+<body>
+  <header>
+    <h1>WxStore Plot Loop</h1>
+    <div class="navs">
+      <a class="nav secondary" href="/">Map</a>
+      <a class="nav secondary" href="/ops">Ops</a>
+      <button id="refresh" type="button">Refresh</button>
+    </div>
+  </header>
+  <main>
+    <aside>
+      <label>Model<select id="model"></select></label>
+      <label>Run<select id="run"></select></label>
+      <label>Domain<select id="domain"></select></label>
+      <label id="variantWrap" hidden>Projection<select id="variant"></select></label>
+      <label id="ensembleWrap" hidden>GEFS<select id="ensemble"></select></label>
+      <label>Product<input id="productSearch" placeholder="filter products" /><select id="product"></select></label>
+      <div class="controls">
+        <button id="prev" type="button" class="secondary">Prev</button>
+        <button id="play" type="button">Play</button>
+        <button id="next" type="button" class="secondary">Next</button>
+      </div>
+      <div class="meta">
+        <div class="metric"><span>Frames</span><strong id="frameCount">0</strong></div>
+        <div class="metric"><span>Available</span><strong id="availableCount">0</strong></div>
+        <div class="metric"><span>Current</span><strong id="currentHour">-</strong></div>
+        <div class="metric"><span>Artifacts</span><strong id="artifactCount">0</strong></div>
+      </div>
+      <div class="status" id="status">Loading summaries...</div>
+    </aside>
+    <section class="viewer">
+      <div class="stage">
+        <div class="badge" id="badge">No frame selected</div>
+        <div class="stage-actions" id="stageActions" hidden>
+          <a class="stage-action" id="openArtifact" href="" target="_blank" rel="noopener">Open</a>
+          <a class="stage-action" id="exportArtifact" href="" download>Export</a>
+        </div>
+        <img id="plot" alt="" hidden />
+        <video id="plotVideo" controls loop muted playsinline hidden></video>
+        <div id="empty" class="empty">Loading static plot inventory...</div>
+      </div>
+      <div class="timeline">
+        <div class="hour-row" id="hours"></div>
+        <div class="status" id="frameMeta"></div>
+      </div>
+    </section>
+  </main>
+  <script>
+    const els = {
+      model: document.getElementById("model"),
+      run: document.getElementById("run"),
+      domain: document.getElementById("domain"),
+      variant: document.getElementById("variant"),
+      variantWrap: document.getElementById("variantWrap"),
+      ensemble: document.getElementById("ensemble"),
+      ensembleWrap: document.getElementById("ensembleWrap"),
+      product: document.getElementById("product"),
+      productSearch: document.getElementById("productSearch"),
+      refresh: document.getElementById("refresh"),
+      prev: document.getElementById("prev"),
+      play: document.getElementById("play"),
+      next: document.getElementById("next"),
+      frameCount: document.getElementById("frameCount"),
+      availableCount: document.getElementById("availableCount"),
+      currentHour: document.getElementById("currentHour"),
+      artifactCount: document.getElementById("artifactCount"),
+      status: document.getElementById("status"),
+      badge: document.getElementById("badge"),
+      stageActions: document.getElementById("stageActions"),
+      openArtifact: document.getElementById("openArtifact"),
+      exportArtifact: document.getElementById("exportArtifact"),
+      plot: document.getElementById("plot"),
+      video: document.getElementById("plotVideo"),
+      empty: document.getElementById("empty"),
+      hours: document.getElementById("hours"),
+      frameMeta: document.getElementById("frameMeta"),
+    };
+    let catalog = { manifests: [], summary: {} };
+    let series = { manifests: [], products: [], frames: [] };
+    let selectedIndex = 0;
+    let playTimer = null;
+    let refreshTimer = null;
+    let loadingSeries = false;
+    let followLatestRun = true;
+    const VARIANT_ORDER = ["auto", "geo", "lambert", "albers", "mercator", "robinson"];
+
+    function valueText(value) {
+      return value === null || value === undefined ? "" : String(value);
+    }
+
+    function modelOf(item) {
+      return item.model || (item.run_kind || "unknown").replace(/_non_ecape_hour$/, "");
+    }
+
+    function runKey(item) {
+      return `${modelOf(item)}|${item.date || ""}|${item.cycle_utc ?? ""}|${item.source || ""}`;
+    }
+
+    function ensembleKey(item) {
+      return item.ensemble_key || item.member || item.ensemble_stat || "control";
+    }
+
+    function ensembleLabel(key) {
+      if (key === "control") return "control";
+      if (key === "all_members") return "all members";
+      if (key === "all_members_gif") return "all members GIF";
+      if (key === "all_members_webp") return "all members WebP";
+      if (key === "all_members_mp4") return "all members MP4";
+      if (/^gep\d\d$|^gec00$/.test(key)) return key;
+      return `stat: ${key}`;
+    }
+
+    function variantKey(item) {
+      return valueText(item.projection_variant || item.plot_variant || item.variant || "auto").trim() || "auto";
+    }
+
+    function variantLabel(key) {
+      return key === "auto" ? "auto" : key.replaceAll("_", " ");
+    }
+
+    function compareVariantKeys(a, b) {
+      const ai = VARIANT_ORDER.indexOf(a);
+      const bi = VARIANT_ORDER.indexOf(b);
+      if (ai !== -1 || bi !== -1) return (ai === -1 ? 999 : ai) - (bi === -1 ? 999 : bi);
+      return a.localeCompare(b);
+    }
+
+    function runLabelFromKey(key) {
+      const [model, date, cycle, source] = key.split("|");
+      return `${model} ${date || "unknown"} ${cycle !== "" ? cycle + "z" : ""}${source ? " " + source : ""}`.trim();
+    }
+
+    function parseRunKey(key) {
+      const [model, date, cycle, source] = key.split("|");
+      return {
+        model,
+        date: Number(date || 0),
+        cycle: Number(cycle || -1),
+        source: source || "",
+      };
+    }
+
+    function compareRunKeysDesc(a, b) {
+      const left = parseRunKey(a);
+      const right = parseRunKey(b);
+      if (right.date !== left.date) return right.date - left.date;
+      if (right.cycle !== left.cycle) return right.cycle - left.cycle;
+      if (left.model !== right.model) return left.model.localeCompare(right.model);
+      return left.source.localeCompare(right.source);
+    }
+
+    function normalizeProduct(key) {
+      return valueText(key).replace(/^(direct|derived|windowed|ensemble|animation|animation_webp|video_mp4):/, "");
+    }
+
+    function productLabel(key) {
+      return normalizeProduct(key).replaceAll("_", " ");
+    }
+
+    function artifactExtension(artifact) {
+      const path = valueText(artifact && (artifact.path || artifact.relative_path || artifact.url));
+      const match = path.toLowerCase().match(/\.([a-z0-9]+)(?:[?#].*)?$/);
+      if (match) return match[1];
+      const key = valueText(artifact && artifact.artifact_key);
+      if (key.startsWith("animation_webp:")) return "webp";
+      if (key.startsWith("animation:")) return "gif";
+      if (key.startsWith("video_mp4:")) return "mp4";
+      return "png";
+    }
+
+    function isVideoExtension(extension) {
+      return extension === "mp4" || extension === "webm" || extension === "mov";
+    }
+
+    function artifactDownloadName(frame) {
+      const path = valueText(frame && frame.artifact && (frame.artifact.path || frame.artifact.relative_path));
+      const name = path.split("/").pop();
+      if (name) return name;
+      const extension = artifactExtension(frame && frame.artifact);
+      return `rustwx_${Date.now()}.${extension}`;
+    }
+
+    function stateOf(artifact) {
+      return valueText(artifact && artifact.state).toLowerCase();
+    }
+
+    function isAvailable(artifact) {
+      return !!artifact && artifact.exists && !!artifact.url;
+    }
+
+    function selectedRunParts() {
+      const [model, date, cycle, source] = els.run.value.split("|");
+      return { model, date, cycle, source };
+    }
+
+    function manifestsForSelection() {
+      const key = els.run.value;
+      const domain = els.domain.value;
+      const ensemble = selectedEnsemble();
+      const variant = selectedVariant();
+      return catalog.manifests
+        .filter(item => runKey(item) === key && item.domain === domain && ensembleKey(item) === ensemble && variantKey(item) === variant)
+        .sort((a, b) => (a.forecast_hour ?? 0) - (b.forecast_hour ?? 0));
+    }
+
+    function selectedEnsemble() {
+      if (els.ensembleWrap.hidden) return "control";
+      return els.ensemble.value || "control";
+    }
+
+    function selectedVariant() {
+      return els.variant.value || "auto";
+    }
+
+    function setStatus(text) {
+      els.status.textContent = text;
+    }
+
+    function populateModels(preserve = true) {
+      const previous = preserve ? els.model.value : "";
+      const models = Array.from(new Set(catalog.manifests.map(modelOf))).filter(Boolean).sort();
+      els.model.innerHTML = models.map(model => `<option value="${model}">${model}</option>`).join("");
+      if (models.includes(previous)) {
+        els.model.value = previous;
+      } else if (models.includes("hrrr")) {
+        els.model.value = "hrrr";
+      } else if (models.includes("gfs")) {
+        els.model.value = "gfs";
+      }
+    }
+
+    function populateRuns(preserve = true) {
+      const previous = preserve ? els.run.value : "";
+      const runs = Array.from(new Set(
+        catalog.manifests.filter(item => modelOf(item) === els.model.value).map(runKey)
+      )).sort(compareRunKeysDesc);
+      const latest = runs[0] || "";
+      els.run.innerHTML = runs.map(key => `<option value="${key}">${runLabelFromKey(key)}</option>`).join("");
+      if (followLatestRun && latest) {
+        els.run.value = latest;
+      } else if (runs.includes(previous)) {
+        els.run.value = previous;
+      } else if (latest) {
+        els.run.value = latest;
+      }
+    }
+
+    function populateDomains(preserve = true) {
+      const previous = preserve ? els.domain.value : "";
+      const domains = Array.from(new Set(
+        catalog.manifests.filter(item => runKey(item) === els.run.value).map(item => item.domain).filter(Boolean)
+      )).sort();
+      els.domain.innerHTML = domains.map(domain => `<option value="${domain}">${domain}</option>`).join("");
+      if (domains.includes(previous)) {
+        els.domain.value = previous;
+      } else if (domains.includes("conus")) {
+        els.domain.value = "conus";
+      } else if (domains.includes("global")) {
+        els.domain.value = "global";
+      }
+    }
+
+    function populateEnsembles(preserve = true) {
+      const previous = preserve ? els.ensemble.value : "";
+      const model = els.model.value;
+      const run = els.run.value;
+      const domain = els.domain.value;
+      const keys = Array.from(new Set(
+        catalog.manifests
+          .filter(item => modelOf(item) === model && runKey(item) === run && item.domain === domain)
+          .map(ensembleKey)
+      )).filter(Boolean).sort((a, b) => {
+        if (a === "control") return -1;
+        if (b === "control") return 1;
+        const am = /^ge[cp]\d\d$/.test(a);
+        const bm = /^ge[cp]\d\d$/.test(b);
+        if (am !== bm) return am ? -1 : 1;
+        return a.localeCompare(b);
+      });
+      const show = model === "gefs" && keys.length > 1;
+      els.ensembleWrap.hidden = !show;
+      els.ensemble.innerHTML = keys.map(key => `<option value="${key}">${ensembleLabel(key)}</option>`).join("");
+      if (keys.includes(previous)) {
+        els.ensemble.value = previous;
+      } else if (keys.includes("control")) {
+        els.ensemble.value = "control";
+      } else if (keys.length) {
+        els.ensemble.value = keys[0];
+      }
+    }
+
+    function populateVariants(preserve = true) {
+      const previous = preserve ? els.variant.value : "";
+      const model = els.model.value;
+      const run = els.run.value;
+      const domain = els.domain.value;
+      const ensemble = selectedEnsemble();
+      const keys = Array.from(new Set(
+        catalog.manifests
+          .filter(item => modelOf(item) === model && runKey(item) === run && item.domain === domain && ensembleKey(item) === ensemble)
+          .map(variantKey)
+      )).filter(Boolean).sort(compareVariantKeys);
+      const variants = keys.length ? keys : ["auto"];
+      els.variantWrap.hidden = variants.length <= 1;
+      els.variant.innerHTML = variants.map(key => `<option value="${key}">${variantLabel(key)}</option>`).join("");
+      if (variants.includes(previous)) {
+        els.variant.value = previous;
+      } else if (variants.includes("auto")) {
+        els.variant.value = "auto";
+      } else {
+        els.variant.value = variants[0];
+      }
+    }
+
+    function filteredProducts() {
+      const query = els.productSearch.value.trim().toLowerCase();
+      if (!query) return series.products;
+      return series.products.filter(item => item.key.toLowerCase().includes(query) || productLabel(item.key).includes(query));
+    }
+
+    function populateProducts(preserve = true) {
+      const previous = preserve ? els.product.value : "";
+      const products = filteredProducts();
+      els.product.innerHTML = products.map(item => {
+        const suffix = `${item.available}/${item.total}`;
+        return `<option value="${item.key}">${productLabel(item.key)} (${suffix})</option>`;
+      }).join("");
+      if (products.some(item => item.key === previous)) {
+        els.product.value = previous;
+      } else {
+        const preferred = products.find(item => /2m_temperature|temperature_2m/.test(item.key))
+          || products.find(item => /composite_reflectivity/.test(item.key))
+          || products.find(item => /sbcape|cape/.test(item.key))
+          || products.find(item => item.available > 0)
+          || products[0];
+        if (preferred) els.product.value = preferred.key;
+      }
+    }
+
+    function buildProducts(manifests) {
+      const byKey = new Map();
+      for (const manifest of manifests) {
+        for (const artifact of manifest.artifacts || []) {
+          const key = normalizeProduct(artifact.artifact_key);
+          if (!key) continue;
+          const entry = byKey.get(key) || { key, total: 0, available: 0 };
+          entry.total += 1;
+          if (isAvailable(artifact)) entry.available += 1;
+          byKey.set(key, entry);
+        }
+      }
+      return Array.from(byKey.values()).sort((a, b) => {
+        if (b.available !== a.available) return b.available - a.available;
+        return a.key.localeCompare(b.key);
+      });
+    }
+
+    function buildFrames() {
+      const product = els.product.value;
+      series.frames = series.manifests
+        .map(manifest => {
+          const artifact = (manifest.artifacts || []).find(item => normalizeProduct(item.artifact_key) === product);
+          return { manifest, artifact, hour: manifest.forecast_hour ?? 0 };
+        })
+        .filter(frame => frame.artifact)
+        .sort((a, b) => a.hour - b.hour);
+      if (selectedIndex >= series.frames.length) selectedIndex = Math.max(0, series.frames.length - 1);
+    }
+
+    function renderTimeline() {
+      els.hours.innerHTML = series.frames.map((frame, index) => {
+        const state = stateOf(frame.artifact) || "pending";
+        const cls = [isAvailable(frame.artifact) ? "complete" : state, index === selectedIndex ? "active" : ""].join(" ");
+        return `<button type="button" class="hour ${cls}" data-index="${index}">f${String(frame.hour).padStart(3, "0")}</button>`;
+      }).join("");
+    }
+
+    function preloadNeighbor() {
+      if (!series.frames.length) return;
+      const next = series.frames[(selectedIndex + 1) % series.frames.length];
+      if (next && isAvailable(next.artifact)) {
+        if (isVideoExtension(artifactExtension(next.artifact))) return;
+        const img = new Image();
+        img.src = next.artifact.url;
+      }
+    }
+
+    function renderFrame() {
+      buildFrames();
+      renderTimeline();
+      const frame = series.frames[selectedIndex];
+      const available = series.frames.filter(item => isAvailable(item.artifact)).length;
+      els.frameCount.textContent = String(series.frames.length);
+      els.availableCount.textContent = String(available);
+      els.artifactCount.textContent = String((series.manifests || []).reduce((sum, item) => sum + ((item.artifacts || []).length), 0));
+      els.prev.disabled = series.frames.length < 2;
+      els.next.disabled = series.frames.length < 2;
+      els.play.disabled = series.frames.length < 2;
+      if (!frame) {
+        els.plot.hidden = true;
+        els.video.hidden = true;
+        els.video.pause();
+        els.empty.hidden = false;
+        els.empty.textContent = "No frames are available for this product yet.";
+        els.badge.textContent = "No frame selected";
+        els.currentHour.textContent = "-";
+        els.frameMeta.textContent = "";
+        els.stageActions.hidden = true;
+        return;
+      }
+      const state = stateOf(frame.artifact);
+      const label = `${modelOf(frame.manifest)} ${frame.manifest.date || ""} ${frame.manifest.cycle_utc ?? ""}z ${frame.manifest.domain || ""} ${productLabel(els.product.value)} f${String(frame.hour).padStart(3, "0")}`;
+      const ensemble = ensembleKey(frame.manifest);
+      const variant = variantKey(frame.manifest);
+      const badges = [label];
+      if (ensemble !== "control") badges.push(ensembleLabel(ensemble));
+      if (variant !== "auto") badges.push(variantLabel(variant));
+      els.badge.textContent = badges.join(" ");
+      els.currentHour.textContent = `f${String(frame.hour).padStart(3, "0")}`;
+      const variantMeta = variant === "auto" ? "" : ` | ${variantLabel(variant)}`;
+      els.frameMeta.textContent = `${frame.manifest.run_label || frame.manifest.manifest_id} | ${state || "unknown"}${variantMeta} | ${frame.artifact.path || frame.artifact.relative_path || ""}`;
+      if (isAvailable(frame.artifact)) {
+        const extension = artifactExtension(frame.artifact);
+        els.empty.hidden = true;
+        els.stageActions.hidden = false;
+        els.openArtifact.href = frame.artifact.url;
+        els.exportArtifact.href = frame.artifact.url;
+        els.exportArtifact.download = artifactDownloadName(frame);
+        els.exportArtifact.textContent = `Export ${extension.toUpperCase()}`;
+        if (isVideoExtension(extension)) {
+          els.plot.hidden = true;
+          if (els.plot.src) els.plot.removeAttribute("src");
+          els.video.hidden = false;
+          const absoluteUrl = new URL(frame.artifact.url, location.href).href;
+          if (els.video.src !== absoluteUrl) {
+            els.video.src = frame.artifact.url;
+            els.video.load();
+          }
+        } else {
+          els.video.hidden = true;
+          els.video.pause();
+          if (els.video.src) els.video.removeAttribute("src");
+          els.plot.hidden = false;
+          if (els.plot.src !== new URL(frame.artifact.url, location.href).href) {
+            els.plot.src = frame.artifact.url;
+          }
+        }
+      } else {
+        els.plot.hidden = true;
+        els.video.hidden = true;
+        els.video.pause();
+        els.empty.hidden = false;
+        els.stageActions.hidden = true;
+        els.empty.textContent = `${state || "pending"}: ${frame.artifact.detail || "the plot is not complete yet"}`;
+      }
+      preloadNeighbor();
+    }
+
+    function step(delta) {
+      if (!series.frames.length) return;
+      selectedIndex = (selectedIndex + delta + series.frames.length) % series.frames.length;
+      renderFrame();
+    }
+
+    function stopPlayback() {
+      if (playTimer) {
+        clearInterval(playTimer);
+        playTimer = null;
+      }
+      els.play.textContent = "Play";
+    }
+
+    function togglePlayback() {
+      if (playTimer) {
+        stopPlayback();
+        return;
+      }
+      els.play.textContent = "Pause";
+      playTimer = setInterval(() => step(1), 850);
+    }
+
+    async function fetchCatalog(preserve = true) {
+      const catalogParams = new URLSearchParams({
+        include_artifacts: "false",
+        catalog_index: "true",
+        state: "all",
+        manifest_limit: "20000",
+        _: String(Date.now()),
+      });
+      const res = await fetch(`/v1/static-plots?${catalogParams.toString()}`, { cache: "no-store" });
+      if (!res.ok) throw new Error(`static plot catalog failed: ${res.status}`);
+      const previousRun = els.run.value;
+      catalog = await res.json();
+      populateModels(preserve);
+      populateRuns(preserve);
+      populateDomains(preserve);
+      populateEnsembles(preserve);
+      populateVariants(preserve);
+      if (els.run.value !== previousRun) selectedIndex = 0;
+    }
+
+    async function fetchSeries(preserveProduct = true) {
+      if (!els.run.value || !els.domain.value || loadingSeries) return;
+      loadingSeries = true;
+      setStatus("Loading selected run/domain artifacts...");
+      const parts = selectedRunParts();
+      const params = new URLSearchParams({
+        include_artifacts: "true",
+        model: parts.model,
+        date: parts.date,
+        cycle_utc: parts.cycle,
+        domain: els.domain.value,
+        ensemble: selectedEnsemble(),
+        projection: selectedVariant(),
+        state: "all",
+        manifest_limit: "20000",
+        artifact_limit: "1000",
+        _: String(Date.now()),
+      });
+      const res = await fetch(`/v1/static-plots?${params.toString()}`, { cache: "no-store" });
+      if (!res.ok) throw new Error(`static plot frames failed: ${res.status}`);
+      const data = await res.json();
+      series.manifests = (data.manifests || []).sort((a, b) => (a.forecast_hour ?? 0) - (b.forecast_hour ?? 0));
+      series.products = buildProducts(series.manifests);
+      populateProducts(preserveProduct);
+      selectedIndex = Math.min(selectedIndex, Math.max(0, series.manifests.length - 1));
+      renderFrame();
+      const complete = series.frames.filter(frame => isAvailable(frame.artifact)).length;
+      const variant = selectedVariant();
+      const variantText = variant === "auto" ? "" : ` / ${variantLabel(variant)}`;
+      setStatus(`${series.manifests.length} hours loaded for ${runLabelFromKey(els.run.value)} / ${els.domain.value}${variantText}; ${complete}/${series.frames.length} selected-product frames complete.`);
+      loadingSeries = false;
+    }
+
+    async function reloadAll(preserve = true) {
+      stopPlayback();
+      setStatus("Refreshing plot inventory...");
+      await fetchCatalog(preserve);
+      await fetchSeries(preserve);
+    }
+
+    els.model.addEventListener("change", () => {
+      stopPlayback();
+      followLatestRun = true;
+      populateRuns(false);
+      populateDomains(false);
+      populateEnsembles(false);
+      populateVariants(false);
+      selectedIndex = 0;
+      fetchSeries(false).catch(err => setStatus(err.message));
+    });
+    els.run.addEventListener("change", () => {
+      stopPlayback();
+      followLatestRun = false;
+      populateDomains(false);
+      populateEnsembles(false);
+      populateVariants(false);
+      selectedIndex = 0;
+      fetchSeries(false).catch(err => setStatus(err.message));
+    });
+    els.domain.addEventListener("change", () => {
+      stopPlayback();
+      populateEnsembles(false);
+      populateVariants(false);
+      selectedIndex = 0;
+      fetchSeries(false).catch(err => setStatus(err.message));
+    });
+    els.ensemble.addEventListener("change", () => {
+      stopPlayback();
+      populateVariants(false);
+      selectedIndex = 0;
+      fetchSeries(false).catch(err => setStatus(err.message));
+    });
+    els.variant.addEventListener("change", () => {
+      stopPlayback();
+      selectedIndex = 0;
+      fetchSeries(false).catch(err => setStatus(err.message));
+    });
+    els.product.addEventListener("change", () => {
+      selectedIndex = 0;
+      renderFrame();
+    });
+    els.productSearch.addEventListener("input", () => {
+      populateProducts(true);
+      selectedIndex = 0;
+      renderFrame();
+    });
+    els.prev.addEventListener("click", () => step(-1));
+    els.next.addEventListener("click", () => step(1));
+    els.play.addEventListener("click", togglePlayback);
+    els.refresh.addEventListener("click", () => {
+      followLatestRun = true;
+      reloadAll(true).catch(err => setStatus(err.message));
+    });
+    els.hours.addEventListener("click", event => {
+      const target = event.target.closest("[data-index]");
+      if (!target) return;
+      selectedIndex = Number(target.dataset.index);
+      renderFrame();
+    });
+    window.addEventListener("keydown", event => {
+      if (event.key === "ArrowLeft") step(-1);
+      if (event.key === "ArrowRight") step(1);
+      if (event.key === " ") {
+        event.preventDefault();
+        togglePlayback();
+      }
+    });
+
+    reloadAll(false).catch(err => setStatus(err.message));
+    refreshTimer = setInterval(() => {
+      fetchCatalog(true).then(() => fetchSeries(true)).catch(err => setStatus(err.message));
+    }, 5000);
+  </script>
+</body>
+</html>
+"#;
+
+const OPS_HTML: &str = r#"<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>WxStore Ops</title>
+  <style>
+    :root { color-scheme: light; }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      background: #f8fafc;
+      color: #0f172a;
+    }
+    header {
+      position: sticky;
+      top: 0;
+      z-index: 10;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 12px;
+      padding: 12px 16px;
+      border-bottom: 1px solid #cbd5e1;
+      background: rgba(248,250,252,0.96);
+    }
+    h1 { margin: 0; font-size: 18px; line-height: 1.2; }
+    nav { display: flex; gap: 8px; }
+    nav a {
+      display: inline-grid;
+      place-items: center;
+      height: 34px;
+      padding: 0 10px;
+      border-radius: 6px;
+      background: #0f172a;
+      color: #fff;
+      text-decoration: none;
+      font-weight: 800;
+      font-size: 13px;
+    }
+    main {
+      display: grid;
+      gap: 12px;
+      padding: 14px 16px 28px;
+    }
+    .metrics {
+      display: grid;
+      grid-template-columns: repeat(6, minmax(120px, 1fr));
+      gap: 8px;
+    }
+    .metric, .panel {
+      min-width: 0;
+      padding: 10px;
+      border: 1px solid #cbd5e1;
+      border-radius: 8px;
+      background: #fff;
+    }
+    .metric span { display: block; color: #64748b; font-size: 11px; font-weight: 800; text-transform: uppercase; }
+    .metric strong { display: block; margin-top: 3px; font-size: 20px; line-height: 1.1; }
+    .grid { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
+    h2 { margin: 0 0 8px; font-size: 15px; }
+    table { width: 100%; border-collapse: collapse; font-size: 12px; }
+    th, td { padding: 6px 7px; border-bottom: 1px solid #e2e8f0; text-align: left; vertical-align: top; }
+    th { color: #475569; font-size: 11px; text-transform: uppercase; }
+    td { overflow-wrap: anywhere; }
+    .ok { color: #166534; font-weight: 800; }
+    .bad { color: #991b1b; font-weight: 800; }
+    pre {
+      margin: 0;
+      max-height: 420px;
+      overflow: auto;
+      font-size: 12px;
+      line-height: 1.35;
+      white-space: pre-wrap;
+    }
+    @media (max-width: 1100px) {
+      .metrics { grid-template-columns: 1fr 1fr 1fr; }
+      .grid { grid-template-columns: 1fr; }
+    }
+    @media (max-width: 640px) {
+      header { align-items: flex-start; flex-direction: column; }
+      .metrics { grid-template-columns: 1fr 1fr; }
+      main { padding: 10px; }
+    }
+  </style>
+</head>
+<body>
+  <header>
+    <h1>WxStore Ops</h1>
+    <nav><a href="/">Map</a><a href="/plots">Plots</a></nav>
+  </header>
+  <main>
+    <section id="metrics" class="metrics"></section>
+    <section class="grid">
+      <div class="panel"><h2>Active Jobs</h2><div id="jobs"></div></div>
+      <div class="panel"><h2>Profile Summary</h2><div id="profileSummary"></div></div>
+    </section>
+    <section class="panel"><h2>Hour Profile Summary</h2><div id="profileByHour"></div></section>
+    <section class="grid">
+      <div class="panel"><h2>Slowest Recent Hours</h2><div id="slowestProfiles"></div></div>
+      <div class="panel"><h2>Recent Hour Profiles</h2><div id="profiles"></div></div>
+    </section>
+    <section class="grid">
+      <div class="panel"><h2>Top Processes</h2><div id="processes"></div></div>
+      <div class="panel"><h2>Storage</h2><div id="storage"></div></div>
+    </section>
+    <section class="panel"><h2>Raw Snapshot</h2><pre id="raw"></pre></section>
+  </main>
+  <script>
+    const metrics = document.getElementById("metrics");
+    const jobs = document.getElementById("jobs");
+    const profileSummary = document.getElementById("profileSummary");
+    const profileByHour = document.getElementById("profileByHour");
+    const slowestProfiles = document.getElementById("slowestProfiles");
+    const profiles = document.getElementById("profiles");
+    const processes = document.getElementById("processes");
+    const storage = document.getElementById("storage");
+    const raw = document.getElementById("raw");
+
+    function value(path, fallback = null) {
+      return path.reduce((current, key) => current && current[key] !== undefined ? current[key] : fallback, window.snapshot);
+    }
+
+    function fmtBytes(bytes) {
+      if (bytes === null || bytes === undefined || Number.isNaN(Number(bytes))) return "n/a";
+      const units = ["B", "KB", "MB", "GB", "TB"];
+      let value = Number(bytes);
+      let unit = 0;
+      while (value >= 1024 && unit < units.length - 1) { value /= 1024; unit++; }
+      return `${value.toFixed(unit ? 1 : 0)} ${units[unit]}`;
+    }
+
+    function metric(label, value) {
+      return `<div class="metric"><span>${label}</span><strong>${value}</strong></div>`;
+    }
+
+    function table(rows, columns) {
+      if (!rows || !rows.length) return `<div class="empty">No rows yet.</div>`;
+      return `<table><thead><tr>${columns.map(col => `<th>${col.label}</th>`).join("")}</tr></thead><tbody>${rows.map(row => (
+        `<tr>${columns.map(col => `<td>${col.render ? col.render(row) : (row[col.key] ?? "")}</td>`).join("")}</tr>`
+      )).join("")}</tbody></table>`;
+    }
+
+    function render(snapshot) {
+      window.snapshot = snapshot;
+      const load = value(["loadavg"], {});
+      const mem = value(["memory"], {});
+      const disk = value(["disk"], {});
+      const counts = value(["counts"], {});
+      metrics.innerHTML = [
+        metric("updated", snapshot.timestamp_utc || "missing"),
+        metric("load 1m", load.one || "n/a"),
+        metric("cpu cores", snapshot.cpu_count || "n/a"),
+        metric("mem avail", fmtBytes(mem.available_bytes)),
+        metric("disk free", fmtBytes(disk.available_bytes)),
+        metric("plots", counts.static_artifacts || 0),
+      ].join("");
+      jobs.innerHTML = table(snapshot.jobs || [], [
+        {label: "lane", render: r => `${r.model || ""} ${r.kind || ""}`},
+        {label: "pid", key: "pid"},
+        {label: "age", key: "etime"},
+        {label: "cmd", key: "cmd"},
+      ]);
+      const summary = (snapshot.profile_summary && snapshot.profile_summary.groups) || [];
+      profileSummary.innerHTML = table(summary, [
+        {label: "lane", render: r => `${r.model || ""} ${r.kind || ""}`},
+        {label: "n", key: "count"},
+        {label: "avg", render: r => `${r.avg_s ?? ""}s`},
+        {label: "p50", render: r => `${r.p50_s ?? ""}s`},
+        {label: "p90", render: r => `${r.p90_s ?? ""}s`},
+        {label: "max", render: r => `${r.max_s ?? ""}s`},
+      ]);
+      const hourSummary = (snapshot.profile_summary && snapshot.profile_summary.hour_groups) || [];
+      profileByHour.innerHTML = table(hourSummary.slice(0, 160), [
+        {label: "lane", render: r => `${r.model || ""} ${r.kind || ""}`},
+        {label: "run", render: r => `${r.date || ""} ${r.cycle || ""}z`},
+        {label: "hour", render: r => r.hour === undefined ? "" : `f${String(r.hour).padStart(3, "0")}`},
+        {label: "domain", key: "domain"},
+        {label: "n", key: "count"},
+        {label: "latest", render: r => `${r.latest_elapsed_s ?? ""}s`},
+        {label: "avg", render: r => `${r.avg_s ?? ""}s`},
+        {label: "p90", render: r => `${r.p90_s ?? ""}s`},
+        {label: "max", render: r => `${r.max_s ?? ""}s`},
+      ]);
+      const slowest = (snapshot.profile_summary && snapshot.profile_summary.slowest) || [];
+      slowestProfiles.innerHTML = table(slowest.slice(0, 16), [
+        {label: "lane", render: r => `${r.model || ""} ${r.kind || ""}`},
+        {label: "run", render: r => `${r.date || ""} ${r.cycle || ""}z`},
+        {label: "hour", render: r => r.hour === undefined ? "" : `f${String(r.hour).padStart(3, "0")}`},
+        {label: "domain", key: "domain"},
+        {label: "elapsed", render: r => `${r.elapsed_s ?? ""}s`},
+        {label: "rss", render: r => fmtBytes((Number(r.rss_kb || 0) || 0) * 1024)},
+      ]);
+      profiles.innerHTML = table(snapshot.recent_profiles || [], [
+        {label: "lane", render: r => `${r.kind || ""} ${r.model || ""}`},
+        {label: "hour", key: "hour"},
+        {label: "status", render: r => `<span class="${r.status === "ok" ? "ok" : "bad"}">${r.status || ""}</span>`},
+        {label: "elapsed", render: r => r.total_elapsed_s || r.render_elapsed_s || r.export_elapsed_s || ""},
+        {label: "rss", render: r => fmtBytes((Number(r.maxrss_kb || r.export_maxrss_kb || 0) || 0) * 1024)},
+      ]);
+      processes.innerHTML = table(snapshot.processes || [], [
+        {label: "pid", key: "pid"},
+        {label: "cpu", key: "cpu_pct"},
+        {label: "rss", render: r => fmtBytes((Number(r.rss_kb || 0) || 0) * 1024)},
+        {label: "age", key: "etime"},
+        {label: "cmd", key: "cmd"},
+      ]);
+      const dirs = value(["dir_sizes"], {});
+      storage.innerHTML = table(Object.entries(dirs).map(([name, bytes]) => ({name, bytes})), [
+        {label: "dir", key: "name"},
+        {label: "size", render: r => fmtBytes(r.bytes)},
+      ]);
+      raw.textContent = JSON.stringify(snapshot, null, 2);
+    }
+
+    async function tick() {
+      try {
+        const res = await fetch(`/v1/ops/live?t=${Date.now()}`);
+        render(await res.json());
+      } catch (err) {
+        raw.textContent = err.message;
+      } finally {
+        setTimeout(tick, 2000);
+      }
+    }
+    tick();
   </script>
 </body>
 </html>
@@ -1920,11 +4656,10 @@ async fn livez() -> Json<Value> {
 }
 
 async fn readyz(State(state): State<Arc<AppState>>) -> (StatusCode, Json<Value>) {
-    let status = store_status(
+    let status = readiness_status(
         &state.profile,
         state.diagnostic.as_deref(),
         state.spatial.as_deref(),
-        Some(state.cache_stats()),
     );
     let ok = status.get("ok").and_then(Value::as_bool).unwrap_or(false);
     (
@@ -1942,6 +4677,7 @@ async fn status(State(state): State<Arc<AppState>>) -> Json<Value> {
         &state.profile,
         state.diagnostic.as_deref(),
         state.spatial.as_deref(),
+        state.static_plots.as_deref(),
         Some(state.cache_stats()),
     ))
 }
@@ -1958,11 +4694,12 @@ async fn latest(
             "domain": manifest.domain,
             "run_id": manifest.run_id,
             "cycle": manifest.cycle,
-            "products": {
-                "profile_pressure_core": "ready",
-                "diag_scalar_basic": if state.diagnostic.is_some() { "ready_sparse_v0" } else { "unavailable" },
-                "surface_spatial": if state.spatial.is_some() { "ready" } else { "unavailable" }
-            },
+                "products": {
+                    "profile_pressure_core": "ready",
+                    "diag_scalar_basic": if state.diagnostic.is_some() { "ready_sparse_v0" } else { "unavailable" },
+                    "surface_spatial": if state.spatial.is_some() { "ready" } else { "unavailable" },
+                    "static_plots": if state.static_plots.is_some() { "ready" } else { "unavailable" }
+                },
             "canonical_run_url": format!("/v1/runs/{}/{}/{}", manifest.model, manifest.domain, manifest.run_id),
         })));
     }
@@ -1976,11 +4713,12 @@ async fn latest(
                 "run_id": run,
                 "products": {
                     "surface_spatial": "ready",
+                    "static_plots": if state.static_plots.is_some() { "ready" } else { "unavailable" },
                     "profile_pressure_core": "unavailable",
                     "diag_scalar_basic": "unavailable"
                 },
                 "readiness": spatial.run_readiness(&model, &run),
-                "canonical_run_url": format!("/v1/spatial/{}/{}/{}", model, domain, run),
+                "canonical_run_url": format!("/v1/layers?model={}&run={}", model, run),
             })));
         }
     }
@@ -1990,6 +4728,10 @@ async fn latest(
 
 async fn models(State(state): State<Arc<AppState>>) -> Json<Value> {
     let spatial = state.spatial.as_deref().map(SpatialLane::models_json);
+    let static_plots = state
+        .static_plots
+        .as_deref()
+        .map(StaticPlotLane::overview_json);
     Json(json!({
         "schema": "wxstore.models.v1",
         "profile_loaded": {
@@ -1999,12 +4741,96 @@ async fn models(State(state): State<Arc<AppState>>) -> Json<Value> {
             "products": ["temporal_sounding", "point_bin"]
         },
         "spatial_loaded": spatial.unwrap_or_else(|| json!({"status": "unavailable"})),
+        "static_plots_loaded": static_plots.unwrap_or_else(|| json!({"status": "unavailable"})),
         "science_engine_scope": {
             "current_profile_lane": ["hrrr"],
             "current_spatial_surface_lanes": state.spatial.as_deref().map(SpatialLane::model_ids).unwrap_or_default(),
             "designed_for": ["hrrr", "gfs", "nam", "rap", "rrfs", "ecmwf_ifs", "ecmwf_ens", "ai_model_outputs"]
         }
     }))
+}
+
+async fn static_plots(
+    State(state): State<Arc<AppState>>,
+    Query(query): Query<StaticPlotCatalogQuery>,
+) -> Result<impl IntoResponse, ApiError> {
+    let Some(static_plots) = state.static_plots.as_deref() else {
+        return Err(not_found("static plots root is not configured"));
+    };
+    Ok((no_store_headers(), Json(static_plots.catalog_json(&query))))
+}
+
+async fn ops_live(State(state): State<Arc<AppState>>) -> Result<Json<Value>, ApiError> {
+    let path = state.ops_root.join("ops").join("live.json");
+    match fs::read(&path) {
+        Ok(bytes) => {
+            let value = serde_json::from_slice(&bytes).map_err(|err| {
+                internal_error(format!("parse ops snapshot {}: {err}", path.display()))
+            })?;
+            Ok(Json(value))
+        }
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(Json(json!({
+            "schema": "wxstore.ops.live.v1",
+            "status": "missing",
+            "path": display_path(&path),
+            "message": "ops snapshot writer is not running"
+        }))),
+        Err(err) => Err(internal_error(format!(
+            "read ops snapshot {}: {err}",
+            path.display()
+        ))),
+    }
+}
+
+async fn static_plot_artifact(
+    State(state): State<Arc<AppState>>,
+    AxumPath((manifest_id, artifact_index)): AxumPath<(String, usize)>,
+    Query(query): Query<StaticPlotArtifactQuery>,
+) -> Result<Response, ApiError> {
+    let Some(static_plots) = state.static_plots.as_deref() else {
+        return Err(not_found("static plots root is not configured"));
+    };
+    let artifact = if let Some(relative_path) = query.path.as_deref() {
+        static_plots
+            .artifact_relative_path(relative_path)
+            .map_err(bad_anyhow)?
+    } else {
+        static_plots
+            .artifact_path(&manifest_id, artifact_index)
+            .map_err(bad_anyhow)?
+    };
+    let immutable = query
+        .v
+        .as_deref()
+        .and_then(|version| {
+            static_plot_artifact_version(&artifact).map(|current| current == version)
+        })
+        .unwrap_or(false);
+    let bytes = fs::read(&artifact)
+        .map_err(|err| internal_error(format!("read static plot {}: {err}", artifact.display())))?;
+    Ok(bytes_response(
+        Bytes::from(bytes),
+        static_plot_artifact_content_type(&artifact),
+        false,
+        immutable,
+    ))
+}
+
+fn static_plot_artifact_content_type(path: &Path) -> &'static str {
+    match path
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .unwrap_or_default()
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "gif" => "image/gif",
+        "webp" => "image/webp",
+        "mp4" => "video/mp4",
+        "webm" => "video/webm",
+        "jpg" | "jpeg" => "image/jpeg",
+        _ => "image/png",
+    }
 }
 
 async fn variables(
@@ -2470,24 +5296,30 @@ async fn layers(
 }
 
 async fn tilejson(
-    State(_state): State<Arc<AppState>>,
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
     AxumPath((model, run, variable)): AxumPath<(String, String, String)>,
     Query(query): Query<TileJsonQuery>,
-) -> Json<Value> {
+) -> Result<Json<Value>, ApiError> {
     let base = query
         .base_url
-        .unwrap_or_else(|| "http://127.0.0.1:8897".to_string())
+        .unwrap_or_else(|| request_base_url(&headers))
         .trim_end_matches('/')
         .to_string();
+    let resolved_run = resolve_tilejson_run(&state, &model, &run)?;
     let hour = query.forecast_hour.unwrap_or(0);
-    let mut tile_url =
-        format!("{base}/v1/tiles/{model}/{run}/{variable}/{hour}/{{z}}/{{x}}/{{y}}.png");
+    let model_path = url_path_segment(&model);
+    let run_path = url_path_segment(&resolved_run);
+    let variable_path = url_path_segment(&variable);
+    let mut tile_url = format!(
+        "{base}/v1/tiles/{model_path}/{run_path}/{variable_path}/{hour}/{{z}}/{{x}}/{{y}}.png"
+    );
     let mut params = Vec::new();
     if let Some(member) = query.member {
-        params.push(format!("member={member}"));
+        params.push(format!("member={}", url_query_value(&member)));
     }
     if let Some(palette) = query.palette {
-        params.push(format!("palette={palette}"));
+        params.push(format!("palette={}", url_query_value(&palette)));
     }
     if let Some(min) = query.min {
         params.push(format!("min={min}"));
@@ -2508,9 +5340,9 @@ async fn tilejson(
         tile_url.push('?');
         tile_url.push_str(&params.join("&"));
     }
-    Json(json!({
+    Ok(Json(json!({
         "tilejson": "3.0.0",
-        "name": format!("{model}/{run}/{variable}"),
+        "name": format!("{model}/{resolved_run}/{variable}"),
         "scheme": "xyz",
         "tiles": [tile_url],
         "minzoom": 0,
@@ -2519,12 +5351,69 @@ async fn tilejson(
         "wxstore": {
             "schema": "wxstore.mapbox_layer.v1",
             "model": model,
-            "run": run,
+            "run": resolved_run,
+            "requested_run": run,
             "variable": variable,
             "forecast_hour": hour,
-            "temporal_tile_template": format!("{base}/v1/tiles/{model}/{run}/{variable}/{{forecast_hour}}/{{z}}/{{x}}/{{y}}.png")
+            "temporal_tile_template": format!("{base}/v1/tiles/{model_path}/{run_path}/{variable_path}/{{forecast_hour}}/{{z}}/{{x}}/{{y}}.png")
         }
-    }))
+    })))
+}
+
+fn resolve_tilejson_run(state: &AppState, model: &str, run: &str) -> Result<String, ApiError> {
+    if let Some(spatial) = state.spatial.as_deref() {
+        return spatial.resolve_run(model, Some(run));
+    }
+    if run == "latest" && model == state.profile.manifest.model {
+        return Ok(state.profile.manifest.run_id.clone());
+    }
+    Ok(run.to_string())
+}
+
+fn request_base_url(headers: &HeaderMap) -> String {
+    let proto = headers
+        .get("x-forwarded-proto")
+        .and_then(|value| value.to_str().ok())
+        .and_then(first_csv_value)
+        .filter(|value| matches!(*value, "http" | "https"))
+        .unwrap_or("http");
+    let host = headers
+        .get("x-forwarded-host")
+        .or_else(|| headers.get(header::HOST))
+        .and_then(|value| value.to_str().ok())
+        .and_then(first_csv_value)
+        .filter(|value| !value.is_empty() && !value.contains('/') && !value.contains('\\'))
+        .unwrap_or("127.0.0.1:8080");
+    format!("{proto}://{host}")
+}
+
+fn first_csv_value(value: &str) -> Option<&str> {
+    value
+        .split(',')
+        .next()
+        .map(str::trim)
+        .filter(|v| !v.is_empty())
+}
+
+fn url_path_segment(value: &str) -> String {
+    percent_encode(value)
+}
+
+fn url_query_value(value: &str) -> String {
+    percent_encode(value)
+}
+
+fn percent_encode(value: &str) -> String {
+    let mut out = String::with_capacity(value.len());
+    for byte in value.bytes() {
+        match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                out.push(byte as char)
+            }
+            _ => out.push_str(&format!("%{byte:02X}")),
+        }
+    }
+    out
 }
 
 async fn raster_tile(
@@ -2553,23 +5442,51 @@ async fn raster_tile(
         .transparent_above
         .or_else(|| default_transparent_above_for_variable(&variable));
     let alpha = query.alpha.unwrap_or(210);
+    let requested_latest = run == "latest";
+    let resolved_run = if requested_latest {
+        if let Some(spatial) = state.spatial.as_deref() {
+            spatial.resolve_run(&model, Some(&run))?
+        } else {
+            run.clone()
+        }
+    } else {
+        run.clone()
+    };
+    let source_token = state
+        .spatial
+        .as_deref()
+        .and_then(|spatial| {
+            spatial
+                .grid_source_cache_token(
+                    &model,
+                    &resolved_run,
+                    query.member.as_deref(),
+                    &variable,
+                    forecast_hour,
+                )
+                .ok()
+        })
+        .unwrap_or_else(|| "source:profile".to_string());
     let cache_key = format!(
-        "tile:v2:{model}:{run}:{member}:{variable}:f{forecast_hour:03}:{z}:{x}:{y}:{palette}:{min:?}:{max:?}:{transparent_below:?}:{transparent_above:?}:{alpha:?}",
+        "tile:v3:{source_token}:{model}:{resolved_run}:{member}:{variable}:f{forecast_hour:03}:{z}:{x}:{y}:{palette}:{min:?}:{max:?}:{transparent_below:?}:{transparent_above:?}:{alpha:?}",
         member = query.member.as_deref().unwrap_or(""),
         palette = query.palette.as_deref().unwrap_or(""),
         min = query.min,
         max = query.max,
     );
+    let immutable_tile = !requested_latest;
     if let Some(png) = state.cache_get(&cache_key) {
-        return Ok(png_tile_response(png));
+        return Ok(png_tile_response(png, immutable_tile));
     }
     let member = query.member.clone();
+    let model_for_read = model.clone();
+    let run_for_read = resolved_run.clone();
     let state_for_read = state.clone();
     let grid = tokio::task::spawn_blocking(move || {
         read_grid_from_state(
             &state_for_read,
-            &model,
-            Some(&run),
+            &model_for_read,
+            Some(&run_for_read),
             member.as_deref(),
             &variable,
             forecast_hour,
@@ -2590,16 +5507,21 @@ async fn raster_tile(
         .map_err(|err| bad_request(err.to_string()))?;
     let png = Bytes::from(png);
     state.cache_insert(cache_key, png.clone());
-    Ok(png_tile_response(png))
+    Ok(png_tile_response(png, immutable_tile))
 }
 
-fn png_tile_response(png: Bytes) -> Response {
+fn png_tile_response(png: Bytes, immutable: bool) -> Response {
     let mut response = png.into_response();
     let headers = response.headers_mut();
     headers.insert(header::CONTENT_TYPE, HeaderValue::from_static("image/png"));
+    let cache_control = if immutable {
+        "public, max-age=31536000, immutable"
+    } else {
+        "public, max-age=30"
+    };
     headers.insert(
         header::CACHE_CONTROL,
-        HeaderValue::from_static("public, max-age=31536000, immutable"),
+        HeaderValue::from_static(cache_control),
     );
     response
 }
@@ -2648,11 +5570,15 @@ async fn mapbox_layer(
     let bounds = hours
         .first()
         .and_then(|hour| {
-            state.spatial.as_ref().and_then(|spatial| {
-                spatial
-                    .read_grid(&model, &run, query.member.as_deref(), &variable, *hour)
-                    .ok()
-            })
+            read_grid_from_state(
+                &state,
+                &model,
+                Some(&run),
+                query.member.as_deref(),
+                &variable,
+                *hour,
+            )
+            .ok()
         })
         .map(|grid| grid_bounds(&grid))
         .unwrap_or([-180.0, -85.05112878, 180.0, 85.05112878]);
@@ -2716,6 +5642,7 @@ async fn mapbox_layer(
 
 async fn mapbox_tilejson(
     State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
     AxumPath((model, run, variable, frame)): AxumPath<(String, String, String, String)>,
     Query(query): Query<MapboxLayerQuery>,
 ) -> Result<Json<Value>, ApiError> {
@@ -2725,8 +5652,9 @@ async fn mapbox_tilejson(
         .as_deref()
         .and_then(parse_range_pair)
         .unwrap_or_else(|| default_range_for_variable(&variable, &[]));
-    Ok(tilejson(
+    tilejson(
         State(state),
+        headers,
         AxumPath((model, run, variable)),
         Query(TileJsonQuery {
             member: query.member,
@@ -2740,7 +5668,7 @@ async fn mapbox_tilejson(
             base_url: query.base_url,
         }),
     )
-    .await)
+    .await
 }
 
 async fn mapbox_raster_tile(
@@ -3029,6 +5957,7 @@ fn store_status(
     profile: &ProfileLane,
     diagnostic: Option<&DiagnosticLane>,
     spatial: Option<&SpatialLane>,
+    static_plots: Option<&StaticPlotLane>,
     cache: Option<CacheStats>,
 ) -> Value {
     let spatial_models = spatial.map(SpatialLane::model_ids).unwrap_or_default();
@@ -3036,7 +5965,12 @@ fn store_status(
         && !profile.manifest.forecast_hours.is_empty()
         && !profile.manifest.levels_hpa.is_empty();
     let spatial_ready = spatial.map(|_| !spatial_models.is_empty()).unwrap_or(true);
-    let ok = profile_ready && spatial_ready;
+    let ok = if spatial.is_some() {
+        spatial_ready
+    } else {
+        profile_ready
+    };
+    let cache_stats = cache.unwrap_or_else(default_cache_stats);
     json!({
         "schema": "wxstore.status.v1",
         "service": "wxstore",
@@ -3055,18 +5989,378 @@ fn store_status(
         "lanes": {
             "profile_pressure_core": profile.lane_manifest_json(),
             "diag_scalar_basic": diagnostic.map(DiagnosticLane::lane_manifest_json).unwrap_or_else(|| json!({"status": "unavailable"})),
-            "surface_spatial": spatial.map(SpatialLane::lane_manifest_json).unwrap_or_else(|| json!({"status": "unavailable"}))
+            "surface_spatial": spatial.map(SpatialLane::lane_manifest_json).unwrap_or_else(|| json!({"status": "unavailable"})),
+            "static_plots": static_plots.map(StaticPlotLane::lane_manifest_json).unwrap_or_else(|| json!({"status": "unavailable"}))
         },
-        "cache": cache.unwrap_or(CacheStats {
-            entries: 0,
-            entries_limit: CACHE_LIMIT,
-            bytes: 0,
-            bytes_limit: CACHE_BYTES_LIMIT,
-            hits: 0,
-            misses: 0,
-            evictions: 0,
-        })
+        "monitoring": monitoring_status(profile, diagnostic, spatial, static_plots, &cache_stats),
+        "cache": cache_stats
     })
+}
+
+fn readiness_status(
+    profile: &ProfileLane,
+    diagnostic: Option<&DiagnosticLane>,
+    spatial: Option<&SpatialLane>,
+) -> Value {
+    let spatial_models = spatial.map(SpatialLane::model_ids).unwrap_or_default();
+    let profile_ready = !profile.manifest.variables.is_empty()
+        && !profile.manifest.forecast_hours.is_empty()
+        && !profile.manifest.levels_hpa.is_empty();
+    let spatial_ready = spatial.map(|_| !spatial_models.is_empty()).unwrap_or(true);
+    let ok = if spatial.is_some() {
+        spatial_ready
+    } else {
+        profile_ready
+    };
+    json!({
+        "schema": "wxstore.health.v1",
+        "service": "wxstore",
+        "kind": "ready",
+        "ok": ok,
+        "readiness": {
+            "profile_pressure_core": if profile_ready { "ready" } else { "unavailable" },
+            "diag_scalar_basic": if diagnostic.is_some() { "ready_sparse_v0" } else { "unavailable" },
+            "surface_spatial": if spatial.is_some() {
+                if spatial_ready { "ready" } else { "empty" }
+            } else {
+                "unavailable"
+            },
+            "spatial_models": spatial_models
+        }
+    })
+}
+
+fn default_cache_stats() -> CacheStats {
+    CacheStats {
+        entries: 0,
+        entries_limit: CACHE_LIMIT,
+        bytes: 0,
+        bytes_limit: CACHE_BYTES_LIMIT,
+        hits: 0,
+        misses: 0,
+        evictions: 0,
+    }
+}
+
+fn monitoring_status(
+    profile: &ProfileLane,
+    diagnostic: Option<&DiagnosticLane>,
+    spatial: Option<&SpatialLane>,
+    static_plots: Option<&StaticPlotLane>,
+    cache: &CacheStats,
+) -> Value {
+    let profile_hours = profile
+        .manifest
+        .forecast_hours
+        .iter()
+        .map(|hour| u32::from(*hour))
+        .collect::<Vec<_>>();
+    let spatial_monitoring = spatial
+        .map(spatial_monitoring_json)
+        .unwrap_or_else(|| json!({"status": "unavailable"}));
+    let spatial_latest_runs = spatial
+        .map(|lane| {
+            lane.model_ids()
+                .into_iter()
+                .map(|model| {
+                    json!({
+                        "model": model,
+                        "latest_run": lane.latest_run_for_model(&model)
+                    })
+                })
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    let static_plot_summary = static_plots
+        .map(StaticPlotLane::summary_json)
+        .unwrap_or_else(|| json!({"status": "unavailable", "coverage": []}));
+    json!({
+        "schema": "wxstore.monitoring.v1",
+        "generated_at": utc_now_string(),
+        "latest_runs": {
+            "profile_pressure_core": {
+                "model": profile.manifest.model,
+                "domain": profile.manifest.domain,
+                "run_id": profile.manifest.run_id,
+                "cycle": profile.manifest.cycle
+            },
+            "surface_spatial": spatial_latest_runs
+        },
+        "coverage": {
+            "profile_forecast_hours": profile_hours,
+            "surface_spatial": spatial_monitoring.get("models").cloned().unwrap_or_else(|| json!([]))
+        },
+        "product_completeness": {
+            "profile_pressure_core": {
+                "status": "complete",
+                "variable_count": profile.manifest.variables.len(),
+                "forecast_hour_count": profile.manifest.forecast_hours.len(),
+                "level_count": profile.manifest.levels_hpa.len()
+            },
+            "diag_scalar_basic": {
+                "status": if diagnostic.is_some() { "ready_sparse_v0" } else { "unavailable" }
+            },
+            "surface_spatial": spatial_monitoring.get("product_completeness").cloned().unwrap_or_else(|| json!([]))
+        },
+        "static_plots": {
+            "status": static_plot_summary.get("status").cloned().unwrap_or_else(|| json!("unavailable")),
+            "root": static_plot_summary.get("root").cloned().unwrap_or_else(|| json!(null)),
+            "manifest_count": static_plot_summary.get("manifest_count").cloned().unwrap_or_else(|| json!(0)),
+            "artifact_count": static_plot_summary.get("artifact_count").cloned().unwrap_or_else(|| json!(0)),
+            "complete_count": static_plot_summary.get("complete_count").cloned().unwrap_or_else(|| json!(0)),
+            "blocked_count": static_plot_summary.get("blocked_count").cloned().unwrap_or_else(|| json!(0)),
+            "failed_count": static_plot_summary.get("failed_count").cloned().unwrap_or_else(|| json!(0)),
+            "coverage": static_plot_summary.get("coverage").cloned().unwrap_or_else(|| json!([]))
+        },
+        "timing": {
+            "surface_spatial_ingest": spatial_monitoring.get("ingest_timing").cloned().unwrap_or_else(|| json!([])),
+            "surface_spatial_export": spatial_monitoring.get("export_timing").cloned().unwrap_or_else(|| json!([]))
+        },
+        "disk": {
+            "surface_spatial": spatial_monitoring.get("disk").cloned().unwrap_or_else(|| json!({"status": "unavailable"})),
+            "response_cache_bytes": cache.bytes,
+            "response_cache_limit_bytes": cache.bytes_limit
+        },
+        "api_health": {
+            "livez": "configured",
+            "readyz": if !profile.manifest.variables.is_empty() { "configured" } else { "profile_unavailable" },
+            "sample_api": if spatial.is_some() { "configured" } else { "unavailable" },
+            "tile_api": if spatial.is_some() { "configured" } else { "unavailable" },
+            "tilejson_api": if spatial.is_some() { "configured" } else { "unavailable" }
+        }
+    })
+}
+
+fn spatial_monitoring_json(spatial: &SpatialLane) -> Value {
+    let mut product_completeness = Vec::new();
+    let mut ingest_timing = Vec::new();
+    let mut export_timing = Vec::new();
+    let models = spatial
+        .model_ids()
+        .into_iter()
+        .map(|model| {
+            let runs = spatial.runs_for_model(&model);
+            let latest_run = spatial.latest_run_for_model(&model);
+            let run_reports = runs
+                .iter()
+                .map(|run| {
+                    let report = spatial_run_monitoring_json(&spatial.root, &model, run);
+                    if let Some(value) = report.get("product_completeness") {
+                        product_completeness.push(value.clone());
+                    }
+                    if let Some(values) = report.get("ingest_timing").and_then(Value::as_array) {
+                        ingest_timing.extend(values.iter().cloned());
+                    }
+                    if let Some(values) = report.get("export_timing").and_then(Value::as_array) {
+                        export_timing.extend(values.iter().cloned());
+                    }
+                    report
+                })
+                .collect::<Vec<_>>();
+            json!({
+                "model": model,
+                "latest_run": latest_run,
+                "run_count": runs.len(),
+                "runs": run_reports
+            })
+        })
+        .collect::<Vec<_>>();
+    json!({
+        "status": if models.is_empty() { "empty" } else { "ready" },
+        "root": display_path(&spatial.root),
+        "models": models,
+        "product_completeness": product_completeness,
+        "ingest_timing": ingest_timing,
+        "export_timing": export_timing,
+        "disk": {
+            "root": display_path(&spatial.root),
+            "root_bytes": sum_dir_bytes(&spatial.root),
+            "wxa_bytes": spatial_wxa_bytes(spatial)
+        }
+    })
+}
+
+fn spatial_run_monitoring_json(root: &Path, model: &str, run: &str) -> Value {
+    let run_dir = root.join(model).join(run);
+    let manifest_path = run_manifest_path(root, model, run);
+    let manifest = fs::read(&manifest_path)
+        .ok()
+        .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok());
+    let products = manifest
+        .as_ref()
+        .and_then(|value| value.get("products").and_then(Value::as_array))
+        .cloned()
+        .unwrap_or_default();
+    let sources = manifest
+        .as_ref()
+        .and_then(|value| value.get("sources").and_then(Value::as_array))
+        .cloned()
+        .unwrap_or_default();
+    let mut hours = BTreeSet::new();
+    let product_coverage = products
+        .iter()
+        .map(|product| {
+            let product_hours = product
+                .get("forecast_hours")
+                .and_then(Value::as_array)
+                .cloned()
+                .unwrap_or_default();
+            for hour in &product_hours {
+                if let Some(hour) = hour.as_u64() {
+                    hours.insert(hour);
+                }
+            }
+            json!({
+                "product": product.get("product").cloned().unwrap_or_else(|| json!(null)),
+                "member": product.get("member").cloned().unwrap_or_else(|| json!(null)),
+                "forecast_hours": product_hours,
+                "units": product.get("units").cloned().unwrap_or_else(|| json!(null)),
+                "bytes": product.get("bytes").cloned().unwrap_or_else(|| json!(0)),
+                "grid": product.get("grid").cloned().unwrap_or_else(|| json!(null))
+            })
+        })
+        .collect::<Vec<_>>();
+    let blockers = sources
+        .iter()
+        .flat_map(|source| {
+            source
+                .get("blockers")
+                .and_then(Value::as_array)
+                .cloned()
+                .unwrap_or_default()
+        })
+        .collect::<Vec<_>>();
+    let ingest_timing = sources
+        .iter()
+        .map(|source| {
+            json!({
+                "model": model,
+                "run": run,
+                "kind": source.get("kind").cloned().unwrap_or_else(|| json!(null)),
+                "imported_at": source.get("imported_at").cloned().unwrap_or_else(|| json!(null)),
+                "elapsed_ms": source.get("elapsed_ms").cloned().unwrap_or_else(|| json!(null)),
+                "blocker_count": source.get("blocker_count").cloned().unwrap_or_else(|| json!(0))
+            })
+        })
+        .collect::<Vec<_>>();
+    let export_timing = sources
+        .iter()
+        .filter_map(|source| source.get("source_manifest").and_then(Value::as_str))
+        .map(|source_manifest| {
+            let manifest_value = fs::read(source_manifest)
+                .ok()
+                .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok());
+            json!({
+                "model": model,
+                "run": run,
+                "source_manifest": source_manifest,
+                "timing": manifest_value
+                    .as_ref()
+                    .and_then(|value| value.get("timing").cloned())
+                    .unwrap_or_else(|| json!(null))
+            })
+        })
+        .collect::<Vec<_>>();
+    let product_count = products.len();
+    let status = if product_count == 0 {
+        "unavailable"
+    } else if blockers.is_empty() {
+        "complete_for_manifest"
+    } else {
+        "partial_with_blockers"
+    };
+    json!({
+        "run": run,
+        "path": display_path(&run_dir),
+        "run_manifest": if manifest_path.is_file() { json!(display_path(&manifest_path)) } else { json!(null) },
+        "domains": domains_from_run_manifest(manifest.as_ref()),
+        "forecast_hours": hours.into_iter().collect::<Vec<_>>(),
+        "product_count": product_count,
+        "products": product_coverage,
+        "blocker_count": blockers.len(),
+        "blockers": blockers,
+        "product_completeness": {
+            "model": model,
+            "run": run,
+            "status": status,
+            "product_count": product_count,
+            "blocker_count": blockers.len()
+        },
+        "ingest_timing": ingest_timing,
+        "export_timing": export_timing,
+        "bytes": sum_dir_bytes(&run_dir)
+    })
+}
+
+fn domains_from_run_manifest(manifest: Option<&Value>) -> Vec<String> {
+    let mut domains = BTreeSet::new();
+    if let Some(sources) = manifest
+        .and_then(|value| value.get("sources"))
+        .and_then(Value::as_array)
+    {
+        for source in sources {
+            let Some(source_manifest) = source.get("source_manifest").and_then(Value::as_str)
+            else {
+                continue;
+            };
+            if let Some(domain) = domain_from_source_manifest(source_manifest) {
+                domains.insert(domain);
+            }
+        }
+    }
+    domains.into_iter().collect()
+}
+
+fn domain_from_source_manifest(source_manifest: &str) -> Option<String> {
+    let value = fs::read(source_manifest)
+        .ok()
+        .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())?;
+    value
+        .get("domain")
+        .and_then(|domain| domain.get("slug"))
+        .and_then(Value::as_str)
+        .map(str::to_string)
+}
+
+fn spatial_wxa_bytes(spatial: &SpatialLane) -> u64 {
+    spatial
+        .model_ids()
+        .iter()
+        .flat_map(|model| {
+            spatial
+                .runs_for_model(model)
+                .into_iter()
+                .map(|run| spatial.root.join(model).join(run))
+                .collect::<Vec<_>>()
+        })
+        .map(|run_dir| sum_wxa_bytes(&run_dir))
+        .sum()
+}
+
+fn sum_dir_bytes(dir: &Path) -> u64 {
+    if !dir.is_dir() {
+        return 0;
+    }
+    let Ok(entries) = fs::read_dir(dir) else {
+        return 0;
+    };
+    entries
+        .filter_map(|entry| entry.ok())
+        .map(|entry| entry.path())
+        .map(|path| {
+            fs::metadata(&path)
+                .map(|meta| {
+                    if meta.is_file() {
+                        meta.len()
+                    } else if meta.is_dir() {
+                        sum_dir_bytes(&path)
+                    } else {
+                        0
+                    }
+                })
+                .unwrap_or(0)
+        })
+        .sum()
 }
 
 fn run_manifest_json(
@@ -4189,25 +7483,23 @@ impl SpatialLane {
             .map(|model| {
                 let runs = self.runs_for_model(&model);
                 let latest = self.latest_run_for_model(&model);
-                let variables = latest
+                let domains = latest
                     .as_deref()
-                    .and_then(|run| self.variables_for(&model, run, None).ok())
+                    .and_then(|run| {
+                        fs::read(run_manifest_path(&self.root, &model, run))
+                            .ok()
+                            .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
+                    })
+                    .map(|manifest| domains_from_run_manifest(Some(&manifest)))
                     .unwrap_or_default();
-                let members = latest
-                    .as_deref()
-                    .map(|run| self.members_for(&model, run))
-                    .unwrap_or_default();
-                let readiness = latest
-                    .as_deref()
-                    .map(|run| self.run_readiness(&model, run))
-                    .unwrap_or_else(|| json!({"status": "unavailable"}));
                 json!({
                     "id": model,
                     "runs": runs,
                     "latest_run": latest,
-                    "members": members,
-                    "latest_variables": variables,
-                    "latest_readiness": readiness
+                    "latest_readiness": {
+                        "status": if latest.is_some() { "available" } else { "unavailable" },
+                        "domains": domains
+                    }
                 })
             })
             .collect::<Vec<_>>();
@@ -4248,6 +7540,7 @@ impl SpatialLane {
         json!({
             "status": status,
             "run_manifest": if manifest_path.is_file() { json!(relative_path_string(&self.root, &manifest_path)) } else { json!(null) },
+            "domains": domains_from_run_manifest(manifest.as_ref()),
             "variables": variables,
             "available_hours": available_hours,
             "members": self.members_for(model, run),
@@ -4351,7 +7644,7 @@ impl SpatialLane {
     ) -> Result<Vec<u32>> {
         let wxa_path = self.wxa_file_path(model, run, member, variable);
         if wxa_path.is_file() {
-            let (_, meta, _) = read_wxa_dense2d(&wxa_path)?;
+            let (meta, _) = read_wxa_dense2d_metadata(&wxa_path)?;
             return Ok(meta.forecast_hours);
         }
         let array_dir = self.array_dir(model, run, member, variable)?;
@@ -4384,6 +7677,7 @@ impl SpatialLane {
         variable: &str,
         forecast_hour: u32,
     ) -> Result<SpatialGrid> {
+        let variable = storage_variable_alias(variable).unwrap_or(variable);
         if self.array_exists(model, run, member, variable) {
             return self.read_raw_grid(model, run, member, variable, forecast_hour);
         }
@@ -4406,8 +7700,18 @@ impl SpatialLane {
         variable: &str,
         forecast_hour: u32,
     ) -> Result<SpatialGrid> {
+        let variable = storage_variable_alias(variable).unwrap_or(variable);
         let member_key = member.unwrap_or("-");
-        let cache_key = format!("{model}|{run}|{member_key}|{variable}|{forecast_hour}");
+        let wxa_path = self.wxa_file_path(model, run, member, variable);
+        let cache_key = if wxa_path.is_file() {
+            format!(
+                "wxa|{model}|{run}|{member_key}|{variable}|{forecast_hour}|{}|{}",
+                wxa_path.display(),
+                file_cache_token(&wxa_path)
+            )
+        } else {
+            format!("zarr|{model}|{run}|{member_key}|{variable}|{forecast_hour}")
+        };
         if let Some(grid) = self
             .grid_cache
             .read()
@@ -4417,7 +7721,6 @@ impl SpatialLane {
             return Ok((*grid).clone());
         }
 
-        let wxa_path = self.wxa_file_path(model, run, member, variable);
         if wxa_path.is_file() {
             let grid = read_spatial_wxa_grid(&wxa_path, forecast_hour)
                 .with_context(|| format!("read native WXA {}", wxa_path.display()))?;
@@ -4510,6 +7813,74 @@ impl SpatialLane {
             cache.insert(cache_key, Arc::new(grid.clone()));
         }
         Ok(grid)
+    }
+
+    fn grid_source_cache_token(
+        &self,
+        model: &str,
+        run: &str,
+        member: Option<&str>,
+        variable: &str,
+        forecast_hour: u32,
+    ) -> Result<String> {
+        let variable = storage_variable_alias(variable).unwrap_or(variable);
+        if self.array_exists(model, run, member, variable) {
+            return Ok(self.raw_grid_source_cache_token(
+                model,
+                run,
+                member,
+                variable,
+                forecast_hour,
+            ));
+        }
+        if let Some(raw) = raw_variable_for_product(variable) {
+            return Ok(self.raw_grid_source_cache_token(model, run, member, raw, forecast_hour));
+        }
+        if let Some(deps) = cheap_derived_dependencies(variable) {
+            let tokens = deps
+                .iter()
+                .map(|dep| {
+                    self.grid_source_cache_token(model, run, member, dep, forecast_hour)
+                        .unwrap_or_else(|_| format!("missing:{dep}:f{forecast_hour:03}"))
+                })
+                .collect::<Vec<_>>();
+            return Ok(format!("derived:{variable}:{}", tokens.join("+")));
+        }
+        if let Some(window) = parse_windowed_product(variable) {
+            let hours = self.available_hours_for(model, run, member, window.raw_variable)?;
+            let tokens = hours
+                .into_iter()
+                .filter(|hour| *hour >= window.start && *hour <= window.end)
+                .map(|hour| {
+                    self.raw_grid_source_cache_token(model, run, member, window.raw_variable, hour)
+                })
+                .collect::<Vec<_>>();
+            return Ok(format!("window:{variable}:{}", tokens.join("+")));
+        }
+        Ok(format!("source:{variable}:f{forecast_hour:03}"))
+    }
+
+    fn raw_grid_source_cache_token(
+        &self,
+        model: &str,
+        run: &str,
+        member: Option<&str>,
+        variable: &str,
+        forecast_hour: u32,
+    ) -> String {
+        let variable = storage_variable_alias(variable).unwrap_or(variable);
+        let wxa_path = self.wxa_file_path(model, run, member, variable);
+        if wxa_path.is_file() {
+            return format!(
+                "wxa:{}:f{forecast_hour:03}:{}",
+                wxa_path.display(),
+                file_cache_token(&wxa_path)
+            );
+        }
+        match self.array_dir(model, run, member, variable) {
+            Ok(array_dir) => format!("zarr:{}:f{forecast_hour:03}", array_dir.display()),
+            Err(_) => format!("missing:{variable}:f{forecast_hour:03}"),
+        }
     }
 
     fn forecast_point(
@@ -5029,34 +8400,7 @@ fn write_spatial_wxa_grids(
     }
     fs::create_dir_all(&base)?;
     let path = base.join(format!("{product}.wxa"));
-
-    let incoming_hours = grids
-        .iter()
-        .map(|grid| grid.forecast_hour)
-        .collect::<BTreeSet<_>>();
-    let mut merged_grids = Vec::new();
-    if path.is_file() {
-        let (_, meta, _) = read_wxa_dense2d(&path)
-            .with_context(|| format!("read existing WXA metadata {}", path.display()))?;
-        for hour in meta.forecast_hours {
-            if !incoming_hours.contains(&hour) {
-                merged_grids.push(read_spatial_wxa_grid(&path, hour).with_context(|| {
-                    format!("read existing WXA grid {} f{hour:03}", path.display())
-                })?);
-            }
-        }
-    }
-    merged_grids.extend(grids.iter().cloned());
-    merged_grids.sort_by_key(|grid| grid.forecast_hour);
-    let grids = merged_grids;
-    let first = grids
-        .first()
-        .ok_or_else(|| anyhow!("cannot write empty WXA product"))?;
-    for grid in &grids {
-        if grid.nx != first.nx || grid.ny != first.ny {
-            bail!("all WXA grids for a product must share dimensions");
-        }
-    }
+    let first_grid_meta = first.grid_meta();
 
     let cy = WXA_SPATIAL_CHUNK_Y.min(first.ny);
     let cx = WXA_SPATIAL_CHUNK_X.min(first.nx);
@@ -5065,7 +8409,47 @@ fn write_spatial_wxa_grids(
 
     let mut records = Vec::<WxaDense2dIndexRecord>::new();
     let mut payload = Vec::<u8>::new();
-    for grid in &grids {
+
+    let incoming_hours = grids
+        .iter()
+        .map(|grid| grid.forecast_hour)
+        .collect::<BTreeSet<_>>();
+    if path.is_file() {
+        let (existing_bytes, existing_meta, existing_records) = read_wxa_dense2d(&path)
+            .with_context(|| format!("read existing WXA metadata {}", path.display()))?;
+        if existing_meta.model != model
+            || existing_meta.run != run
+            || existing_meta.member.as_deref() != member
+            || existing_meta.variable != product
+            || existing_meta.nx != first.nx
+            || existing_meta.ny != first.ny
+            || existing_meta.chunk_y != cy
+            || existing_meta.chunk_x != cx
+            || existing_meta.dtype != "f32_le"
+            || existing_meta.codec != "zstd_level_1"
+            || existing_meta.units != first.units
+            || existing_meta.grid != first_grid_meta
+        {
+            bail!(
+                "existing WXA product is incompatible with incoming grids: {}",
+                path.display()
+            );
+        }
+        for record in existing_records
+            .into_iter()
+            .filter(|record| !incoming_hours.contains(&record.forecast_hour))
+        {
+            let end = record.offset + record.len;
+            if end > existing_bytes.len() {
+                bail!("existing WXA chunk exceeds file length: {}", path.display());
+            }
+            let offset = payload.len();
+            payload.extend_from_slice(&existing_bytes[record.offset..end]);
+            records.push(WxaDense2dIndexRecord { offset, ..record });
+        }
+    }
+
+    for grid in grids {
         for chunk_y in 0..n_chunks_y {
             for chunk_x in 0..n_chunks_x {
                 let y0 = chunk_y * cy;
@@ -5116,10 +8500,11 @@ fn write_spatial_wxa_grids(
             }
         }
     }
+    records.sort_by_key(|record| (record.forecast_hour, record.chunk_y, record.chunk_x));
 
-    let mut forecast_hours = grids
+    let mut forecast_hours = records
         .iter()
-        .map(|grid| grid.forecast_hour)
+        .map(|record| record.forecast_hour)
         .collect::<Vec<_>>();
     forecast_hours.sort_unstable();
     forecast_hours.dedup();
@@ -5137,7 +8522,7 @@ fn write_spatial_wxa_grids(
         chunk_x: cx,
         dtype: "f32_le".to_string(),
         codec: "zstd_level_1".to_string(),
-        grid: first.grid_meta(),
+        grid: first_grid_meta,
     };
     let meta_bytes = serde_json::to_vec(&meta)?;
     let index_offset = WXA_DENSE2D_HEADER_LEN + meta_bytes.len();
@@ -5244,10 +8629,9 @@ fn render_raster_tile_png(
     for py in 0..tile_size {
         for px in 0..tile_size {
             let (lon, lat) = web_mercator_tile_lon_lat(z, x, y, px, py, tile_size);
-            let Some(index) = grid_index_for_latlon(grid, lat, lon) else {
+            let Some(value) = tile_value_for_latlon(grid, lat, lon) else {
                 continue;
             };
-            let value = grid.values.get(index).copied().unwrap_or(f32::NAN);
             let color = color_for_tile_value(value, min, max, palette, query);
             let dst = (py * tile_size + px) * 4;
             rgba[dst..dst + 4].copy_from_slice(&color);
@@ -5267,6 +8651,162 @@ fn encode_png_rgba(width: u32, height: u32, rgba: &[u8]) -> Result<Vec<u8>> {
         writer.write_image_data(rgba)?;
     }
     Ok(out)
+}
+
+fn tile_value_for_latlon(grid: &SpatialGrid, lat: f64, lon: f64) -> Option<f32> {
+    if should_smooth_tile_variable(&grid.variable) {
+        if let Some(value) = interpolated_geographic_value(grid, lat, lon) {
+            return Some(value);
+        }
+    }
+    let index = grid_index_for_latlon(grid, lat, lon)?;
+    Some(grid.values.get(index).copied().unwrap_or(f32::NAN))
+}
+
+fn should_smooth_tile_variable(variable: &str) -> bool {
+    let lower = variable.to_ascii_lowercase();
+    !(lower.contains("categorical")
+        || lower.contains("precipitation_type")
+        || lower.ends_with("_type")
+        || lower.contains("cloud_cover_levels"))
+}
+
+fn interpolated_geographic_value(grid: &SpatialGrid, lat: f64, lon: f64) -> Option<f32> {
+    if !lat.is_finite() || !lon.is_finite() {
+        return None;
+    }
+    match grid.grid_meta.get("type").and_then(Value::as_str)? {
+        "regular_latlon" => interpolated_regular_latlon_value(grid, lat, lon),
+        "rectilinear_latlon" => interpolated_rectilinear_latlon_value(grid, lat, lon),
+        _ => None,
+    }
+}
+
+fn interpolated_regular_latlon_value(grid: &SpatialGrid, lat: f64, lon: f64) -> Option<f32> {
+    let lat_start = meta_f64(&grid.grid_meta, "lat_start")?;
+    let lon_start = meta_f64(&grid.grid_meta, "lon_start")?;
+    let lat_step = meta_f64(&grid.grid_meta, "lat_step").or_else(|| {
+        meta_f64(&grid.grid_meta, "lat_end")
+            .map(|lat_end| (lat_end - lat_start) / grid.ny.saturating_sub(1).max(1) as f64)
+    })?;
+    let lon_step = meta_f64(&grid.grid_meta, "lon_step").or_else(|| {
+        meta_f64(&grid.grid_meta, "lon_end")
+            .map(|lon_end| (lon_end - lon_start) / grid.nx.saturating_sub(1).max(1) as f64)
+    })?;
+    if lat_step == 0.0 || lon_step == 0.0 {
+        return None;
+    }
+    let yf = (lat - lat_start) / lat_step;
+    if yf < 0.0 || yf > grid.ny.saturating_sub(1) as f64 {
+        return None;
+    }
+    let mut xf = (unwrap_lon_near(lon, lon_start) - lon_start) / lon_step;
+    let lon_wrap = grid
+        .grid_meta
+        .get("lon_wrap")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+        || (lon_step.abs() * grid.nx as f64 - 360.0).abs() <= lon_step.abs().max(0.01) * 2.0;
+    if lon_wrap {
+        xf = xf.rem_euclid(grid.nx as f64);
+    } else if xf < 0.0 || xf > grid.nx.saturating_sub(1) as f64 {
+        return None;
+    }
+    bilinear_grid_value(grid, xf, yf, lon_wrap)
+}
+
+fn interpolated_rectilinear_latlon_value(grid: &SpatialGrid, lat: f64, lon: f64) -> Option<f32> {
+    let lat_axis = meta_f64_array(&grid.grid_meta, "lat_axis")?;
+    let lon_axis = meta_f64_array(&grid.grid_meta, "lon_axis")?;
+    if lat_axis.len() != grid.ny || lon_axis.len() != grid.nx {
+        return None;
+    }
+    let y = axis_fraction(&lat_axis, lat, false)?;
+    let lon_wrap = grid
+        .grid_meta
+        .get("lon_wrap")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let x = axis_fraction(&lon_axis, lon, lon_wrap)?;
+    bilinear_grid_value(grid, x, y, lon_wrap)
+}
+
+fn axis_fraction(axis: &[f64], value: f64, wraps: bool) -> Option<f64> {
+    if axis.is_empty() || !value.is_finite() {
+        return None;
+    }
+    let value = if wraps {
+        unwrap_lon_near(value, axis[0])
+    } else {
+        value
+    };
+    if axis.len() == 1 {
+        return ((value - axis[0]).abs() <= f64::EPSILON).then_some(0.0);
+    }
+    let ascending = axis[axis.len() - 1] >= axis[0];
+    let first = axis[0];
+    let last = axis[axis.len() - 1];
+    let in_range = if ascending {
+        value >= first && value <= last
+    } else {
+        value <= first && value >= last
+    };
+    if !in_range {
+        return None;
+    }
+    for index in 0..axis.len() - 1 {
+        let a = axis[index];
+        let b = axis[index + 1];
+        if a == b {
+            continue;
+        }
+        let between = if ascending {
+            value >= a && value <= b
+        } else {
+            value <= a && value >= b
+        };
+        if between {
+            return Some(index as f64 + ((value - a) / (b - a)).clamp(0.0, 1.0));
+        }
+    }
+    Some((axis.len() - 1) as f64)
+}
+
+fn bilinear_grid_value(grid: &SpatialGrid, xf: f64, yf: f64, wraps_x: bool) -> Option<f32> {
+    if !xf.is_finite() || !yf.is_finite() || yf < 0.0 || yf > grid.ny.saturating_sub(1) as f64 {
+        return None;
+    }
+    let x0f = xf.floor();
+    let y0f = yf.floor();
+    let tx = (xf - x0f).clamp(0.0, 1.0) as f32;
+    let ty = (yf - y0f).clamp(0.0, 1.0) as f32;
+    let x0 = x0f as isize;
+    let y0 = y0f as isize;
+    let x1 = if wraps_x {
+        (x0 + 1).rem_euclid(grid.nx as isize)
+    } else {
+        (x0 + 1).min(grid.nx.saturating_sub(1) as isize)
+    };
+    let y1 = (y0 + 1).min(grid.ny.saturating_sub(1) as isize);
+    if x0 < 0 || y0 < 0 || x0 >= grid.nx as isize || y0 >= grid.ny as isize {
+        return None;
+    }
+    let x0 = x0 as usize;
+    let y0 = y0 as usize;
+    let x1 = x1 as usize;
+    let y1 = y1 as usize;
+    let v00 = grid.values[y0 * grid.nx + x0];
+    let v10 = grid.values[y0 * grid.nx + x1];
+    let v01 = grid.values[y1 * grid.nx + x0];
+    let v11 = grid.values[y1 * grid.nx + x1];
+    if v00.is_finite() && v10.is_finite() && v01.is_finite() && v11.is_finite() {
+        let top = v00 * (1.0 - tx) + v10 * tx;
+        let bottom = v01 * (1.0 - tx) + v11 * tx;
+        return Some(top * (1.0 - ty) + bottom * ty);
+    }
+    let nearest_x = if tx < 0.5 { x0 } else { x1 };
+    let nearest_y = if ty < 0.5 { y0 } else { y1 };
+    Some(grid.values[nearest_y * grid.nx + nearest_x])
 }
 
 fn web_mercator_tile_lon_lat(
@@ -5761,6 +9301,18 @@ fn read_f32_file(path: &Path) -> Result<Vec<f32>> {
         .chunks_exact(4)
         .map(|item| f32::from_le_bytes([item[0], item[1], item[2], item[3]]))
         .collect())
+}
+
+fn cached_f32_file(
+    cache: &mut HashMap<PathBuf, Arc<Vec<f32>>>,
+    path: &Path,
+) -> Result<Arc<Vec<f32>>> {
+    if let Some(values) = cache.get(path) {
+        return Ok(Arc::clone(values));
+    }
+    let values = Arc::new(read_f32_file(path)?);
+    cache.insert(path.to_path_buf(), Arc::clone(&values));
+    Ok(values)
 }
 
 fn grid_meta_from_latlon(
@@ -6365,6 +9917,55 @@ fn read_wxa_dense2d(path: &Path) -> Result<(Vec<u8>, WxaDense2dMeta, Vec<WxaDens
     Ok((bytes, meta, records))
 }
 
+fn read_wxa_dense2d_metadata(path: &Path) -> Result<(WxaDense2dMeta, Vec<WxaDense2dIndexRecord>)> {
+    let mut file = File::open(path).with_context(|| format!("open {}", path.display()))?;
+    let file_len = file
+        .metadata()
+        .with_context(|| format!("stat {}", path.display()))?
+        .len() as usize;
+    let mut header_bytes = vec![0u8; WXA_DENSE2D_HEADER_LEN];
+    file.read_exact(&mut header_bytes)
+        .with_context(|| format!("read WXA header {}", path.display()))?;
+    let header = parse_wxa_dense2d_header(&header_bytes)?;
+    let meta_end = WXA_DENSE2D_HEADER_LEN + header.metadata_len;
+    if meta_end > file_len {
+        bail!("WXA metadata exceeds file length");
+    }
+    let mut meta_bytes = vec![0u8; header.metadata_len];
+    file.read_exact(&mut meta_bytes)
+        .with_context(|| format!("read WXA metadata {}", path.display()))?;
+    let meta: WxaDense2dMeta = serde_json::from_slice(&meta_bytes)
+        .with_context(|| format!("parse WXA metadata {}", path.display()))?;
+    let index_end = header.index_offset + header.index_count * WXA_DENSE2D_INDEX_RECORD_LEN;
+    if index_end > file_len || header.payload_offset > file_len {
+        bail!("WXA index exceeds file length");
+    }
+    file.seek(SeekFrom::Start(header.index_offset as u64))
+        .with_context(|| format!("seek WXA index {}", path.display()))?;
+    let mut index_bytes = vec![0u8; header.index_count * WXA_DENSE2D_INDEX_RECORD_LEN];
+    file.read_exact(&mut index_bytes)
+        .with_context(|| format!("read WXA index {}", path.display()))?;
+    let mut records = Vec::with_capacity(header.index_count);
+    let mut offset = 0usize;
+    for _ in 0..header.index_count {
+        records.push(WxaDense2dIndexRecord {
+            forecast_hour: u32_from(&index_bytes[offset..offset + 4])?,
+            chunk_y: u32_from(&index_bytes[offset + 4..offset + 8])? as usize,
+            chunk_x: u32_from(&index_bytes[offset + 8..offset + 12])? as usize,
+            y_count: u32_from(&index_bytes[offset + 12..offset + 16])? as usize,
+            x_count: u32_from(&index_bytes[offset + 16..offset + 20])? as usize,
+            raw_len: u32_from(&index_bytes[offset + 20..offset + 24])? as usize,
+            offset: u64_from(&index_bytes[offset + 24..offset + 32])? as usize,
+            len: u64_from(&index_bytes[offset + 32..offset + 40])? as usize,
+            min: f32_from(&index_bytes[offset + 40..offset + 44])?,
+            max: f32_from(&index_bytes[offset + 44..offset + 48])?,
+            valid_count: u32_from(&index_bytes[offset + 48..offset + 52])?,
+        });
+        offset += WXA_DENSE2D_INDEX_RECORD_LEN;
+    }
+    Ok((meta, records))
+}
+
 fn parse_wxa_dense2d_header(bytes: &[u8]) -> Result<WxaDense2dHeader> {
     if bytes.len() < WXA_DENSE2D_HEADER_LEN {
         bail!("file too short for WXA header");
@@ -6524,6 +10125,38 @@ fn raw_variable_for_product(product: &str) -> Option<&'static str> {
         "sbcin" | "convective_inhibition" => Some("convective_inhibition"),
         "composite_reflectivity" => Some("composite_reflectivity"),
         "shortwave_radiation" => Some("shortwave_radiation"),
+        _ => None,
+    }
+}
+
+fn storage_variable_alias(variable: &str) -> Option<&'static str> {
+    match variable {
+        "temperature_2m" => Some("2m_temperature"),
+        "dew_point_2m" => Some("2m_dewpoint"),
+        "relative_humidity_2m" => Some("2m_relative_humidity"),
+        "wind_gusts_10m" => Some("10m_wind_gusts"),
+        "precipitation" => Some("total_qpf"),
+        "cloud_cover_low" => Some("low_cloud_cover"),
+        "cloud_cover_mid" => Some("middle_cloud_cover"),
+        "cloud_cover_high" => Some("high_cloud_cover"),
+        "pressure_msl" => Some("mslp_10m_winds"),
+        "cape" => Some("sbcape"),
+        "convective_inhibition" => Some("sbcin"),
+        _ => None,
+    }
+}
+
+fn cheap_derived_dependencies(variable: &str) -> Option<&'static [&'static str]> {
+    match variable {
+        "dewpoint_depression_2m" => Some(&["temperature_2m", "dew_point_2m"]),
+        "vpd_2m" | "heat_index_2m" => Some(&["temperature_2m", "relative_humidity_2m"]),
+        "wind_chill_2m" => Some(&["temperature_2m", "wind_speed_10m"]),
+        "apparent_temperature_2m" => {
+            Some(&["temperature_2m", "relative_humidity_2m", "wind_speed_10m"])
+        }
+        "wind_speed_10m" | "10m_wind_speed" | "wind_direction_10m" => {
+            Some(&["u_component_of_wind_10m", "v_component_of_wind_10m"])
+        }
         _ => None,
     }
 }
@@ -6709,28 +10342,91 @@ fn normalize_spatial_values(variable: &str, values: &mut [f32]) {
 }
 
 fn valid_times_from_run_id(run: &str, hours: &[u32]) -> Vec<String> {
-    if let Some((date, hour_z)) = run.split_once('_') {
-        if date.len() == 8 && hour_z.ends_with('z') {
-            if let Ok(hour) = hour_z.trim_end_matches('z').parse::<u32>() {
-                return hours
-                    .iter()
-                    .map(|lead| {
-                        format!(
-                            "{}-{}-{}T{:02}:00:00Z",
-                            &date[0..4],
-                            &date[4..6],
-                            &date[6..8],
-                            (hour + lead) % 24
-                        )
-                    })
-                    .collect();
-            }
-        }
+    if let Some(cycle_time) = parse_run_id_cycle_utc(run) {
+        return hours
+            .iter()
+            .map(|lead| {
+                (cycle_time + chrono::Duration::hours(i64::from(*lead)))
+                    .to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
+            })
+            .collect();
     }
     hours
         .iter()
         .map(|hour| format!("{run}+f{hour:03}"))
         .collect()
+}
+
+fn parse_run_id_cycle_utc(run: &str) -> Option<chrono::DateTime<chrono::Utc>> {
+    if let Ok(cycle_time) = chrono::DateTime::parse_from_rfc3339(run) {
+        return Some(cycle_time.with_timezone(&chrono::Utc));
+    }
+
+    let bytes = run.as_bytes();
+    for start in 0..bytes.len().saturating_sub(7) {
+        if !bytes[start..start + 8].iter().all(u8::is_ascii_digit) {
+            continue;
+        }
+
+        let search_end = bytes.len().min(start + 40);
+        let Some((hour_start, hour_end)) = (start + 8..search_end).find_map(|candidate| {
+            if !bytes[candidate].is_ascii_digit()
+                || candidate
+                    .checked_sub(1)
+                    .is_some_and(|prev| bytes[prev].is_ascii_digit())
+            {
+                return None;
+            }
+            let mut end = candidate;
+            while end < search_end && bytes[end].is_ascii_digit() && end - candidate < 2 {
+                end += 1;
+            }
+            if end < bytes.len()
+                && matches!(bytes[end], b'z' | b'Z')
+                && (end + 1 == bytes.len() || !bytes[end + 1].is_ascii_digit())
+            {
+                Some((candidate, end))
+            } else {
+                None
+            }
+        }) else {
+            continue;
+        };
+
+        let Some(year) = ascii_digits_to_u32(&bytes[start..start + 4]) else {
+            continue;
+        };
+        let Some(month) = ascii_digits_to_u32(&bytes[start + 4..start + 6]) else {
+            continue;
+        };
+        let Some(day) = ascii_digits_to_u32(&bytes[start + 6..start + 8]) else {
+            continue;
+        };
+        let Some(hour) = ascii_digits_to_u32(&bytes[hour_start..hour_end]) else {
+            continue;
+        };
+        if hour > 23 {
+            continue;
+        }
+        let Some(date) = chrono::NaiveDate::from_ymd_opt(year as i32, month, day) else {
+            continue;
+        };
+        let Some(time) = chrono::NaiveTime::from_hms_opt(hour, 0, 0) else {
+            continue;
+        };
+        return Some(chrono::DateTime::<chrono::Utc>::from_naive_utc_and_offset(
+            date.and_time(time),
+            chrono::Utc,
+        ));
+    }
+    None
+}
+
+fn ascii_digits_to_u32(bytes: &[u8]) -> Option<u32> {
+    bytes.iter().try_fold(0u32, |value, byte| {
+        byte.is_ascii_digit()
+            .then_some(value * 10 + u32::from(*byte - b'0'))
+    })
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -7265,6 +10961,21 @@ fn normalize_lon(lon: f64) -> f64 {
     normalized_lon_delta(lon)
 }
 
+fn file_cache_token(path: &Path) -> String {
+    match fs::metadata(path) {
+        Ok(meta) => {
+            let modified_ns = meta
+                .modified()
+                .ok()
+                .and_then(|time| time.duration_since(UNIX_EPOCH).ok())
+                .map(|duration| duration.as_nanos())
+                .unwrap_or_default();
+            format!("len={}:mtime_ns={modified_ns}", meta.len())
+        }
+        Err(_) => "missing".to_string(),
+    }
+}
+
 fn u32_from(bytes: &[u8]) -> Result<u32> {
     Ok(u32::from_le_bytes(bytes.try_into()?))
 }
@@ -7333,4 +11044,210 @@ fn internal_error(reason: impl AsRef<str>) -> ApiError {
             "reason": reason.as_ref()
         })),
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn temp_test_root(name: &str) -> PathBuf {
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system time before epoch")
+            .as_nanos();
+        let path =
+            std::env::temp_dir().join(format!("wxstore_{name}_{}_{}", std::process::id(), nonce));
+        fs::create_dir_all(&path).expect("create temp test root");
+        path
+    }
+
+    fn static_plot_test_manifest(run_label: &str) -> StaticPlotRunManifest {
+        StaticPlotRunManifest {
+            run_kind: "hrrr_non_ecape_hour".to_string(),
+            run_label: run_label.to_string(),
+            output_root: PathBuf::from("plots"),
+            model: None,
+            date_yyyymmdd: None,
+            cycle_utc: None,
+            forecast_hour: None,
+            source: None,
+            domain_slug: None,
+            member: None,
+            ensemble_kind: None,
+            ensemble_stat: None,
+            projection_variant: None,
+            plot_variant: None,
+            variant: None,
+            state: "complete".to_string(),
+            detail: None,
+            artifacts: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn static_plot_identity_defaults_old_manifests_to_auto_variant() {
+        let manifest = static_plot_test_manifest("rustwx_hrrr_20260503_14z_f000_conus");
+        let identity = static_plot_identity_with_path(&manifest, None);
+
+        assert_eq!(identity.domain_slug.as_deref(), Some("conus"));
+        assert_eq!(static_plot_variant_key(&identity), "auto");
+    }
+
+    #[test]
+    fn static_plot_identity_reads_and_normalizes_manifest_projection_variant() {
+        let mut manifest = static_plot_test_manifest("rustwx_hrrr_20260503_14z_f000_conus");
+        manifest.projection_variant = Some("Lambert-Conformal".to_string());
+        let identity = static_plot_identity_with_path(&manifest, None);
+
+        assert_eq!(identity.domain_slug.as_deref(), Some("conus"));
+        assert_eq!(static_plot_variant_key(&identity), "lambert");
+    }
+
+    #[test]
+    fn static_plot_identity_infers_variant_from_label_suffix() {
+        let manifest = static_plot_test_manifest(
+            "rustwx_hrrr_20260503_14z_f000_conus_projection_variant_robinson_non_ecape_hour",
+        );
+        let identity = static_plot_identity_with_path(&manifest, None);
+
+        assert_eq!(identity.domain_slug.as_deref(), Some("conus"));
+        assert_eq!(static_plot_variant_key(&identity), "robinson");
+    }
+
+    #[test]
+    fn static_plot_identity_infers_variant_from_manifest_path() {
+        let manifest = static_plot_test_manifest("rustwx_hrrr_20260503_14z_f000_conus");
+        let path = PathBuf::from(
+            "plots/hrrr/20260503_14z/projection_mercator/rustwx_hrrr_20260503_14z_f000_conus_run_manifest.json",
+        );
+        let identity = static_plot_identity_with_path(&manifest, Some(&path));
+
+        assert_eq!(identity.domain_slug.as_deref(), Some("conus"));
+        assert_eq!(static_plot_variant_key(&identity), "mercator");
+    }
+
+    #[test]
+    fn static_plot_record_matches_projection_and_variant_queries() {
+        let mut manifest = static_plot_test_manifest("rustwx_hrrr_20260503_14z_f000_conus");
+        manifest.plot_variant = Some("geo".to_string());
+        let record = StaticPlotManifestRecord {
+            id: "test".to_string(),
+            path: PathBuf::from("geo/test_run_manifest.json"),
+            manifest,
+        };
+
+        let projection_query = StaticPlotCatalogQuery {
+            projection: Some("geographic".to_string()),
+            ..StaticPlotCatalogQuery::default()
+        };
+        let variant_query = StaticPlotCatalogQuery {
+            variant: Some("lambert".to_string()),
+            ..StaticPlotCatalogQuery::default()
+        };
+
+        assert!(static_plot_record_matches(&record, &projection_query));
+        assert!(!static_plot_record_matches(&record, &variant_query));
+    }
+
+    #[test]
+    fn publish_latest_pointer_does_not_regress_to_older_cycle() {
+        let root = temp_test_root("latest_regression");
+        let model = "hrrr";
+        let newer = "20260503_hrrr_12z";
+        let older = "20260503_hrrr_11z";
+        fs::create_dir_all(root.join(model).join(newer)).expect("create newer run");
+        fs::create_dir_all(root.join(model).join(older)).expect("create older run");
+
+        publish_latest_pointer(&root, model, newer, "test").expect("publish newer");
+        let skipped =
+            publish_latest_pointer(&root, model, older, "test").expect("older publish skips");
+
+        assert_eq!(
+            skipped.get("published").and_then(Value::as_bool),
+            Some(false)
+        );
+        assert_eq!(
+            read_latest_pointer_run(&root, model).as_deref(),
+            Some(newer)
+        );
+
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn valid_times_from_run_id_rolls_over_days() {
+        assert_eq!(
+            valid_times_from_run_id("20260430_23z", &[0, 1, 25]),
+            vec![
+                "2026-04-30T23:00:00Z",
+                "2026-05-01T00:00:00Z",
+                "2026-05-02T00:00:00Z",
+            ]
+        );
+    }
+
+    #[test]
+    fn valid_times_from_run_id_accepts_prefixed_uppercase_run_ids() {
+        assert_eq!(
+            valid_times_from_run_id("hrrr.20260430_06Z.current", &[0, 18]),
+            vec!["2026-04-30T06:00:00Z", "2026-05-01T00:00:00Z"]
+        );
+    }
+
+    #[test]
+    fn valid_times_from_run_id_accepts_model_between_date_and_cycle() {
+        assert_eq!(
+            valid_times_from_run_id("20260503_hrrr_12z", &[0, 6]),
+            vec!["2026-05-03T12:00:00Z", "2026-05-03T18:00:00Z"]
+        );
+    }
+
+    #[test]
+    fn valid_times_from_run_id_falls_back_for_unparsed_runs() {
+        assert_eq!(
+            valid_times_from_run_id("latest", &[3, 12]),
+            vec!["latest+f003", "latest+f012"]
+        );
+    }
+
+    #[test]
+    fn wxa_metadata_reader_does_not_need_payload_read() {
+        let root = temp_test_root("wxa_metadata_reader");
+        let grid = SpatialGrid {
+            model: "hrrr".to_string(),
+            run_id: "20260503_hrrr_13z".to_string(),
+            member: Some("control".to_string()),
+            variable: "2m_temperature".to_string(),
+            units: "degC".to_string(),
+            forecast_hour: 0,
+            nx: 2,
+            ny: 2,
+            grid_meta: json!({"type": "regular_latlon", "lat_start": 0.0, "lon_start": 0.0, "lat_step": 1.0, "lon_step": 1.0}),
+            values: Arc::new(vec![1.0, 2.0, 3.0, 4.0]),
+        };
+        let mut grid_f1 = grid.clone();
+        grid_f1.forecast_hour = 1;
+        grid_f1.values = Arc::new(vec![5.0, 6.0, 7.0, 8.0]);
+
+        let path = write_spatial_wxa_grids(
+            &root,
+            "hrrr",
+            "20260503_hrrr_13z",
+            Some("control"),
+            "2m_temperature",
+            &[grid, grid_f1],
+        )
+        .expect("write WXA");
+
+        let (meta, index) = read_wxa_dense2d_metadata(&path).expect("read WXA metadata");
+        assert_eq!(meta.model, "hrrr");
+        assert_eq!(meta.forecast_hours, vec![0, 1]);
+        assert_eq!(index.len(), 2);
+
+        let full = read_spatial_wxa_grid(&path, 1).expect("read WXA grid");
+        assert_eq!(full.forecast_hour, 1);
+        assert_eq!(full.values.as_ref(), &vec![5.0, 6.0, 7.0, 8.0]);
+
+        fs::remove_dir_all(root).ok();
+    }
 }
