@@ -5,8 +5,9 @@ use std::{
     io::{Read, Seek, SeekFrom, Write},
     net::SocketAddr,
     path::{Path, PathBuf},
+    process::{Command as ProcessCommand, Stdio},
     sync::{Arc, RwLock},
-    time::{Instant, UNIX_EPOCH},
+    time::{Instant, SystemTime, UNIX_EPOCH},
 };
 
 use anyhow::{anyhow, bail, Context, Result};
@@ -16,7 +17,7 @@ use axum::{
     http::{header, HeaderMap, HeaderValue, Method, Request, StatusCode},
     middleware::{self, Next},
     response::{Html, IntoResponse, Response},
-    routing::get,
+    routing::{get, post},
     Json, Router,
 };
 use bytes::Bytes;
@@ -275,6 +276,7 @@ async fn main() -> Result<()> {
 }
 
 async fn serve(args: ServeArgs) -> Result<()> {
+    let ops_root = infer_ops_root(&args);
     let state = Arc::new(AppState {
         profile: Arc::new(ProfileLane::open(&args.profile_store)?),
         diagnostic: args
@@ -295,13 +297,15 @@ async fn serve(args: ServeArgs) -> Result<()> {
             .map(|path| StaticPlotLane::open(path))
             .transpose()
             .map(|lane| lane.map(Arc::new))?,
-        ops_root: infer_ops_root(&args),
+        plot_lab: Arc::new(PlotLabLane::from_env(&ops_root)?),
+        ops_root,
         cache: RwLock::new(ResponseCache::default()),
     });
 
     let app = Router::new()
         .route("/", get(index))
         .route("/plots", get(plots))
+        .route("/plot-lab", get(plot_lab))
         .route("/projection-demo", get(projection_demo))
         .route("/ops", get(ops))
         .route("/livez", get(livez))
@@ -312,6 +316,12 @@ async fn serve(args: ServeArgs) -> Result<()> {
         .route("/v1/variables", get(variables))
         .route("/v1/products", get(products))
         .route("/v1/static-plots", get(static_plots))
+        .route("/v1/plot-lab/config", get(plot_lab_config))
+        .route("/v1/plot-lab/render", post(plot_lab_render))
+        .route(
+            "/v1/plot-lab/artifacts/{render_id}/{file_name}",
+            get(plot_lab_artifact),
+        )
         .route("/v1/ops/live", get(ops_live))
         .route(
             "/v1/static-plots/artifacts/{manifest_id}/{artifact_index}",
@@ -357,6 +367,7 @@ async fn serve(args: ServeArgs) -> Result<()> {
             Method::GET,
             Method::HEAD,
             Method::OPTIONS,
+            Method::POST,
         ]))
         .with_state(state);
 
@@ -1189,6 +1200,7 @@ struct AppState {
     diagnostic: Option<Arc<DiagnosticLane>>,
     spatial: Option<Arc<SpatialLane>>,
     static_plots: Option<Arc<StaticPlotLane>>,
+    plot_lab: Arc<PlotLabLane>,
     ops_root: PathBuf,
     cache: RwLock<ResponseCache>,
 }
@@ -1219,10 +1231,551 @@ struct StaticPlotLane {
     manifest_cache: RwLock<StaticPlotManifestCache>,
 }
 
+struct PlotLabLane {
+    root: PathBuf,
+    direct_batch_bin: PathBuf,
+    cache_root: PathBuf,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+struct PlotLabBounds {
+    west: f64,
+    east: f64,
+    south: f64,
+    north: f64,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+struct PlotLabRenderRequest {
+    model: String,
+    date: String,
+    cycle_utc: Option<u8>,
+    forecast_hour: Option<u16>,
+    source: Option<String>,
+    region: String,
+    product: String,
+    domain_slug: Option<String>,
+    bounds: Option<PlotLabBounds>,
+    projection_variant: Option<String>,
+    plot_style: Option<String>,
+    output_width: Option<u32>,
+    output_height: Option<u32>,
+    supersample_factor: Option<u32>,
+    chrome_scale: Option<f32>,
+    presentation_pad_fraction: Option<f64>,
+    inverse_raster_crop_pad_cells: Option<usize>,
+    inverse_raster_geo_clip: Option<bool>,
+    basemap_graticule: Option<bool>,
+    native_fill_level_multiplier: Option<usize>,
+    place_label_density: Option<u8>,
+    linework_width_boost: Option<u32>,
+    linework_alpha_scale: Option<f32>,
+    barb_width: Option<u32>,
+    barb_length_px: Option<f64>,
+    barb_density: Option<f64>,
+}
+
 #[derive(Default)]
 struct StaticPlotManifestCache {
     loaded_at: Option<Instant>,
     records: Vec<StaticPlotManifestRecord>,
+}
+
+impl PlotLabLane {
+    fn from_env(ops_root: &Path) -> Result<Self> {
+        let root = std::env::var_os("WXSTORE_PLOT_LAB_ROOT")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| ops_root.join("plot_lab"));
+        let direct_batch_bin = std::env::var_os("RUSTWX_DIRECT_BATCH_BIN")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| {
+                PathBuf::from("/opt/free-weather-api/build/rustwx-target/release/direct_batch")
+            });
+        let cache_root = std::env::var_os("RUSTWX_CACHE_DIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| ops_root.join("cache"));
+        fs::create_dir_all(&root)
+            .with_context(|| format!("create plot lab root {}", root.display()))?;
+        Ok(Self {
+            root,
+            direct_batch_bin,
+            cache_root,
+        })
+    }
+
+    fn config_json(&self) -> Value {
+        json!({
+            "schema": "wxstore.plot_lab.config.v1",
+            "status": "ready",
+            "root": self.root,
+            "direct_batch_bin": self.direct_batch_bin,
+            "cache_root": self.cache_root,
+            "models": ["gfs", "hrrr", "rap", "gefs", "ecmwf"],
+            "sources": ["nomads", "ecmwf-open-data"],
+            "regions": plot_lab_regions_json(),
+            "products": [
+                "500mb_height_winds",
+                "2m_temperature",
+                "2m_dewpoint",
+                "2m_relative_humidity",
+                "10m_winds",
+                "10m_wind_gusts",
+                "mslp_10m_winds",
+                "850mb_temperature_winds",
+                "700mb_relative_humidity",
+                "total_qpf",
+                "composite_reflectivity",
+                "total_cloud_cover",
+                "sbcape"
+            ],
+            "projection_variants": ["auto", "pivotal", "albers", "mercator", "robinson"],
+            "plot_styles": ["clean_atlas", "default"]
+        })
+    }
+
+    fn artifact_path(&self, render_id: &str, file_name: &str) -> Result<PathBuf> {
+        if !safe_path_component(render_id) || !safe_path_component(file_name) {
+            bail!("invalid plot lab artifact path");
+        }
+        let root = fs::canonicalize(&self.root)
+            .with_context(|| format!("canonicalize plot lab root {}", self.root.display()))?;
+        let path = fs::canonicalize(self.root.join(render_id).join(file_name))
+            .with_context(|| format!("canonicalize plot lab artifact {render_id}/{file_name}"))?;
+        if !path.starts_with(&root) {
+            bail!("plot lab artifact escapes root: {}", path.display());
+        }
+        if !path.is_file() {
+            bail!("plot lab artifact is missing: {}", path.display());
+        }
+        Ok(path)
+    }
+
+    fn render(&self, request: PlotLabRenderRequest) -> Result<Value> {
+        let request = normalize_plot_lab_request(request)?;
+        let render_id = plot_lab_render_id(&request);
+        let out_dir = self.root.join(&render_id);
+        fs::create_dir_all(&out_dir)
+            .with_context(|| format!("create plot lab render dir {}", out_dir.display()))?;
+
+        let mut command = ProcessCommand::new(&self.direct_batch_bin);
+        command
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .env(
+                "RUSTWX_PLOT_STYLE",
+                request.plot_style.as_deref().unwrap_or("clean_atlas"),
+            )
+            .env(
+                "RUSTWX_PROJECTION_VARIANT",
+                request.projection_variant.as_deref().unwrap_or("auto"),
+            )
+            .env(
+                "RUSTWX_STATIC_OUTPUT_WIDTH",
+                request.output_width.unwrap_or(1600).to_string(),
+            )
+            .env(
+                "RUSTWX_STATIC_OUTPUT_HEIGHT",
+                request.output_height.unwrap_or(900).to_string(),
+            )
+            .env(
+                "RUSTWX_SUPERSAMPLE_FACTOR",
+                request.supersample_factor.unwrap_or(2).to_string(),
+            )
+            .env(
+                "RUSTWX_CHROME_SCALE",
+                request.chrome_scale.unwrap_or(0.9).to_string(),
+            )
+            .env(
+                "RUSTWX_PRESENTATION_PAD_FRACTION",
+                request
+                    .presentation_pad_fraction
+                    .unwrap_or(0.06)
+                    .to_string(),
+            )
+            .env(
+                "RUSTWX_INVERSE_RASTER_CROP_PAD_CELLS",
+                request
+                    .inverse_raster_crop_pad_cells
+                    .unwrap_or(1000)
+                    .to_string(),
+            )
+            .env(
+                "RUSTWX_INVERSE_RASTER_GEO_CLIP",
+                bool_env_value(request.inverse_raster_geo_clip.unwrap_or(true)),
+            )
+            .env(
+                "RUSTWX_BASEMAP_GRATICULE",
+                bool_env_value(request.basemap_graticule.unwrap_or(true)),
+            )
+            .env(
+                "RUSTWX_LINEWORK_WIDTH_BOOST",
+                request.linework_width_boost.unwrap_or(0).to_string(),
+            )
+            .env(
+                "RUSTWX_LINEWORK_ALPHA_SCALE",
+                request.linework_alpha_scale.unwrap_or(1.0).to_string(),
+            )
+            .env(
+                "RUSTWX_BARB_WIDTH",
+                request.barb_width.unwrap_or(2).to_string(),
+            )
+            .env(
+                "RUSTWX_BARB_LENGTH_PX",
+                request.barb_length_px.unwrap_or(20.0).to_string(),
+            )
+            .env(
+                "RUSTWX_BARB_DENSITY",
+                request.barb_density.unwrap_or(1.0).to_string(),
+            )
+            .arg("--model")
+            .arg(&request.model)
+            .arg("--date")
+            .arg(&request.date)
+            .arg("--forecast-hour")
+            .arg(request.forecast_hour.unwrap_or(0).to_string())
+            .arg("--region")
+            .arg(&request.region)
+            .arg("--recipe")
+            .arg(&request.product)
+            .arg("--out-dir")
+            .arg(&out_dir)
+            .arg("--cache-dir")
+            .arg(&self.cache_root)
+            .arg("--native-fill-level-multiplier")
+            .arg(
+                request
+                    .native_fill_level_multiplier
+                    .unwrap_or(1)
+                    .to_string(),
+            )
+            .arg("--place-label-density")
+            .arg(request.place_label_density.unwrap_or(0).to_string());
+        if let Some(cycle_utc) = request.cycle_utc {
+            command.arg("--cycle").arg(cycle_utc.to_string());
+        }
+        if let Some(source) = request.source.as_deref().filter(|value| !value.is_empty()) {
+            command.arg("--source").arg(source);
+        }
+        if let Some(bounds) = request.bounds.as_ref() {
+            command.arg(format!(
+                "--bounds={},{},{},{}",
+                bounds.west, bounds.east, bounds.south, bounds.north
+            ));
+            command.arg(format!(
+                "--domain-slug={}",
+                request.domain_slug.as_deref().unwrap_or("plot_lab_custom")
+            ));
+        }
+
+        let started = Instant::now();
+        let output = command.output().with_context(|| {
+            format!("run plot lab renderer {}", self.direct_batch_bin.display())
+        })?;
+        let elapsed_ms = started.elapsed().as_millis();
+        let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+        let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+        if !output.status.success() {
+            bail!(
+                "plot lab render failed with status {:?}\nstdout:\n{}\nstderr:\n{}",
+                output.status.code(),
+                stdout,
+                stderr
+            );
+        }
+        let artifact = newest_file_with_extension(&out_dir, "png")?;
+        let file_name = artifact
+            .file_name()
+            .and_then(|name| name.to_str())
+            .ok_or_else(|| anyhow!("plot lab artifact has invalid filename"))?
+            .to_string();
+        let version = static_plot_artifact_version(&artifact);
+        let mut url = format!(
+            "/v1/plot-lab/artifacts/{}/{}",
+            url_path_segment(&render_id),
+            url_path_segment(&file_name)
+        );
+        if let Some(version) = version.as_deref() {
+            url.push_str("?v=");
+            url.push_str(&url_encode_query_component(version));
+        }
+        Ok(json!({
+            "schema": "wxstore.plot_lab.render.v1",
+            "status": "complete",
+            "render_id": render_id,
+            "elapsed_ms": elapsed_ms,
+            "artifact": {
+                "file_name": file_name,
+                "path": artifact,
+                "url": url,
+                "bytes": fs::metadata(&artifact).ok().map(|meta| meta.len()),
+                "version": version
+            },
+            "request": request,
+            "stdout": truncate_string(stdout, 8000),
+            "stderr": truncate_string(stderr, 8000)
+        }))
+    }
+}
+
+fn normalize_plot_lab_request(mut request: PlotLabRenderRequest) -> Result<PlotLabRenderRequest> {
+    request.model = normalize_cli_token(&request.model, "model")?;
+    request.region = normalize_cli_token(&request.region, "region")?;
+    request.product = normalize_cli_token(&request.product, "product")?;
+    request.date = request.date.trim().to_string();
+    if request.date.len() != 8 || !request.date.chars().all(|ch| ch.is_ascii_digit()) {
+        bail!("date must be YYYYMMDD");
+    }
+    if request.cycle_utc.is_some_and(|cycle| cycle > 23) {
+        bail!("cycle_utc must be 0-23");
+    }
+    if request.forecast_hour.unwrap_or(0) > 840 {
+        bail!("forecast_hour is too large");
+    }
+    if let Some(source) = request.source.as_mut() {
+        *source = normalize_cli_token(source, "source")?;
+    }
+    if let Some(value) = request.projection_variant.as_mut() {
+        *value = normalize_cli_token(value, "projection_variant")?;
+    }
+    if let Some(value) = request.plot_style.as_mut() {
+        *value = normalize_cli_token(value, "plot_style")?;
+    }
+    if let Some(slug) = request.domain_slug.as_mut() {
+        *slug = normalize_slug_token(slug, "domain_slug")?;
+    }
+    if let Some(bounds) = request.bounds.as_ref() {
+        if !bounds.west.is_finite()
+            || !bounds.east.is_finite()
+            || !bounds.south.is_finite()
+            || !bounds.north.is_finite()
+        {
+            bail!("bounds must be finite");
+        }
+        if bounds.south >= bounds.north {
+            bail!("bounds south must be less than north");
+        }
+        if !(-90.0..=90.0).contains(&bounds.south) || !(-90.0..=90.0).contains(&bounds.north) {
+            bail!("bounds latitude values must be between -90 and 90");
+        }
+    }
+    request.output_width = Some(request.output_width.unwrap_or(1600).clamp(640, 4096));
+    request.output_height = Some(request.output_height.unwrap_or(900).clamp(480, 4096));
+    request.supersample_factor = Some(request.supersample_factor.unwrap_or(2).clamp(1, 4));
+    request.chrome_scale = Some(request.chrome_scale.unwrap_or(0.9).clamp(0.6, 1.6));
+    request.presentation_pad_fraction = Some(
+        request
+            .presentation_pad_fraction
+            .unwrap_or(0.06)
+            .clamp(0.0, 0.25),
+    );
+    request.inverse_raster_crop_pad_cells = Some(
+        request
+            .inverse_raster_crop_pad_cells
+            .unwrap_or(1000)
+            .clamp(0, 5000),
+    );
+    request.native_fill_level_multiplier = Some(
+        request
+            .native_fill_level_multiplier
+            .unwrap_or(1)
+            .clamp(1, 8),
+    );
+    request.place_label_density = Some(request.place_label_density.unwrap_or(0).min(3));
+    request.linework_width_boost = Some(request.linework_width_boost.unwrap_or(0).min(4));
+    request.linework_alpha_scale =
+        Some(request.linework_alpha_scale.unwrap_or(1.0).clamp(0.25, 2.0));
+    request.barb_width = Some(request.barb_width.unwrap_or(2).clamp(1, 8));
+    request.barb_length_px = Some(request.barb_length_px.unwrap_or(20.0).clamp(6.0, 48.0));
+    request.barb_density = Some(request.barb_density.unwrap_or(1.0).clamp(0.25, 4.0));
+    Ok(request)
+}
+
+fn normalize_cli_token(value: &str, field: &str) -> Result<String> {
+    let value = value.trim().to_ascii_lowercase();
+    if value.is_empty()
+        || !value
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '.'))
+    {
+        bail!("{field} contains unsupported characters");
+    }
+    Ok(value)
+}
+
+fn normalize_slug_token(value: &str, field: &str) -> Result<String> {
+    let value = value.trim().to_ascii_lowercase().replace('-', "_");
+    if value.is_empty()
+        || !value
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || ch == '_')
+    {
+        bail!("{field} contains unsupported characters");
+    }
+    Ok(value)
+}
+
+fn bool_env_value(value: bool) -> &'static str {
+    if value {
+        "1"
+    } else {
+        "0"
+    }
+}
+
+fn plot_lab_render_id(request: &PlotLabRenderRequest) -> String {
+    let now_ms = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_millis())
+        .unwrap_or(0);
+    let domain = request
+        .domain_slug
+        .as_deref()
+        .unwrap_or(request.region.as_str());
+    format!(
+        "{}_{}_{}z_f{:03}_{}_{}_{}",
+        now_ms,
+        request.model,
+        request.cycle_utc.unwrap_or(0),
+        request.forecast_hour.unwrap_or(0),
+        sanitize_file_component(domain),
+        sanitize_file_component(&request.product),
+        sanitize_file_component(request.projection_variant.as_deref().unwrap_or("auto"))
+    )
+}
+
+fn safe_path_component(value: &str) -> bool {
+    !value.is_empty()
+        && value != "."
+        && value != ".."
+        && !value.contains("..")
+        && !value.contains('/')
+        && !value.contains('\\')
+        && value
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '.'))
+}
+
+fn sanitize_file_component(value: &str) -> String {
+    let slug = value
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_') {
+                ch
+            } else {
+                '_'
+            }
+        })
+        .collect::<String>();
+    if slug.is_empty() {
+        "x".to_string()
+    } else {
+        slug
+    }
+}
+
+fn newest_file_with_extension(root: &Path, extension: &str) -> Result<PathBuf> {
+    let mut newest: Option<(SystemTime, PathBuf)> = None;
+    for entry in fs::read_dir(root).with_context(|| format!("read {}", root.display()))? {
+        let entry = entry?;
+        let path = entry.path();
+        if !path.is_file()
+            || path
+                .extension()
+                .and_then(|value| value.to_str())
+                .map(|value| !value.eq_ignore_ascii_case(extension))
+                .unwrap_or(true)
+        {
+            continue;
+        }
+        let modified = entry
+            .metadata()
+            .and_then(|meta| meta.modified())
+            .unwrap_or(UNIX_EPOCH);
+        if newest
+            .as_ref()
+            .map(|(current, _)| modified > *current)
+            .unwrap_or(true)
+        {
+            newest = Some((modified, path));
+        }
+    }
+    newest.map(|(_, path)| path).ok_or_else(|| {
+        anyhow!(
+            "plot lab render did not produce a PNG in {}",
+            root.display()
+        )
+    })
+}
+
+fn truncate_string(value: String, max_chars: usize) -> String {
+    if value.chars().count() <= max_chars {
+        return value;
+    }
+    let mut out = value.chars().take(max_chars).collect::<String>();
+    out.push_str("\n[truncated]");
+    out
+}
+
+fn plot_lab_regions_json() -> Vec<Value> {
+    vec![
+        plot_lab_region("global", "Global", -180.0, 179.999, -90.0, 90.0),
+        plot_lab_region("conus", "CONUS", -127.0, -66.0, 23.0, 51.5),
+        plot_lab_region("north-america", "North America", -170.0, -50.0, 5.0, 84.0),
+        plot_lab_region("south-america", "South America", -82.0, -34.0, -56.0, 13.0),
+        plot_lab_region("europe", "Europe", -25.0, 45.0, 34.0, 72.0),
+        plot_lab_region("africa", "Africa", -20.0, 55.0, -35.0, 38.0),
+        plot_lab_region("asia", "Asia", 25.0, 179.999, -10.0, 82.0),
+        plot_lab_region("australia", "Australia", 110.0, 180.0, -50.0, 0.0),
+        plot_lab_region("antarctica", "Antarctica", -180.0, 179.999, -90.0, -60.0),
+        plot_lab_region(
+            "pacific-northwest",
+            "Pacific Northwest",
+            -125.0,
+            -110.0,
+            41.0,
+            49.5,
+        ),
+        plot_lab_region(
+            "california-southwest",
+            "California / Southwest",
+            -125.0,
+            -108.0,
+            31.0,
+            41.5,
+        ),
+        plot_lab_region(
+            "rockies-high-plains",
+            "Rockies / High Plains",
+            -112.0,
+            -96.0,
+            37.0,
+            49.5,
+        ),
+        plot_lab_region(
+            "southern-plains",
+            "Southern Plains",
+            -109.0,
+            -90.0,
+            25.0,
+            40.5,
+        ),
+        plot_lab_region("great-lakes", "Great Lakes", -97.5, -72.0, 39.0, 50.5),
+        plot_lab_region("southeast", "Southeast", -96.0, -72.0, 24.0, 38.5),
+        plot_lab_region("northeast", "Northeast", -84.5, -65.0, 36.0, 48.5),
+    ]
+}
+
+fn plot_lab_region(slug: &str, label: &str, west: f64, east: f64, south: f64, north: f64) -> Value {
+    json!({
+        "slug": slug,
+        "label": label,
+        "bounds": {
+            "west": west,
+            "east": east,
+            "south": south,
+            "north": north
+        }
+    })
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -2237,6 +2790,10 @@ async fn plots() -> impl IntoResponse {
     (no_store_headers(), Html(PLOTS_HTML))
 }
 
+async fn plot_lab() -> impl IntoResponse {
+    (no_store_headers(), Html(PLOT_LAB_HTML))
+}
+
 async fn projection_demo() -> impl IntoResponse {
     (no_store_headers(), Html(PROJECTION_DEMO_HTML))
 }
@@ -2244,6 +2801,285 @@ async fn projection_demo() -> impl IntoResponse {
 async fn ops() -> impl IntoResponse {
     (no_store_headers(), Html(OPS_HTML))
 }
+
+const PLOT_LAB_HTML: &str = r####"<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>WxStore Plot Lab</title>
+  <style>
+    :root { color-scheme: light; --ink:#111827; --muted:#64748b; --line:#d0d5dd; --panel:#fff; --bg:#f6f8fb; --accent:#1d4ed8; }
+    * { box-sizing: border-box; }
+    body { margin:0; font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; background:var(--bg); color:var(--ink); }
+    header { position:sticky; top:0; z-index:10; display:grid; grid-template-columns:minmax(180px,1fr) auto; gap:12px; align-items:center; padding:10px 14px; border-bottom:1px solid var(--line); background:rgba(246,248,251,.97); }
+    h1 { margin:0; font-size:18px; line-height:1.2; }
+    nav { display:flex; gap:8px; }
+    nav a, button { display:inline-grid; place-items:center; min-height:34px; border:1px solid #111827; border-radius:6px; background:#111827; color:#fff; padding:0 10px; font:inherit; font-size:13px; font-weight:800; text-decoration:none; cursor:pointer; }
+    button.secondary, nav a.secondary { background:#fff; color:#111827; border-color:#cbd5e1; }
+    button:disabled { opacity:.55; cursor:default; }
+    main { display:grid; grid-template-columns:360px minmax(0,1fr); min-height:calc(100vh - 56px); }
+    aside { display:grid; align-content:start; gap:10px; padding:12px; border-right:1px solid var(--line); background:#fff; overflow:auto; max-height:calc(100vh - 56px); }
+    fieldset { display:grid; gap:8px; margin:0; padding:10px; border:1px solid #e2e8f0; border-radius:8px; }
+    legend { padding:0 4px; color:#475467; font-size:11px; font-weight:900; text-transform:uppercase; }
+    label { display:grid; gap:5px; min-width:0; color:#475467; font-size:11px; font-weight:900; text-transform:uppercase; }
+    select, input { width:100%; min-height:34px; border:1px solid #cbd5e1; border-radius:6px; background:#fff; color:#111827; padding:0 8px; font:inherit; font-size:13px; text-transform:none; }
+    input[type="checkbox"] { width:auto; min-height:auto; }
+    .row { display:grid; grid-template-columns:1fr 1fr; gap:8px; }
+    .row3 { display:grid; grid-template-columns:1fr 1fr 1fr; gap:8px; }
+    .check { display:flex; align-items:center; gap:8px; min-height:32px; color:#111827; font-size:13px; font-weight:800; text-transform:none; }
+    .actions { display:grid; grid-template-columns:1fr 1fr; gap:8px; }
+    .status { color:#475467; font-size:12px; line-height:1.35; overflow-wrap:anywhere; }
+    .stage { display:grid; grid-template-rows:auto minmax(0,1fr) auto; min-width:0; min-height:0; }
+    .bar { display:grid; grid-template-columns:minmax(0,1fr) auto; gap:10px; align-items:center; padding:10px 12px; border-bottom:1px solid var(--line); background:#fff; }
+    .meta { display:flex; flex-wrap:wrap; gap:8px; color:#475467; font-size:12px; font-weight:800; }
+    .meta span { padding:5px 7px; border:1px solid #e2e8f0; border-radius:6px; background:#f8fafc; }
+    .preview { position:relative; display:grid; place-items:center; min-width:0; min-height:0; padding:14px; background:#111827; }
+    .preview img { display:block; max-width:100%; max-height:calc(100vh - 188px); width:auto; height:auto; object-fit:contain; background:#f8fafc; box-shadow:0 14px 34px rgba(0,0,0,.28); }
+    .empty { width:min(620px,92vw); padding:18px; border:1px dashed #64748b; border-radius:8px; background:rgba(15,23,42,.72); color:#e5e7eb; text-align:center; }
+    .history { display:flex; gap:8px; overflow-x:auto; padding:10px 12px; border-top:1px solid var(--line); background:#fff; }
+    .thumb { display:grid; gap:4px; width:150px; min-width:150px; padding:6px; border:1px solid #e2e8f0; border-radius:8px; background:#f8fafc; cursor:pointer; }
+    .thumb.active { outline:3px solid var(--accent); outline-offset:1px; }
+    .thumb img { width:100%; height:82px; object-fit:cover; background:#fff; border:1px solid #e2e8f0; }
+    .thumb span { font-size:11px; color:#475467; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+    pre { margin:0; max-height:150px; overflow:auto; padding:8px; border-top:1px solid var(--line); background:#0f172a; color:#dbeafe; font-size:12px; line-height:1.35; white-space:pre-wrap; }
+    @media (max-width:1050px) { main { grid-template-columns:1fr; } aside { max-height:none; border-right:0; border-bottom:1px solid var(--line); } .preview img { max-height:64vh; } }
+  </style>
+</head>
+<body>
+  <header>
+    <h1>WxStore Plot Lab</h1>
+    <nav>
+      <a class="secondary" href="/">Map</a>
+      <a class="secondary" href="/plots">Plots</a>
+      <a class="secondary" href="/ops">Ops</a>
+    </nav>
+  </header>
+  <main>
+    <aside>
+      <fieldset>
+        <legend>Data</legend>
+        <div class="row">
+          <label>Model<select id="model"></select></label>
+          <label>Source<select id="source"></select></label>
+        </div>
+        <div class="row3">
+          <label>Date<input id="date" value="20260504" /></label>
+          <label>Cycle<input id="cycle" type="number" min="0" max="23" value="12" /></label>
+          <label>Hour<input id="hour" type="number" min="0" max="840" value="0" /></label>
+        </div>
+        <label>Product<input id="product" list="products" value="500mb_height_winds" /><datalist id="products"></datalist></label>
+      </fieldset>
+      <fieldset>
+        <legend>Domain</legend>
+        <label>Region<select id="region"></select></label>
+        <label class="check"><input id="customBounds" type="checkbox" /> Custom bounds</label>
+        <div class="row">
+          <label>West<input id="west" type="number" step="0.001" /></label>
+          <label>East<input id="east" type="number" step="0.001" /></label>
+        </div>
+        <div class="row">
+          <label>South<input id="south" type="number" step="0.001" /></label>
+          <label>North<input id="north" type="number" step="0.001" /></label>
+        </div>
+      </fieldset>
+      <fieldset>
+        <legend>Projection</legend>
+        <div class="row">
+          <label>Projection<select id="projection"></select></label>
+          <label>Style<select id="style"></select></label>
+        </div>
+        <div class="row">
+          <label>Width<input id="width" type="number" min="640" max="4096" value="1600" /></label>
+          <label>Height<input id="height" type="number" min="480" max="4096" value="900" /></label>
+        </div>
+        <div class="row">
+          <label>Supersample<input id="supersample" type="number" min="1" max="4" value="2" /></label>
+          <label>Chrome<input id="chrome" type="number" step="0.05" min="0.6" max="1.6" value="0.9" /></label>
+        </div>
+        <label>Frame pad<input id="pad" type="number" step="0.005" min="0" max="0.25" value="0.06" /></label>
+      </fieldset>
+      <fieldset>
+        <legend>Linework</legend>
+        <div class="row">
+          <label>Line boost<input id="lineBoost" type="number" min="0" max="4" value="0" /></label>
+          <label>Line alpha<input id="lineAlpha" type="number" step="0.05" min="0.25" max="2" value="1" /></label>
+        </div>
+        <div class="row3">
+          <label>Barb width<input id="barbWidth" type="number" min="1" max="8" value="2" /></label>
+          <label>Barb length<input id="barbLength" type="number" min="6" max="48" value="20" /></label>
+          <label>Barb density<input id="barbDensity" type="number" step="0.1" min="0.25" max="4" value="1" /></label>
+        </div>
+      </fieldset>
+      <fieldset>
+        <legend>Raster</legend>
+        <div class="row">
+          <label>Crop pad cells<input id="cropPad" type="number" min="0" max="5000" value="1000" /></label>
+          <label>Fill levels<input id="fillMult" type="number" min="1" max="8" value="1" /></label>
+        </div>
+        <label class="check"><input id="geoClip" type="checkbox" checked /> Geographic clip</label>
+        <label class="check"><input id="graticule" type="checkbox" checked /> Graticule</label>
+      </fieldset>
+      <div class="actions">
+        <button id="render" type="button">Render</button>
+        <button id="reset" type="button" class="secondary">Reset View</button>
+      </div>
+      <div class="status" id="status">Loading config...</div>
+    </aside>
+    <section class="stage">
+      <div class="bar">
+        <div class="meta" id="meta"></div>
+        <a id="open" class="secondary" href="" target="_blank" rel="noopener" hidden>Open</a>
+      </div>
+      <div class="preview">
+        <img id="image" alt="" hidden />
+        <div id="empty" class="empty">No render yet.</div>
+      </div>
+      <div class="history" id="history"></div>
+      <pre id="log" hidden></pre>
+    </section>
+  </main>
+  <script>
+    const $ = id => document.getElementById(id);
+    const els = {
+      model: $("model"), source: $("source"), date: $("date"), cycle: $("cycle"), hour: $("hour"),
+      product: $("product"), products: $("products"), region: $("region"), customBounds: $("customBounds"),
+      west: $("west"), east: $("east"), south: $("south"), north: $("north"), projection: $("projection"),
+      style: $("style"), width: $("width"), height: $("height"), supersample: $("supersample"),
+      chrome: $("chrome"), pad: $("pad"), lineBoost: $("lineBoost"), lineAlpha: $("lineAlpha"),
+      barbWidth: $("barbWidth"), barbLength: $("barbLength"), barbDensity: $("barbDensity"),
+      cropPad: $("cropPad"), fillMult: $("fillMult"), geoClip: $("geoClip"), graticule: $("graticule"),
+      render: $("render"), reset: $("reset"), status: $("status"), image: $("image"), empty: $("empty"),
+      meta: $("meta"), open: $("open"), history: $("history"), log: $("log")
+    };
+    let config = null;
+    let history = [];
+
+    function option(value, label = value) { return `<option value="${value}">${label}</option>`; }
+    function selectedRegion() { return config.regions.find(item => item.slug === els.region.value) || config.regions[0]; }
+    function applyRegionBounds(force = false) {
+      if (!force && els.customBounds.checked) return;
+      const b = selectedRegion().bounds;
+      els.west.value = b.west; els.east.value = b.east; els.south.value = b.south; els.north.value = b.north;
+    }
+    function number(id, fallback) {
+      const value = Number(els[id].value);
+      return Number.isFinite(value) ? value : fallback;
+    }
+    function requestBody() {
+      const body = {
+        model: els.model.value,
+        source: els.source.value,
+        date: els.date.value.trim(),
+        cycle_utc: number("cycle", 0),
+        forecast_hour: number("hour", 0),
+        region: els.region.value,
+        product: els.product.value.trim(),
+        projection_variant: els.projection.value,
+        plot_style: els.style.value,
+        output_width: number("width", 1600),
+        output_height: number("height", 900),
+        supersample_factor: number("supersample", 2),
+        chrome_scale: number("chrome", 0.9),
+        presentation_pad_fraction: number("pad", 0.06),
+        inverse_raster_crop_pad_cells: number("cropPad", 1000),
+        inverse_raster_geo_clip: els.geoClip.checked,
+        basemap_graticule: els.graticule.checked,
+        native_fill_level_multiplier: number("fillMult", 1),
+        place_label_density: 0,
+        linework_width_boost: number("lineBoost", 0),
+        linework_alpha_scale: number("lineAlpha", 1),
+        barb_width: number("barbWidth", 2),
+        barb_length_px: number("barbLength", 20),
+        barb_density: number("barbDensity", 1)
+      };
+      if (els.customBounds.checked) {
+        const base = selectedRegion().slug.replaceAll("-", "_");
+        body.domain_slug = `${base}_lab`;
+        body.bounds = {
+          west: number("west", -127),
+          east: number("east", -66),
+          south: number("south", 23),
+          north: number("north", 51.5)
+        };
+      }
+      return body;
+    }
+    function renderHistory() {
+      els.history.innerHTML = history.map((item, index) => `
+        <button class="thumb ${index === 0 ? "active" : ""}" data-index="${index}" type="button">
+          <img src="${item.artifact.url}" alt="" />
+          <span>${item.request.region} ${item.request.product}</span>
+          <span>${item.elapsed_ms} ms</span>
+        </button>`).join("");
+    }
+    function showResult(result) {
+      els.empty.hidden = true;
+      els.image.hidden = false;
+      els.image.src = result.artifact.url;
+      els.open.hidden = false;
+      els.open.href = result.artifact.url;
+      els.meta.innerHTML = [
+        `${result.request.model} ${result.request.date} ${result.request.cycle_utc}z f${String(result.request.forecast_hour).padStart(3, "0")}`,
+        result.request.region,
+        result.request.product,
+        `${result.request.output_width}x${result.request.output_height}`,
+        `${result.elapsed_ms} ms`
+      ].map(text => `<span>${text}</span>`).join("");
+      els.log.hidden = false;
+      els.log.textContent = [result.stdout, result.stderr].filter(Boolean).join("\n");
+      history.unshift(result);
+      history = history.slice(0, 18);
+      renderHistory();
+    }
+    async function render() {
+      els.render.disabled = true;
+      els.status.textContent = "Rendering real data on the node...";
+      try {
+        const res = await fetch("/v1/plot-lab/render", {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify(requestBody())
+        });
+        const data = await res.json();
+        if (!res.ok) throw new Error(data.message || data.reason || `render failed: ${res.status}`);
+        showResult(data);
+        els.status.textContent = "Render complete.";
+      } catch (err) {
+        els.status.textContent = err.message;
+      } finally {
+        els.render.disabled = false;
+      }
+    }
+    async function init() {
+      const res = await fetch("/v1/plot-lab/config", { cache: "no-store" });
+      config = await res.json();
+      els.model.innerHTML = config.models.map(item => option(item)).join("");
+      els.model.value = "gfs";
+      els.source.innerHTML = config.sources.map(item => option(item)).join("");
+      els.source.value = "nomads";
+      els.region.innerHTML = config.regions.map(item => option(item.slug, item.label)).join("");
+      els.region.value = "global";
+      els.products.innerHTML = config.products.map(item => option(item)).join("");
+      els.projection.innerHTML = config.projection_variants.map(item => option(item)).join("");
+      els.style.innerHTML = config.plot_styles.map(item => option(item)).join("");
+      applyRegionBounds(true);
+      els.status.textContent = "Ready.";
+    }
+    els.region.addEventListener("change", () => applyRegionBounds(false));
+    els.customBounds.addEventListener("change", () => applyRegionBounds(false));
+    els.render.addEventListener("click", render);
+    els.reset.addEventListener("click", () => applyRegionBounds(true));
+    els.history.addEventListener("click", event => {
+      const button = event.target.closest("[data-index]");
+      if (!button) return;
+      const item = history[Number(button.dataset.index)];
+      if (item) showResult({...item, stdout: item.stdout || "", stderr: item.stderr || ""});
+    });
+    init().catch(err => { els.status.textContent = err.message; });
+  </script>
+</body>
+</html>"####;
 
 const PROJECTION_DEMO_HTML: &str = r###"<!doctype html>
 <html lang="en">
@@ -4760,6 +5596,22 @@ async fn static_plots(
     Ok((no_store_headers(), Json(static_plots.catalog_json(&query))))
 }
 
+async fn plot_lab_config(State(state): State<Arc<AppState>>) -> (HeaderMap, Json<Value>) {
+    (no_store_headers(), Json(state.plot_lab.config_json()))
+}
+
+async fn plot_lab_render(
+    State(state): State<Arc<AppState>>,
+    Json(request): Json<PlotLabRenderRequest>,
+) -> Result<impl IntoResponse, ApiError> {
+    let plot_lab = Arc::clone(&state.plot_lab);
+    let rendered = tokio::task::spawn_blocking(move || plot_lab.render(request))
+        .await
+        .map_err(|err| internal_error(format!("plot lab render task failed: {err}")))?
+        .map_err(|err| internal_error(err.to_string()))?;
+    Ok((no_store_headers(), Json(rendered)))
+}
+
 async fn ops_live(State(state): State<Arc<AppState>>) -> Result<Json<Value>, ApiError> {
     let path = state.ops_root.join("ops").join("live.json");
     match fs::read(&path) {
@@ -4780,6 +5632,28 @@ async fn ops_live(State(state): State<Arc<AppState>>) -> Result<Json<Value>, Api
             path.display()
         ))),
     }
+}
+
+async fn plot_lab_artifact(
+    State(state): State<Arc<AppState>>,
+    AxumPath((render_id, file_name)): AxumPath<(String, String)>,
+) -> Result<Response, ApiError> {
+    let artifact = state
+        .plot_lab
+        .artifact_path(&render_id, &file_name)
+        .map_err(bad_anyhow)?;
+    let bytes = fs::read(&artifact).map_err(|err| {
+        internal_error(format!(
+            "read plot lab artifact {}: {err}",
+            artifact.display()
+        ))
+    })?;
+    Ok(bytes_response(
+        Bytes::from(bytes),
+        static_plot_artifact_content_type(&artifact),
+        false,
+        false,
+    ))
 }
 
 async fn static_plot_artifact(
