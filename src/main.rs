@@ -48,6 +48,7 @@ const MAX_TILE_ZOOM: u32 = 14;
 const STATIC_PLOT_MANIFEST_CACHE_TTL_SECS: u64 = 5;
 const STATIC_PLOT_DEFAULT_MANIFEST_LIMIT: usize = 500;
 const STATIC_PLOT_MAX_MANIFEST_LIMIT: usize = 20_000;
+const STATIC_PLOT_EXPORT_MAX_FRAMES: usize = 1000;
 
 const SOUNDING_CORE: &[&str] = &["TMP", "SPFH", "UGRD", "VGRD", "HGT"];
 const BASIC_DIAGNOSTICS: &[&str] = &[
@@ -316,6 +317,7 @@ async fn serve(args: ServeArgs) -> Result<()> {
         .route("/v1/variables", get(variables))
         .route("/v1/products", get(products))
         .route("/v1/static-plots", get(static_plots))
+        .route("/v1/static-plots/export-mp4", post(static_plots_export_mp4))
         .route("/v1/plot-lab/config", get(plot_lab_config))
         .route("/v1/plot-lab/render", post(plot_lab_render))
         .route(
@@ -1861,6 +1863,7 @@ struct StaticPlotCatalogQuery {
     date: Option<String>,
     cycle_utc: Option<u8>,
     forecast_hour: Option<u16>,
+    source: Option<String>,
     domain: Option<String>,
     member: Option<String>,
     ensemble: Option<String>,
@@ -1881,6 +1884,40 @@ struct StaticPlotCatalogQuery {
 struct StaticPlotArtifactQuery {
     path: Option<String>,
     v: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize, Default)]
+struct StaticPlotMp4ExportQuery {
+    model: Option<String>,
+    date: Option<String>,
+    cycle_utc: Option<u8>,
+    domain: Option<String>,
+    member: Option<String>,
+    ensemble: Option<String>,
+    projection: Option<String>,
+    variant: Option<String>,
+    product: Option<String>,
+    source: Option<String>,
+    #[serde(default)]
+    force: bool,
+    fps: Option<f64>,
+    crf: Option<u8>,
+    preset: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+struct StaticPlotMp4Frame {
+    forecast_hour: u16,
+    path: PathBuf,
+}
+
+struct StaticPlotMp4Export {
+    path: PathBuf,
+    relative_path: String,
+    frame_count: usize,
+    forecast_hours: Vec<u16>,
+    rebuilt: bool,
+    version: Option<String>,
 }
 
 impl StaticPlotLane {
@@ -1973,6 +2010,7 @@ impl StaticPlotLane {
                         "date": query.date,
                         "cycle_utc": query.cycle_utc,
                         "forecast_hour": query.forecast_hour,
+                        "source": query.source,
                         "domain": query.domain,
                         "member": query.member,
                         "ensemble": query.ensemble,
@@ -2032,6 +2070,138 @@ impl StaticPlotLane {
             bail!("static plot artifact is missing: {}", path.display());
         }
         Ok(path)
+    }
+
+    fn export_mp4(&self, query: &StaticPlotMp4ExportQuery) -> Result<StaticPlotMp4Export> {
+        let product = query
+            .product
+            .as_deref()
+            .and_then(|value| normalized_optional_query(Some(value)))
+            .ok_or_else(|| anyhow!("product is required"))?;
+        let mut catalog_query = StaticPlotCatalogQuery {
+            include_artifacts: false,
+            include_coverage: false,
+            catalog_index: false,
+            manifest_id: None,
+            model: query.model.clone(),
+            date: query.date.clone(),
+            cycle_utc: query.cycle_utc,
+            forecast_hour: None,
+            domain: query.domain.clone(),
+            member: query.member.clone(),
+            ensemble: query.ensemble.clone(),
+            projection: query.projection.clone(),
+            variant: query.variant.clone(),
+            product: None,
+            state: Some("all".to_string()),
+            q: None,
+            limit: None,
+            offset: None,
+            manifest_limit: None,
+            manifest_offset: None,
+            artifact_limit: None,
+            artifact_offset: None,
+            source: query.source.clone(),
+        };
+        if catalog_query.ensemble.is_none() {
+            catalog_query.ensemble = query.member.clone();
+        }
+        if catalog_query.projection.is_none() {
+            catalog_query.projection = query.variant.clone();
+        }
+
+        let mut frames = self
+            .manifests()?
+            .into_iter()
+            .filter(|record| static_plot_record_matches(record, &catalog_query))
+            .filter_map(|record| {
+                let identity = static_plot_record_identity(&record);
+                let forecast_hour = identity.forecast_hour?;
+                let artifact = record.manifest.artifacts.iter().find(|artifact| {
+                    normalized_static_plot_product_key(&artifact.artifact_key) == product
+                        && matches!(
+                            normalized_state(&artifact.state).as_str(),
+                            "complete" | "cache_hit"
+                        )
+                })?;
+                let path = resolve_static_artifact_path(&record.manifest, &artifact.relative_path);
+                if !path.is_file() || !is_static_plot_image_artifact_path(&path) {
+                    return None;
+                }
+                Some(StaticPlotMp4Frame {
+                    forecast_hour,
+                    path,
+                })
+            })
+            .collect::<Vec<_>>();
+        frames.sort_by(|a, b| {
+            a.forecast_hour
+                .cmp(&b.forecast_hour)
+                .then_with(|| a.path.cmp(&b.path))
+        });
+        frames.dedup_by_key(|frame| frame.forecast_hour);
+        if frames.is_empty() {
+            bail!("no complete image frames found for product '{product}'");
+        }
+        if frames.len() > STATIC_PLOT_EXPORT_MAX_FRAMES {
+            bail!(
+                "refusing to export {} frames; max is {}",
+                frames.len(),
+                STATIC_PLOT_EXPORT_MAX_FRAMES
+            );
+        }
+
+        let export_dir = self.root.join(".exports").join("mp4");
+        fs::create_dir_all(&export_dir)
+            .with_context(|| format!("create {}", export_dir.display()))?;
+        let fingerprint = static_plot_mp4_export_fingerprint(query, &product, &frames);
+        let first_hour = frames.first().map(|frame| frame.forecast_hour).unwrap_or(0);
+        let last_hour = frames.last().map(|frame| frame.forecast_hour).unwrap_or(0);
+        let name = format!(
+            "{}_{}_{}z_{}_{}_{}_{}_f{:03}-f{:03}_{}.mp4",
+            static_plot_export_slug(query.model.as_deref().unwrap_or("plots")),
+            static_plot_export_slug(query.date.as_deref().unwrap_or("run")),
+            query.cycle_utc.unwrap_or(0),
+            static_plot_export_slug(query.domain.as_deref().unwrap_or("domain")),
+            static_plot_export_slug(
+                query
+                    .ensemble
+                    .as_deref()
+                    .or(query.member.as_deref())
+                    .unwrap_or("control")
+            ),
+            static_plot_export_slug(
+                query
+                    .projection
+                    .as_deref()
+                    .or(query.variant.as_deref())
+                    .unwrap_or("auto")
+            ),
+            static_plot_export_slug(&product),
+            first_hour,
+            last_hour,
+            fingerprint
+        );
+        let output_path = export_dir.join(name);
+        let rebuilt = query.force || !output_path.is_file();
+        if rebuilt {
+            build_static_plot_mp4(
+                &frames,
+                &output_path,
+                query.fps.unwrap_or(2.0),
+                query.crf.unwrap_or(18),
+                query.preset.as_deref().unwrap_or("faster"),
+            )?;
+        }
+        let relative_path = relative_path_string(&self.root, &output_path);
+        Ok(StaticPlotMp4Export {
+            version: static_plot_artifact_version(&output_path),
+            path: output_path,
+            relative_path,
+            frame_count: frames.len(),
+            forecast_hours: frames.iter().map(|frame| frame.forecast_hour).collect(),
+            rebuilt,
+        })
     }
 
     fn manifests(&self) -> Result<Vec<StaticPlotManifestRecord>> {
@@ -2237,6 +2407,11 @@ fn static_plot_record_matches(
     }
     if let Some(forecast_hour) = query.forecast_hour {
         if identity.forecast_hour != Some(forecast_hour) {
+            return false;
+        }
+    }
+    if let Some(source) = query.source.as_deref() {
+        if identity.source.as_deref() != Some(source) {
             return false;
         }
     }
@@ -2458,6 +2633,154 @@ fn normalized_static_plot_product_key(key: &str) -> String {
         .or_else(|| key.trim().strip_prefix("video_mp4:"))
         .unwrap_or_else(|| key.trim())
         .to_ascii_lowercase()
+}
+
+fn is_static_plot_image_artifact_path(path: &Path) -> bool {
+    matches!(
+        path.extension()
+            .and_then(|extension| extension.to_str())
+            .unwrap_or_default()
+            .to_ascii_lowercase()
+            .as_str(),
+        "png" | "webp" | "jpg" | "jpeg"
+    )
+}
+
+fn static_plot_export_slug(value: &str) -> String {
+    let mut out = String::new();
+    for ch in value.chars() {
+        if ch.is_ascii_alphanumeric() {
+            out.push(ch.to_ascii_lowercase());
+        } else if matches!(ch, '-' | '_' | '.') {
+            out.push('_');
+        }
+    }
+    while out.contains("__") {
+        out = out.replace("__", "_");
+    }
+    out.trim_matches('_').to_string()
+}
+
+fn static_plot_mp4_export_fingerprint(
+    query: &StaticPlotMp4ExportQuery,
+    product: &str,
+    frames: &[StaticPlotMp4Frame],
+) -> String {
+    let mut hash = 0xcbf29ce484222325u64;
+    for part in [
+        query.model.as_deref().unwrap_or_default(),
+        query.date.as_deref().unwrap_or_default(),
+        query.domain.as_deref().unwrap_or_default(),
+        query
+            .ensemble
+            .as_deref()
+            .or(query.member.as_deref())
+            .unwrap_or_default(),
+        query
+            .projection
+            .as_deref()
+            .or(query.variant.as_deref())
+            .unwrap_or_default(),
+        product,
+    ] {
+        fnv1a_update(&mut hash, part.as_bytes());
+        fnv1a_update(&mut hash, b"\0");
+    }
+    fnv1a_update(&mut hash, &query.cycle_utc.unwrap_or(0).to_le_bytes());
+    for frame in frames {
+        fnv1a_update(&mut hash, &frame.forecast_hour.to_le_bytes());
+        fnv1a_update(&mut hash, frame.path.display().to_string().as_bytes());
+        if let Some(version) = static_plot_artifact_version(&frame.path) {
+            fnv1a_update(&mut hash, version.as_bytes());
+        }
+        fnv1a_update(&mut hash, b"\0");
+    }
+    format!("{hash:016x}")
+}
+
+fn fnv1a_update(hash: &mut u64, bytes: &[u8]) {
+    for byte in bytes {
+        *hash ^= u64::from(*byte);
+        *hash = hash.wrapping_mul(0x100000001b3);
+    }
+}
+
+fn build_static_plot_mp4(
+    frames: &[StaticPlotMp4Frame],
+    output_path: &Path,
+    fps: f64,
+    crf: u8,
+    preset: &str,
+) -> Result<()> {
+    if !(0.1..=30.0).contains(&fps) {
+        bail!("fps must be between 0.1 and 30");
+    }
+    if crf > 35 {
+        bail!("crf must be <= 35");
+    }
+    let preset = match preset {
+        "ultrafast" | "superfast" | "veryfast" | "faster" | "fast" | "medium" | "slow"
+        | "slower" | "veryslow" => preset,
+        _ => "faster",
+    };
+    let parent = output_path
+        .parent()
+        .ok_or_else(|| anyhow!("output mp4 has no parent directory"))?;
+    fs::create_dir_all(parent).with_context(|| format!("create {}", parent.display()))?;
+    let list_path = output_path.with_extension("ffconcat.txt");
+    let tmp_path = output_path.with_extension("tmp.mp4");
+    let frame_duration = 1.0 / fps;
+    let mut list = String::new();
+    for frame in frames {
+        let path = frame.path.display().to_string();
+        if path.contains('\n') || path.contains('\'') {
+            bail!("frame path cannot be encoded for ffmpeg concat list: {path}");
+        }
+        list.push_str("file '");
+        list.push_str(&path);
+        list.push_str("'\n");
+        list.push_str(&format!("duration {frame_duration:.6}\n"));
+    }
+    if let Some(last) = frames.last() {
+        list.push_str("file '");
+        list.push_str(&last.path.display().to_string());
+        list.push_str("'\n");
+    }
+    fs::write(&list_path, list).with_context(|| format!("write {}", list_path.display()))?;
+    let vf = "scale=trunc(iw/2)*2:trunc(ih/2)*2,fps=30,format=yuv420p";
+    let output = ProcessCommand::new("ffmpeg")
+        .arg("-hide_banner")
+        .arg("-loglevel")
+        .arg("error")
+        .arg("-y")
+        .arg("-f")
+        .arg("concat")
+        .arg("-safe")
+        .arg("0")
+        .arg("-i")
+        .arg(&list_path)
+        .arg("-vf")
+        .arg(vf)
+        .arg("-movflags")
+        .arg("+faststart")
+        .arg("-c:v")
+        .arg("libx264")
+        .arg("-preset")
+        .arg(preset)
+        .arg("-crf")
+        .arg(crf.to_string())
+        .arg(&tmp_path)
+        .stdout(Stdio::null())
+        .output()
+        .with_context(|| "run ffmpeg for static plot mp4 export")?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        bail!("ffmpeg mp4 export failed: {stderr}");
+    }
+    fs::rename(&tmp_path, output_path)
+        .with_context(|| format!("publish mp4 {}", output_path.display()))?;
+    let _ = fs::remove_file(&list_path);
+    Ok(())
 }
 
 fn normalized_optional_query(query: Option<&str>) -> Option<String> {
@@ -4290,6 +4613,10 @@ const PLOTS_HTML: &str = r#"<!doctype html>
       grid-template-columns: 1fr 1fr 1fr;
       gap: 8px;
     }
+    .export-row {
+      display: grid;
+      gap: 6px;
+    }
     .meta {
       display: grid;
       grid-template-columns: 1fr 1fr;
@@ -4453,6 +4780,10 @@ const PLOTS_HTML: &str = r#"<!doctype html>
         <button id="play" type="button">Play</button>
         <button id="next" type="button" class="secondary">Next</button>
       </div>
+      <div class="export-row">
+        <button id="exportMp4" type="button" class="secondary">Export MP4</button>
+        <div class="status" id="exportStatus"></div>
+      </div>
       <div class="meta">
         <div class="metric"><span>Frames</span><strong id="frameCount">0</strong></div>
         <div class="metric"><span>Available</span><strong id="availableCount">0</strong></div>
@@ -4493,6 +4824,8 @@ const PLOTS_HTML: &str = r#"<!doctype html>
       prev: document.getElementById("prev"),
       play: document.getElementById("play"),
       next: document.getElementById("next"),
+      exportMp4: document.getElementById("exportMp4"),
+      exportStatus: document.getElementById("exportStatus"),
       frameCount: document.getElementById("frameCount"),
       availableCount: document.getElementById("availableCount"),
       currentHour: document.getElementById("currentHour"),
@@ -4603,6 +4936,14 @@ const PLOTS_HTML: &str = r#"<!doctype html>
 
     function isVideoExtension(extension) {
       return extension === "mp4" || extension === "webm" || extension === "mov";
+    }
+
+    function htmlEscape(value) {
+      return valueText(value)
+        .replaceAll("&", "&amp;")
+        .replaceAll("<", "&lt;")
+        .replaceAll(">", "&gt;")
+        .replaceAll('"', "&quot;");
     }
 
     function artifactDownloadName(frame) {
@@ -4829,6 +5170,7 @@ const PLOTS_HTML: &str = r#"<!doctype html>
       els.prev.disabled = series.frames.length < 2;
       els.next.disabled = series.frames.length < 2;
       els.play.disabled = series.frames.length < 2;
+      els.exportMp4.disabled = series.frames.filter(item => isAvailable(item.artifact) && !isVideoExtension(artifactExtension(item.artifact))).length < 2;
       if (!frame) {
         els.plot.hidden = true;
         els.video.hidden = true;
@@ -4887,6 +5229,43 @@ const PLOTS_HTML: &str = r#"<!doctype html>
         els.empty.textContent = `${state || "pending"}: ${frame.artifact.detail || "the plot is not complete yet"}`;
       }
       preloadNeighbor();
+    }
+
+    async function exportCurrentMp4() {
+      const imageFrames = series.frames.filter(item => isAvailable(item.artifact) && !isVideoExtension(artifactExtension(item.artifact)));
+      if (imageFrames.length < 2) {
+        els.exportStatus.textContent = "Need at least two completed image frames.";
+        return;
+      }
+      const parts = selectedRunParts();
+      const params = new URLSearchParams({
+        model: parts.model,
+        date: parts.date,
+        cycle_utc: parts.cycle,
+        domain: els.domain.value,
+        ensemble: selectedEnsemble(),
+        projection: selectedVariant(),
+        product: els.product.value,
+        fps: "2",
+        crf: "18",
+        preset: "faster",
+      });
+      if (parts.source) params.set("source", parts.source);
+      els.exportMp4.disabled = true;
+      els.exportStatus.textContent = `Building MP4 from ${imageFrames.length} frames...`;
+      try {
+        const res = await fetch(`/v1/static-plots/export-mp4?${params.toString()}`, {
+          method: "POST",
+          cache: "no-store",
+        });
+        const data = await res.json();
+        if (!res.ok) throw new Error(data.message || data.reason || `MP4 export failed: ${res.status}`);
+        els.exportStatus.innerHTML = `<a href="${htmlEscape(data.url)}" download>Download MP4</a> | ${data.frame_count} frames${data.rebuilt ? "" : " cached"}`;
+      } catch (err) {
+        els.exportStatus.textContent = err.message || String(err);
+      } finally {
+        els.exportMp4.disabled = false;
+      }
     }
 
     function step(delta) {
@@ -4950,6 +5329,7 @@ const PLOTS_HTML: &str = r#"<!doctype html>
         artifact_limit: "1000",
         _: String(Date.now()),
       });
+      if (parts.source) params.set("source", parts.source);
       const res = await fetch(`/v1/static-plots?${params.toString()}`, { cache: "no-store" });
       if (!res.ok) throw new Error(`static plot frames failed: ${res.status}`);
       const data = await res.json();
@@ -5021,6 +5401,7 @@ const PLOTS_HTML: &str = r#"<!doctype html>
     els.prev.addEventListener("click", () => step(-1));
     els.next.addEventListener("click", () => step(1));
     els.play.addEventListener("click", togglePlayback);
+    els.exportMp4.addEventListener("click", exportCurrentMp4);
     els.refresh.addEventListener("click", () => {
       followLatestRun = true;
       reloadAll(true).catch(err => setStatus(err.message));
@@ -5594,6 +5975,39 @@ async fn static_plots(
         return Err(not_found("static plots root is not configured"));
     };
     Ok((no_store_headers(), Json(static_plots.catalog_json(&query))))
+}
+
+async fn static_plots_export_mp4(
+    State(state): State<Arc<AppState>>,
+    Query(query): Query<StaticPlotMp4ExportQuery>,
+) -> Result<impl IntoResponse, ApiError> {
+    let Some(static_plots) = state.static_plots.as_ref().cloned() else {
+        return Err(not_found("static plots root is not configured"));
+    };
+    let export = tokio::task::spawn_blocking(move || static_plots.export_mp4(&query))
+        .await
+        .map_err(|err| internal_error(format!("static plot mp4 export task failed: {err}")))?
+        .map_err(bad_anyhow)?;
+    let encoded_path = url_encode_query_component(&export.relative_path);
+    let mut url = format!("/v1/static-plots/artifacts/export/0?path={encoded_path}");
+    if let Some(version) = export.version.as_deref() {
+        url.push_str("&v=");
+        url.push_str(&url_encode_query_component(version));
+    }
+    Ok((
+        no_store_headers(),
+        Json(json!({
+            "schema": "wxstore.static_plots.export_mp4.v1",
+            "status": "complete",
+            "url": url,
+            "path": export.relative_path,
+            "absolute_path": export.path,
+            "version": export.version,
+            "frame_count": export.frame_count,
+            "forecast_hours": export.forecast_hours,
+            "rebuilt": export.rebuilt,
+        })),
+    ))
 }
 
 async fn plot_lab_config(State(state): State<Arc<AppState>>) -> (HeaderMap, Json<Value>) {
