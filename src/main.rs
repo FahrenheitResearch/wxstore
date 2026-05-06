@@ -124,7 +124,7 @@ enum Command {
 #[derive(Parser, Clone)]
 struct ServeArgs {
     #[arg(long)]
-    profile_store: PathBuf,
+    profile_store: Option<PathBuf>,
     #[arg(long)]
     diagnostic_store: Option<PathBuf>,
     #[arg(long)]
@@ -144,7 +144,7 @@ fn infer_ops_root(args: &ServeArgs) -> PathBuf {
         .as_ref()
         .and_then(|path| path.parent())
         .or_else(|| args.spatial_root.as_ref().and_then(|path| path.parent()))
-        .or_else(|| args.profile_store.parent())
+        .or_else(|| args.profile_store.as_ref().and_then(|path| path.parent()))
         .map(Path::to_path_buf)
         .unwrap_or_else(|| PathBuf::from("."))
 }
@@ -250,7 +250,7 @@ async fn main() -> Result<()> {
             println!(
                 "{}",
                 serde_json::to_string_pretty(&store_status(
-                    &profile,
+                    Some(profile.as_ref()),
                     diagnostic.as_ref(),
                     spatial.as_ref(),
                     static_plots.as_ref(),
@@ -291,7 +291,12 @@ async fn serve(args: ServeArgs) -> Result<()> {
         None
     };
     let state = Arc::new(AppState {
-        profile: Arc::new(ProfileLane::open(&args.profile_store)?),
+        profile: args
+            .profile_store
+            .as_ref()
+            .map(|path| ProfileLane::open(path))
+            .transpose()
+            .map(|lane| lane.map(Arc::new))?,
         diagnostic: args
             .diagnostic_store
             .as_ref()
@@ -1259,7 +1264,7 @@ fn sum_wxa_bytes(dir: &Path) -> u64 {
 }
 
 struct AppState {
-    profile: Arc<ProfileLane>,
+    profile: Option<Arc<ProfileLane>>,
     diagnostic: Option<Arc<DiagnosticLane>>,
     spatial: Option<Arc<SpatialLane>>,
     static_plots: Option<Arc<StaticPlotLane>>,
@@ -1269,6 +1274,21 @@ struct AppState {
     archive: Option<Arc<ArchiveLane>>,
     ops_root: PathBuf,
     cache: RwLock<ResponseCache>,
+}
+
+impl AppState {
+    fn profile_lane(&self) -> Result<&ProfileLane, ApiError> {
+        self.profile
+            .as_deref()
+            .ok_or_else(|| service_unavailable("profile store is not configured"))
+    }
+
+    fn profile_lane_arc(&self) -> Result<Arc<ProfileLane>, ApiError> {
+        self.profile
+            .as_ref()
+            .cloned()
+            .ok_or_else(|| service_unavailable("profile store is not configured"))
+    }
 }
 
 #[derive(Default)]
@@ -8748,9 +8768,10 @@ async fn livez() -> Json<Value> {
 
 async fn readyz(State(state): State<Arc<AppState>>) -> (StatusCode, Json<Value>) {
     let status = readiness_status(
-        &state.profile,
+        state.profile.as_deref(),
         state.diagnostic.as_deref(),
         state.spatial.as_deref(),
+        state.static_plots.as_deref(),
     );
     let ok = status.get("ok").and_then(Value::as_bool).unwrap_or(false);
     (
@@ -8765,7 +8786,7 @@ async fn readyz(State(state): State<Arc<AppState>>) -> (StatusCode, Json<Value>)
 
 async fn status(State(state): State<Arc<AppState>>) -> Json<Value> {
     Json(store_status(
-        &state.profile,
+        state.profile.as_deref(),
         state.diagnostic.as_deref(),
         state.spatial.as_deref(),
         state.static_plots.as_deref(),
@@ -8850,22 +8871,24 @@ async fn latest(
     State(state): State<Arc<AppState>>,
     AxumPath((model, domain)): AxumPath<(String, String)>,
 ) -> Result<Json<Value>, ApiError> {
-    let manifest = &state.profile.manifest;
-    if model == manifest.model && domain == manifest.domain {
-        return Ok(Json(json!({
-            "schema": "wxstore.latest.v1",
-            "model": manifest.model,
-            "domain": manifest.domain,
-            "run_id": manifest.run_id,
-            "cycle": manifest.cycle,
-                "products": {
-                    "profile_pressure_core": "ready",
-                    "diag_scalar_basic": if state.diagnostic.is_some() { "ready_sparse_v0" } else { "unavailable" },
-                    "surface_spatial": if state.spatial.is_some() { "ready" } else { "unavailable" },
-                    "static_plots": if state.static_plots.is_some() { "ready" } else { "unavailable" }
-                },
-            "canonical_run_url": format!("/v1/runs/{}/{}/{}", manifest.model, manifest.domain, manifest.run_id),
-        })));
+    if let Some(profile) = state.profile.as_deref() {
+        let manifest = &profile.manifest;
+        if model == manifest.model && domain == manifest.domain {
+            return Ok(Json(json!({
+                "schema": "wxstore.latest.v1",
+                "model": manifest.model,
+                "domain": manifest.domain,
+                "run_id": manifest.run_id,
+                "cycle": manifest.cycle,
+                    "products": {
+                        "profile_pressure_core": "ready",
+                        "diag_scalar_basic": if state.diagnostic.is_some() { "ready_sparse_v0" } else { "unavailable" },
+                        "surface_spatial": if state.spatial.is_some() { "ready" } else { "unavailable" },
+                        "static_plots": if state.static_plots.is_some() { "ready" } else { "unavailable" }
+                    },
+                "canonical_run_url": format!("/v1/runs/{}/{}/{}", manifest.model, manifest.domain, manifest.run_id),
+            })));
+        }
     }
 
     if let Some(spatial) = state.spatial.as_deref() {
@@ -8896,14 +8919,21 @@ async fn models(State(state): State<Arc<AppState>>) -> Json<Value> {
         .static_plots
         .as_deref()
         .map(StaticPlotLane::overview_json);
+    let profile_loaded = state
+        .profile
+        .as_deref()
+        .map(|profile| {
+            json!({
+                "model": profile.manifest.model,
+                "domain": profile.manifest.domain,
+                "run_id": profile.manifest.run_id,
+                "products": ["temporal_sounding", "point_bin"]
+            })
+        })
+        .unwrap_or_else(|| json!({"status": "unavailable"}));
     Json(json!({
         "schema": "wxstore.models.v1",
-        "profile_loaded": {
-            "model": state.profile.manifest.model,
-            "domain": state.profile.manifest.domain,
-            "run_id": state.profile.manifest.run_id,
-            "products": ["temporal_sounding", "point_bin"]
-        },
+        "profile_loaded": profile_loaded,
         "spatial_loaded": spatial.unwrap_or_else(|| json!({"status": "unavailable"})),
         "static_plots_loaded": static_plots.unwrap_or_else(|| json!({"status": "unavailable"})),
         "science_engine_scope": {
@@ -9085,6 +9115,19 @@ async fn products(State(state): State<Arc<AppState>>) -> Json<Value> {
         fs::read("rustwx-inventory/rustwx_hrrr_20260429_f000_capability_inventory.json")
             .ok()
             .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok());
+    let temporal_sounding = state
+        .profile
+        .as_deref()
+        .map(|profile| {
+            json!({
+                "model": profile.manifest.model,
+                "run_id": profile.manifest.run_id,
+                "variables": profile.variable_names(),
+                "hours": profile.manifest.forecast_hours,
+                "levels_hpa": profile.manifest.levels_hpa
+            })
+        })
+        .unwrap_or_else(|| json!({"status": "unavailable"}));
     Json(json!({
         "schema": "wxstore.products.v1",
         "service_products": {
@@ -9119,13 +9162,7 @@ async fn products(State(state): State<Arc<AppState>>) -> Json<Value> {
                     "10m_wind_0_24h_max"
                 ]
             },
-            "temporal_sounding": {
-                "model": state.profile.manifest.model,
-                "run_id": state.profile.manifest.run_id,
-                "variables": state.profile.variable_names(),
-                "hours": state.profile.manifest.forecast_hours,
-                "levels_hpa": state.profile.manifest.levels_hpa
-            }
+            "temporal_sounding": temporal_sounding
         },
         "rustwx_hrrr_inventory": local_inventory.unwrap_or_else(|| json!({
             "status": "not_generated",
@@ -9163,15 +9200,18 @@ fn read_grid_from_state(
         }
     }
 
-    let profile = &state.profile;
-    let profile_run_requested = run
-        .map(|value| {
-            value == "latest" || value == profile.manifest.run_id || value == profile.manifest.cycle
-        })
-        .unwrap_or(true);
-    if model == profile.manifest.model && profile_run_requested && member.is_none() {
-        if let Some(grid) = profile.read_pressure_grid_product(variable, forecast_hour)? {
-            return Ok(grid);
+    if let Some(profile) = state.profile.as_deref() {
+        let profile_run_requested = run
+            .map(|value| {
+                value == "latest"
+                    || value == profile.manifest.run_id
+                    || value == profile.manifest.cycle
+            })
+            .unwrap_or(true);
+        if model == profile.manifest.model && profile_run_requested && member.is_none() {
+            if let Some(grid) = profile.read_pressure_grid_product(variable, forecast_hour)? {
+                return Ok(grid);
+            }
         }
     }
 
@@ -9492,29 +9532,29 @@ async fn layers(
             }
         }
     }
-    if model == state.profile.manifest.model
-        && (run == "latest" || run == state.profile.manifest.run_id)
-    {
-        for level in [1000u16, 925, 850, 700, 500, 300, 250, 200] {
-            for suffix in [
-                "temperature",
-                "height",
-                "wind_speed",
-                "rh",
-                "dewpoint",
-                "specific_humidity",
-            ] {
-                let variable = format!("{level}mb_{suffix}");
-                layers.push(json!({
-                    "id": variable,
-                    "kind": "raster_grid",
-                    "source": "profile_pressure_core",
-                    "model": state.profile.manifest.model,
-                    "run": state.profile.manifest.run_id,
-                    "forecast_hours": state.profile.manifest.forecast_hours,
-                    "pressure_hpa": level,
-                    "tilejson": format!("/v1/tilejson/{}/{}/{}", state.profile.manifest.model, state.profile.manifest.run_id, variable)
-                }));
+    if let Some(profile) = state.profile.as_deref() {
+        if model == profile.manifest.model && (run == "latest" || run == profile.manifest.run_id) {
+            for level in [1000u16, 925, 850, 700, 500, 300, 250, 200] {
+                for suffix in [
+                    "temperature",
+                    "height",
+                    "wind_speed",
+                    "rh",
+                    "dewpoint",
+                    "specific_humidity",
+                ] {
+                    let variable = format!("{level}mb_{suffix}");
+                    layers.push(json!({
+                        "id": variable,
+                        "kind": "raster_grid",
+                        "source": "profile_pressure_core",
+                        "model": profile.manifest.model,
+                        "run": profile.manifest.run_id,
+                        "forecast_hours": profile.manifest.forecast_hours,
+                        "pressure_hpa": level,
+                        "tilejson": format!("/v1/tilejson/{}/{}/{}", profile.manifest.model, profile.manifest.run_id, variable)
+                    }));
+                }
             }
         }
     }
@@ -9610,8 +9650,10 @@ fn resolve_tilejson_run(state: &AppState, model: &str, run: &str) -> Result<Stri
     if let Some(spatial) = state.spatial.as_deref() {
         return spatial.resolve_run(model, Some(run));
     }
-    if run == "latest" && model == state.profile.manifest.model {
-        return Ok(state.profile.manifest.run_id.clone());
+    if let Some(profile) = state.profile.as_deref() {
+        if run == "latest" && model == profile.manifest.model {
+            return Ok(profile.manifest.run_id.clone());
+        }
     }
     Ok(run.to_string())
 }
@@ -10626,8 +10668,9 @@ async fn resolve(
 ) -> Result<Json<Value>, ApiError> {
     let lat = query_lat(&query)?;
     let lon = query_lon(&query)?;
-    let point = state.profile.locate_nearest(lat, lon).map_err(bad_anyhow)?;
-    let manifest = &state.profile.manifest;
+    let profile = state.profile_lane()?;
+    let point = profile.locate_nearest(lat, lon).map_err(bad_anyhow)?;
+    let manifest = &profile.manifest;
     Ok(Json(json!({
         "schema": "wxstore.resolve.v1",
         "model": manifest.model,
@@ -10650,8 +10693,9 @@ async fn temporal_sounding(
 ) -> Result<Response, ApiError> {
     let lat = query_lat(&query)?;
     let lon = query_lon(&query)?;
-    let point = state.profile.locate_nearest(lat, lon).map_err(bad_anyhow)?;
-    let req = RequestShape::from_point_query(&state.profile, &query).map_err(bad_anyhow)?;
+    let profile = state.profile_lane()?;
+    let point = profile.locate_nearest(lat, lon).map_err(bad_anyhow)?;
+    let req = RequestShape::from_point_query(profile, &query).map_err(bad_anyhow)?;
     json_response_for_point(state, point, lat, lon, req, headers, false).await
 }
 
@@ -10661,8 +10705,9 @@ async fn point_bin(
 ) -> Result<Response, ApiError> {
     let lat = query_lat(&query)?;
     let lon = query_lon(&query)?;
-    let point = state.profile.locate_nearest(lat, lon).map_err(bad_anyhow)?;
-    let mut req = RequestShape::from_point_query(&state.profile, &query).map_err(bad_anyhow)?;
+    let profile = state.profile_lane()?;
+    let point = profile.locate_nearest(lat, lon).map_err(bad_anyhow)?;
+    let mut req = RequestShape::from_point_query(profile, &query).map_err(bad_anyhow)?;
     req.response_format = ResponseFormat::WxBin;
     binary_response_for_point(state, point, lat, lon, req, false).await
 }
@@ -10673,9 +10718,10 @@ async fn canonical_temporal_sounding(
     AxumPath((model, domain, run, x, y)): AxumPath<(String, String, String, usize, usize)>,
     Query(query): Query<CanonicalQuery>,
 ) -> Result<Response, ApiError> {
-    validate_canonical(&state.profile, &model, &domain, &run)?;
-    let point = state.profile.grid_point(x, y).map_err(bad_anyhow)?;
-    let req = RequestShape::from_canonical_query(&state.profile, &query).map_err(bad_anyhow)?;
+    let profile = state.profile_lane()?;
+    validate_canonical(profile, &model, &domain, &run)?;
+    let point = profile.grid_point(x, y).map_err(bad_anyhow)?;
+    let req = RequestShape::from_canonical_query(profile, &query).map_err(bad_anyhow)?;
     json_response_for_point(state, point, point.lat, point.lon, req, headers, true).await
 }
 
@@ -10684,9 +10730,10 @@ async fn canonical_point_bin(
     AxumPath((model, domain, run, x, y)): AxumPath<(String, String, String, usize, usize)>,
     Query(query): Query<CanonicalQuery>,
 ) -> Result<Response, ApiError> {
-    validate_canonical(&state.profile, &model, &domain, &run)?;
-    let point = state.profile.grid_point(x, y).map_err(bad_anyhow)?;
-    let mut req = RequestShape::from_canonical_query(&state.profile, &query).map_err(bad_anyhow)?;
+    let profile = state.profile_lane()?;
+    validate_canonical(profile, &model, &domain, &run)?;
+    let point = profile.grid_point(x, y).map_err(bad_anyhow)?;
+    let mut req = RequestShape::from_canonical_query(profile, &query).map_err(bad_anyhow)?;
     req.response_format = ResponseFormat::WxBin;
     binary_response_for_point(state, point, point.lat, point.lon, req, true).await
 }
@@ -10711,14 +10758,14 @@ async fn json_response_for_point(
         )
         .await;
     }
-    let key = cache_key(&state.profile.manifest.run_id, &point, &req, "json");
+    let profile = state.profile_lane_arc()?;
+    let key = cache_key(&profile.manifest.run_id, &point, &req, "json");
     if immutable {
         if let Some(bytes) = state.cache_get(&key) {
             return Ok(bytes_response(bytes, "application/json", true, immutable));
         }
     }
 
-    let profile = state.profile.clone();
     let diagnostic = state.diagnostic.clone();
     let started = Instant::now();
     let body = tokio::task::spawn_blocking(move || {
@@ -10761,7 +10808,8 @@ async fn binary_response_for_point(
     req: RequestShape,
     immutable: bool,
 ) -> Result<Response, ApiError> {
-    let key = cache_key(&state.profile.manifest.run_id, &point, &req, "wxbin");
+    let profile = state.profile_lane_arc()?;
+    let key = cache_key(&profile.manifest.run_id, &point, &req, "wxbin");
     if immutable {
         if let Some(bytes) = state.cache_get(&key) {
             return Ok(bytes_response(
@@ -10772,7 +10820,6 @@ async fn binary_response_for_point(
             ));
         }
     }
-    let profile = state.profile.clone();
     let diagnostic = state.diagnostic.clone();
     let bytes = tokio::task::spawn_blocking(move || {
         build_binary_body(
@@ -10799,7 +10846,7 @@ async fn binary_response_for_point(
 }
 
 fn store_status(
-    profile: &ProfileLane,
+    profile: Option<&ProfileLane>,
     diagnostic: Option<&DiagnosticLane>,
     spatial: Option<&SpatialLane>,
     static_plots: Option<&StaticPlotLane>,
@@ -10807,12 +10854,19 @@ fn store_status(
     archive: Option<&ArchiveLane>,
 ) -> Value {
     let spatial_models = spatial.map(SpatialLane::model_ids).unwrap_or_default();
-    let profile_ready = !profile.manifest.variables.is_empty()
-        && !profile.manifest.forecast_hours.is_empty()
-        && !profile.manifest.levels_hpa.is_empty();
+    let profile_ready = profile
+        .map(|profile| {
+            !profile.manifest.variables.is_empty()
+                && !profile.manifest.forecast_hours.is_empty()
+                && !profile.manifest.levels_hpa.is_empty()
+        })
+        .unwrap_or(false);
     let spatial_ready = spatial.map(|_| !spatial_models.is_empty()).unwrap_or(true);
+    let static_plots_ready = static_plots.is_some();
     let ok = if spatial.is_some() {
         spatial_ready
+    } else if static_plots.is_some() {
+        static_plots_ready
     } else {
         profile_ready
     };
@@ -10831,9 +10885,11 @@ fn store_status(
             },
             "spatial_models": spatial_models
         },
-        "loaded_run": run_manifest_json(profile, diagnostic, spatial),
+        "loaded_run": profile
+            .map(|profile| run_manifest_json(profile, diagnostic, spatial))
+            .unwrap_or_else(|| json!({"status": "unavailable", "reason": "profile store is not configured"})),
         "lanes": {
-            "profile_pressure_core": profile.lane_manifest_json(),
+            "profile_pressure_core": profile.map(ProfileLane::lane_manifest_json).unwrap_or_else(|| json!({"status": "unavailable"})),
             "diag_scalar_basic": diagnostic.map(DiagnosticLane::lane_manifest_json).unwrap_or_else(|| json!({"status": "unavailable"})),
             "surface_spatial": spatial.map(SpatialLane::lane_manifest_json).unwrap_or_else(|| json!({"status": "unavailable"})),
             "static_plots": static_plots.map(StaticPlotLane::lane_manifest_json).unwrap_or_else(|| json!({"status": "unavailable"})),
@@ -10845,17 +10901,24 @@ fn store_status(
 }
 
 fn readiness_status(
-    profile: &ProfileLane,
+    profile: Option<&ProfileLane>,
     diagnostic: Option<&DiagnosticLane>,
     spatial: Option<&SpatialLane>,
+    static_plots: Option<&StaticPlotLane>,
 ) -> Value {
     let spatial_models = spatial.map(SpatialLane::model_ids).unwrap_or_default();
-    let profile_ready = !profile.manifest.variables.is_empty()
-        && !profile.manifest.forecast_hours.is_empty()
-        && !profile.manifest.levels_hpa.is_empty();
+    let profile_ready = profile
+        .map(|profile| {
+            !profile.manifest.variables.is_empty()
+                && !profile.manifest.forecast_hours.is_empty()
+                && !profile.manifest.levels_hpa.is_empty()
+        })
+        .unwrap_or(false);
     let spatial_ready = spatial.map(|_| !spatial_models.is_empty()).unwrap_or(true);
     let ok = if spatial.is_some() {
         spatial_ready
+    } else if static_plots.is_some() {
+        true
     } else {
         profile_ready
     };
@@ -10890,18 +10953,22 @@ fn default_cache_stats() -> CacheStats {
 }
 
 fn monitoring_status(
-    profile: &ProfileLane,
+    profile: Option<&ProfileLane>,
     diagnostic: Option<&DiagnosticLane>,
     spatial: Option<&SpatialLane>,
     static_plots: Option<&StaticPlotLane>,
     cache: &CacheStats,
 ) -> Value {
     let profile_hours = profile
-        .manifest
-        .forecast_hours
-        .iter()
-        .map(|hour| u32::from(*hour))
-        .collect::<Vec<_>>();
+        .map(|profile| {
+            profile
+                .manifest
+                .forecast_hours
+                .iter()
+                .map(|hour| u32::from(*hour))
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
     let spatial_monitoring = spatial
         .map(spatial_monitoring_json)
         .unwrap_or_else(|| json!({"status": "unavailable"}));
@@ -10926,10 +10993,10 @@ fn monitoring_status(
         "generated_at": utc_now_string(),
         "latest_runs": {
             "profile_pressure_core": {
-                "model": profile.manifest.model,
-                "domain": profile.manifest.domain,
-                "run_id": profile.manifest.run_id,
-                "cycle": profile.manifest.cycle
+                "model": profile.map(|profile| profile.manifest.model.as_str()),
+                "domain": profile.map(|profile| profile.manifest.domain.as_str()),
+                "run_id": profile.map(|profile| profile.manifest.run_id.as_str()),
+                "cycle": profile.map(|profile| profile.manifest.cycle.as_str())
             },
             "surface_spatial": spatial_latest_runs
         },
@@ -10939,10 +11006,10 @@ fn monitoring_status(
         },
         "product_completeness": {
             "profile_pressure_core": {
-                "status": "complete",
-                "variable_count": profile.manifest.variables.len(),
-                "forecast_hour_count": profile.manifest.forecast_hours.len(),
-                "level_count": profile.manifest.levels_hpa.len()
+                "status": if profile.is_some() { "complete" } else { "unavailable" },
+                "variable_count": profile.map(|profile| profile.manifest.variables.len()).unwrap_or(0),
+                "forecast_hour_count": profile.map(|profile| profile.manifest.forecast_hours.len()).unwrap_or(0),
+                "level_count": profile.map(|profile| profile.manifest.levels_hpa.len()).unwrap_or(0)
             },
             "diag_scalar_basic": {
                 "status": if diagnostic.is_some() { "ready_sparse_v0" } else { "unavailable" }
@@ -10970,7 +11037,7 @@ fn monitoring_status(
         },
         "api_health": {
             "livez": "configured",
-            "readyz": if !profile.manifest.variables.is_empty() { "configured" } else { "profile_unavailable" },
+            "readyz": if profile.is_some() || spatial.is_some() || static_plots.is_some() { "configured" } else { "profile_unavailable" },
             "sample_api": if spatial.is_some() { "configured" } else { "unavailable" },
             "tile_api": if spatial.is_some() { "configured" } else { "unavailable" },
             "tilejson_api": if spatial.is_some() { "configured" } else { "unavailable" }
@@ -13530,19 +13597,18 @@ fn available_hours_for_layer(
             }
         }
     }
-    if model == state.profile.manifest.model
-        && (run == "latest"
-            || run == state.profile.manifest.run_id
-            || run == state.profile.manifest.cycle)
-        && parse_pressure_grid_product(variable, &state.profile.manifest.levels_hpa).is_some()
-    {
-        return Ok(state
-            .profile
-            .manifest
-            .forecast_hours
-            .iter()
-            .map(|hour| u32::from(*hour))
-            .collect());
+    if let Some(profile) = state.profile.as_deref() {
+        if model == profile.manifest.model
+            && (run == "latest" || run == profile.manifest.run_id || run == profile.manifest.cycle)
+            && parse_pressure_grid_product(variable, &profile.manifest.levels_hpa).is_some()
+        {
+            return Ok(profile
+                .manifest
+                .forecast_hours
+                .iter()
+                .map(|hour| u32::from(*hour))
+                .collect());
+        }
     }
     bail!("no tile hours are available for {model}/{run}/{variable}");
 }
@@ -16135,6 +16201,18 @@ fn not_found(reason: impl AsRef<str>) -> ApiError {
         Json(json!({
             "error": true,
             "code": "not_found",
+            "message": reason.as_ref(),
+            "reason": reason.as_ref()
+        })),
+    )
+}
+
+fn service_unavailable(reason: impl AsRef<str>) -> ApiError {
+    (
+        StatusCode::SERVICE_UNAVAILABLE,
+        Json(json!({
+            "error": true,
+            "code": "service_unavailable",
             "message": reason.as_ref(),
             "reason": reason.as_ref()
         })),
