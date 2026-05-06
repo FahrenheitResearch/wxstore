@@ -45,7 +45,7 @@ const MAX_QUERY_HOURS: usize = 400;
 const MAX_FORECAST_VARIABLES: usize = 96;
 const MAX_GRID_JSON_CELLS: usize = 4_000_000;
 const MAX_TILE_ZOOM: u32 = 14;
-const STATIC_PLOT_MANIFEST_CACHE_TTL_DEFAULT_SECS: u64 = 120;
+const STATIC_PLOT_MANIFEST_CACHE_TTL_DEFAULT_SECS: u64 = 5;
 const STATIC_PLOT_DEFAULT_MANIFEST_LIMIT: usize = 500;
 const STATIC_PLOT_MAX_MANIFEST_LIMIT: usize = 20_000;
 const STATIC_PLOT_EXPORT_MAX_FRAMES: usize = 1000;
@@ -356,6 +356,10 @@ async fn serve(args: ServeArgs) -> Result<()> {
         )
         .route("/v1/forecast", get(forecast))
         .route("/v1/cross-section/status", get(cross_section_status))
+        .route(
+            "/v1/cross-section/status/products",
+            get(cross_section_status_products),
+        )
         .route("/v1/cross-section/products", get(cross_section_products))
         .route("/v1/cross-section/render", post(cross_section_render))
         .route(
@@ -1630,7 +1634,7 @@ impl CrossSectionLane {
         stores
     }
 
-    fn resolve_store(&self, model: &str, run: &str) -> Result<PathBuf> {
+    fn resolve_run(&self, model: &str, run: &str) -> Result<String> {
         let run = if run == "latest" {
             self.latest_run(model)
                 .ok_or_else(|| anyhow!("no latest pressure volume store for {model}"))?
@@ -1644,7 +1648,12 @@ impl CrossSectionLane {
                 store.display()
             );
         }
-        Ok(store)
+        Ok(run)
+    }
+
+    fn resolve_store(&self, model: &str, run: &str) -> Result<PathBuf> {
+        let run = self.resolve_run(model, run)?;
+        Ok(self.store_root.join(model).join(run).join("store"))
     }
 
     fn latest_run(&self, model: &str) -> Option<String> {
@@ -2133,9 +2142,9 @@ impl StaticPlotLane {
             return summary;
         }
         match self.manifests() {
-            Ok(records) => self
-                .cached_summary_json()
-                .unwrap_or_else(|| static_plot_summary_json_with_coverage(&self.root, &records, false)),
+            Ok(records) => self.cached_summary_json().unwrap_or_else(|| {
+                static_plot_summary_json_with_coverage(&self.root, &records, false)
+            }),
             Err(err) => json!({
                 "status": "error",
                 "root": self.root,
@@ -2386,9 +2395,10 @@ impl StaticPlotLane {
     fn manifests(&self) -> Result<Vec<StaticPlotManifestRecord>> {
         let ttl_secs = static_plot_manifest_cache_ttl_secs();
         if let Ok(cache) = self.manifest_cache.read() {
-            if cache.loaded_at.is_some_and(|loaded_at| {
-                loaded_at.elapsed().as_secs() < ttl_secs
-            }) {
+            if cache
+                .loaded_at
+                .is_some_and(|loaded_at| loaded_at.elapsed().as_secs() < ttl_secs)
+            {
                 return Ok(cache.records.clone());
             }
         }
@@ -2889,6 +2899,13 @@ fn static_plot_mp4_export_fingerprint(
         fnv1a_update(&mut hash, b"\0");
     }
     fnv1a_update(&mut hash, &query.cycle_utc.unwrap_or(0).to_le_bytes());
+    fnv1a_update(&mut hash, &query.fps.unwrap_or(2.0).to_bits().to_le_bytes());
+    fnv1a_update(&mut hash, &[query.crf.unwrap_or(18)]);
+    fnv1a_update(
+        &mut hash,
+        query.preset.as_deref().unwrap_or("faster").as_bytes(),
+    );
+    fnv1a_update(&mut hash, b"\0");
     for frame in frames {
         fnv1a_update(&mut hash, &frame.forecast_hour.to_le_bytes());
         fnv1a_update(&mut hash, frame.path.display().to_string().as_bytes());
@@ -5246,7 +5263,7 @@ const INDEX_HTML: &str = r#"<!doctype html>
           headers: {"Content-Type": "application/json"},
           body: JSON.stringify({
             model: els.model.value,
-            run: "latest",
+            run: els.runA.value || "latest",
             start_lat: crossStart.lat,
             start_lon: crossStart.lng,
             end_lat: crossEnd.lat,
@@ -7540,7 +7557,10 @@ struct ForecastQuery {
     member: Option<String>,
     members: Option<String>,
     hourly: Option<String>,
+    variables: Option<String>,
+    variable: Option<String>,
     forecast_hours: Option<String>,
+    forecast_hour: Option<String>,
     hours: Option<String>,
 }
 
@@ -8311,6 +8331,17 @@ async fn tilejson(
         .to_string();
     let resolved_run = resolve_tilejson_run(&state, &model, &run)?;
     let hour = query.forecast_hour.unwrap_or(0);
+    let bounds = read_grid_from_state(
+        &state,
+        &model,
+        Some(&resolved_run),
+        query.member.as_deref(),
+        &variable,
+        hour,
+    )
+    .ok()
+    .map(|grid| grid_bounds(&grid))
+    .unwrap_or([-180.0, -85.05112878, 180.0, 85.05112878]);
     let model_path = url_path_segment(&model);
     let run_path = url_path_segment(&resolved_run);
     let variable_path = url_path_segment(&variable);
@@ -8350,7 +8381,7 @@ async fn tilejson(
         "tiles": [tile_url],
         "minzoom": 0,
         "maxzoom": 9,
-        "bounds": [-180.0, -85.05112878, 180.0, 85.05112878],
+        "bounds": bounds,
         "wxstore": {
             "schema": "wxstore.mapbox_layer.v1",
             "model": model,
@@ -8386,7 +8417,7 @@ fn request_base_url(headers: &HeaderMap) -> String {
         .and_then(|value| value.to_str().ok())
         .and_then(first_csv_value)
         .filter(|value| !value.is_empty() && !value.contains('/') && !value.contains('\\'))
-        .unwrap_or("127.0.0.1:8080");
+        .unwrap_or("127.0.0.1:8895");
     format!("{proto}://{host}")
 }
 
@@ -8531,14 +8562,16 @@ fn png_tile_response(png: Bytes, immutable: bool) -> Response {
 
 async fn mapbox_layer(
     State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
     AxumPath((model, run, variable)): AxumPath<(String, String, String)>,
     Query(query): Query<MapboxLayerQuery>,
 ) -> Result<Json<Value>, ApiError> {
     let base = query
         .base_url
-        .unwrap_or_else(|| "http://127.0.0.1:8897".to_string())
+        .unwrap_or_else(|| request_base_url(&headers))
         .trim_end_matches('/')
         .to_string();
+    let resolved_run = resolve_tilejson_run(&state, &model, &run)?;
     let (min, max) = query
         .range
         .as_deref()
@@ -8554,8 +8587,14 @@ async fn mapbox_layer(
         .transparent_above
         .or_else(|| default_transparent_above_for_variable(&variable));
     let alpha = query.alpha.unwrap_or(210);
-    let hours = available_hours_for_layer(&state, &model, &run, query.member.as_deref(), &variable)
-        .map_err(bad_anyhow)?;
+    let hours = available_hours_for_layer(
+        &state,
+        &model,
+        &resolved_run,
+        query.member.as_deref(),
+        &variable,
+    )
+    .map_err(bad_anyhow)?;
     let requested_hours = query
         .hours
         .as_deref()
@@ -8576,7 +8615,7 @@ async fn mapbox_layer(
             read_grid_from_state(
                 &state,
                 &model,
-                Some(&run),
+                Some(&resolved_run),
                 query.member.as_deref(),
                 &variable,
                 *hour,
@@ -8589,11 +8628,14 @@ async fn mapbox_layer(
         .iter()
         .map(|hour| {
             let frame = format!("f{hour:03}");
+            let model_path = url_path_segment(&model);
+            let run_path = url_path_segment(&resolved_run);
+            let variable_path = url_path_segment(&variable);
             let mut tile = format!(
-                "{base}/v1/mapbox/tiles/{model}/{run}/{variable}/{frame}/{{z}}/{{x}}/{{y}}?palette={palette}&range={min},{max}"
+                "{base}/v1/mapbox/tiles/{model_path}/{run_path}/{variable_path}/{frame}/{{z}}/{{x}}/{{y}}?palette={palette}&range={min},{max}"
             );
             let mut tilejson_url =
-                format!("{base}/v1/mapbox/tilejson/{model}/{run}/{variable}/{frame}?palette={palette}&range={min},{max}");
+                format!("{base}/v1/mapbox/tilejson/{model_path}/{run_path}/{variable_path}/{frame}?palette={palette}&range={min},{max}");
             if let Some(member) = query.member.as_deref() {
                 tile.push_str("&member=");
                 tile.push_str(member);
@@ -8627,7 +8669,8 @@ async fn mapbox_layer(
     Ok(Json(json!({
         "schema": "wxstore.mapbox.layer.v1",
         "model": model,
-        "run_id": run,
+        "run_id": resolved_run,
+        "requested_run": run,
         "variable": variable,
         "bounds": bounds,
         "minzoom": 0,
@@ -8737,12 +8780,13 @@ async fn forecast(
             .filter(|item| !item.is_empty())
             .map(str::to_string)
     }));
-    let variables = split_csv(
-        query
-            .hourly
-            .as_deref()
-            .unwrap_or("temperature_2m,dew_point_2m,wind_gusts_10m"),
-    );
+    let variable_spec = query
+        .hourly
+        .as_deref()
+        .or(query.variables.as_deref())
+        .or(query.variable.as_deref())
+        .unwrap_or("temperature_2m,dew_point_2m,wind_gusts_10m");
+    let variables = split_csv(variable_spec);
     if variables.is_empty() {
         return Err(bad_request("hourly must list at least one variable"));
     }
@@ -8755,6 +8799,7 @@ async fn forecast(
     }
     let hours = query
         .forecast_hours
+        .or(query.forecast_hour)
         .or(query.hours)
         .map(|value| parse_hours_u32(&value))
         .transpose()
@@ -8782,8 +8827,20 @@ async fn cross_section_status(State(state): State<Arc<AppState>>) -> Json<Value>
     Json(state.cross_sections.status_json())
 }
 
-async fn cross_section_products() -> Json<Value> {
+async fn cross_section_status_products(State(state): State<Arc<AppState>>) -> Json<Value> {
     Json(json!({
+        "schema": "wxstore.cross_section.status_products.v1",
+        "status": state.cross_sections.status_json(),
+        "products": cross_section_products_value()
+    }))
+}
+
+async fn cross_section_products() -> Json<Value> {
+    Json(cross_section_products_value())
+}
+
+fn cross_section_products_value() -> Value {
+    json!({
         "schema": "wxstore.cross_section.products.v1",
         "products": [
             {"product": "temperature", "label": "Temperature"},
@@ -8806,7 +8863,7 @@ async fn cross_section_products() -> Json<Value> {
             {"product": "pv", "label": "Potential Vorticity"},
             {"product": "fire_wx", "label": "Fire Weather"}
         ]
-    }))
+    })
 }
 
 async fn cross_section_render(
@@ -8868,7 +8925,8 @@ fn run_cross_section_render(
     let end_lon = normalize_lon(request.end_lon);
     let model = request.model.unwrap_or_else(|| "hrrr".to_string());
     let run = request.run.unwrap_or_else(|| "latest".to_string());
-    let store = lane.resolve_store(&model, &run)?;
+    let resolved_run = lane.resolve_run(&model, &run)?;
+    let store = lane.resolve_store(&model, &resolved_run)?;
     let product = request
         .products
         .or(request.product)
@@ -8879,7 +8937,8 @@ fn run_cross_section_render(
         .unwrap_or_else(|| "Selected cross section".to_string());
     let route_id = stable_cross_section_id(&json!({
         "model": &model,
-        "run": &run,
+        "run": &resolved_run,
+        "requested_run": &run,
         "product": &product,
         "hour": hour,
         "hours": request.hours.clone(),
@@ -8896,6 +8955,8 @@ fn run_cross_section_render(
         let mut report: Value = serde_json::from_slice(&fs::read(&report_path)?)?;
         annotate_cross_section_report(lane, &route_id, &mut report);
         report["cache_hit"] = json!(true);
+        report["requested_run"] = json!(run);
+        report["resolved_run"] = json!(resolved_run);
         return Ok(report);
     }
     fs::create_dir_all(&out_dir)?;
@@ -8951,6 +9012,8 @@ fn run_cross_section_render(
     let mut report: Value = serde_json::from_slice(&fs::read(&report_path)?)?;
     annotate_cross_section_report(lane, &route_id, &mut report);
     report["cache_hit"] = json!(false);
+    report["requested_run"] = json!(run);
+    report["resolved_run"] = json!(resolved_run);
     report["server_elapsed_ms"] = json!(started.elapsed().as_millis());
     Ok(report)
 }
@@ -10657,9 +10720,17 @@ fn wxa_grid_metadata_compatible(existing: &Value, incoming: &Value) -> bool {
     }
 
     if existing_type == Some("curvilinear_latlon_sampled") {
-        return ["type", "nx", "ny", "bounds", "corners", "monotonic", "sample_strategy"]
-            .iter()
-            .all(|key| existing.get(*key) == incoming.get(*key));
+        return [
+            "type",
+            "nx",
+            "ny",
+            "bounds",
+            "corners",
+            "monotonic",
+            "sample_strategy",
+        ]
+        .iter()
+        .all(|key| existing.get(*key) == incoming.get(*key));
     }
 
     false
@@ -11664,7 +11735,10 @@ fn write_spatial_wxa_grids(
             ));
         }
         if existing_meta.run != run {
-            incompatibilities.push(format!("run existing={} incoming={}", existing_meta.run, run));
+            incompatibilities.push(format!(
+                "run existing={} incoming={}",
+                existing_meta.run, run
+            ));
         }
         if existing_meta.member.as_deref() != member {
             incompatibilities.push(format!(
