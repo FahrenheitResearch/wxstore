@@ -45,7 +45,7 @@ const MAX_QUERY_HOURS: usize = 400;
 const MAX_FORECAST_VARIABLES: usize = 96;
 const MAX_GRID_JSON_CELLS: usize = 4_000_000;
 const MAX_TILE_ZOOM: u32 = 14;
-const STATIC_PLOT_MANIFEST_CACHE_TTL_SECS: u64 = 5;
+const STATIC_PLOT_MANIFEST_CACHE_TTL_DEFAULT_SECS: u64 = 120;
 const STATIC_PLOT_DEFAULT_MANIFEST_LIMIT: usize = 500;
 const STATIC_PLOT_MAX_MANIFEST_LIMIT: usize = 20_000;
 const STATIC_PLOT_EXPORT_MAX_FRAMES: usize = 1000;
@@ -299,6 +299,7 @@ async fn serve(args: ServeArgs) -> Result<()> {
             .transpose()
             .map(|lane| lane.map(Arc::new))?,
         plot_lab: Arc::new(PlotLabLane::from_env(&ops_root)?),
+        cross_sections: Arc::new(CrossSectionLane::from_env(&ops_root)?),
         ops_root,
         cache: RwLock::new(ResponseCache::default()),
     });
@@ -306,6 +307,9 @@ async fn serve(args: ServeArgs) -> Result<()> {
     let app = Router::new()
         .route("/", get(index))
         .route("/plots", get(plots))
+        .route("/tools", get(weather_tools))
+        .route("/meteograms", get(weather_tools))
+        .route("/cross-sections", get(weather_tools))
         .route("/plot-lab", get(plot_lab))
         .route("/projection-demo", get(projection_demo))
         .route("/ops", get(ops))
@@ -351,6 +355,13 @@ async fn serve(args: ServeArgs) -> Result<()> {
             get(mapbox_raster_tile),
         )
         .route("/v1/forecast", get(forecast))
+        .route("/v1/cross-section/status", get(cross_section_status))
+        .route("/v1/cross-section/products", get(cross_section_products))
+        .route("/v1/cross-section/render", post(cross_section_render))
+        .route(
+            "/v1/cross-section/artifacts/{render_id}/{file_name}",
+            get(cross_section_artifact),
+        )
         .route("/v1/latest/{model}/{domain}", get(latest))
         .route("/v1/resolve", get(resolve))
         .route("/v1/temporal-sounding", get(temporal_sounding))
@@ -1203,6 +1214,7 @@ struct AppState {
     spatial: Option<Arc<SpatialLane>>,
     static_plots: Option<Arc<StaticPlotLane>>,
     plot_lab: Arc<PlotLabLane>,
+    cross_sections: Arc<CrossSectionLane>,
     ops_root: PathBuf,
     cache: RwLock<ResponseCache>,
 }
@@ -1237,6 +1249,12 @@ struct PlotLabLane {
     root: PathBuf,
     direct_batch_bin: PathBuf,
     cache_root: PathBuf,
+}
+
+struct CrossSectionLane {
+    renderer: PathBuf,
+    store_root: PathBuf,
+    artifact_root: PathBuf,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -1281,6 +1299,7 @@ struct PlotLabRenderRequest {
 struct StaticPlotManifestCache {
     loaded_at: Option<Instant>,
     records: Vec<StaticPlotManifestRecord>,
+    summary: Option<Value>,
 }
 
 impl PlotLabLane {
@@ -1517,6 +1536,160 @@ impl PlotLabLane {
             "stderr": truncate_string(stderr, 8000)
         }))
     }
+}
+
+impl CrossSectionLane {
+    fn from_env(ops_root: &Path) -> Result<Self> {
+        let renderer = std::env::var_os("WXSTORE_CROSS_SECTION_RENDERER")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| {
+                let node_path = PathBuf::from(
+                    "/opt/free-weather-api/build/rustwx-target/release/volume_store_cross_section_render",
+                );
+                if node_path.exists() {
+                    node_path
+                } else {
+                    ops_root.join("bin").join(if cfg!(windows) {
+                        "volume_store_cross_section_render.exe"
+                    } else {
+                        "volume_store_cross_section_render"
+                    })
+                }
+            });
+        let store_root = std::env::var_os("WXSTORE_PRESSURE_VOLUME_ROOT")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| ops_root.join("pressure_volume"));
+        let artifact_root = std::env::var_os("WXSTORE_CROSS_SECTION_ARTIFACT_ROOT")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| ops_root.join("cross_sections"));
+        fs::create_dir_all(&artifact_root).with_context(|| {
+            format!(
+                "create cross-section artifact root {}",
+                artifact_root.display()
+            )
+        })?;
+        Ok(Self {
+            renderer,
+            store_root,
+            artifact_root,
+        })
+    }
+
+    fn status_json(&self) -> Value {
+        let stores = self.available_stores();
+        let renderer_present = self.renderer.is_file();
+        let status = if renderer_present && !stores.is_empty() {
+            "ready"
+        } else if !renderer_present {
+            "renderer_missing"
+        } else {
+            "store_missing"
+        };
+        json!({
+            "schema": "wxstore.cross_section.status.v1",
+            "status": status,
+            "renderer": self.renderer,
+            "renderer_present": renderer_present,
+            "store_root": self.store_root,
+            "artifact_root": self.artifact_root,
+            "stores": stores
+        })
+    }
+
+    fn available_stores(&self) -> Vec<Value> {
+        let mut stores = Vec::new();
+        let Ok(models) = fs::read_dir(&self.store_root) else {
+            return stores;
+        };
+        for model_entry in models.flatten() {
+            let model_path = model_entry.path();
+            if !model_path.is_dir() {
+                continue;
+            }
+            let model = model_entry.file_name().to_string_lossy().to_string();
+            let Ok(runs) = fs::read_dir(&model_path) else {
+                continue;
+            };
+            for run_entry in runs.flatten() {
+                let run_path = run_entry.path();
+                let store_path = run_path.join("store");
+                if pressure_volume_store_complete(&store_path) {
+                    stores.push(json!({
+                        "model": model,
+                        "run": run_entry.file_name().to_string_lossy(),
+                        "store": store_path
+                    }));
+                }
+            }
+        }
+        stores.sort_by(|a, b| {
+            let ak = format!("{}|{}", a["model"], a["run"]);
+            let bk = format!("{}|{}", b["model"], b["run"]);
+            bk.cmp(&ak)
+        });
+        stores
+    }
+
+    fn resolve_store(&self, model: &str, run: &str) -> Result<PathBuf> {
+        let run = if run == "latest" {
+            self.latest_run(model)
+                .ok_or_else(|| anyhow!("no latest pressure volume store for {model}"))?
+        } else {
+            run.to_string()
+        };
+        let store = self.store_root.join(model).join(&run).join("store");
+        if !pressure_volume_store_complete(&store) {
+            bail!(
+                "pressure volume store is not available for {model}/{run}: {}",
+                store.display()
+            );
+        }
+        Ok(store)
+    }
+
+    fn latest_run(&self, model: &str) -> Option<String> {
+        let latest = self.store_root.join(model).join("latest.json");
+        fs::read(latest)
+            .ok()
+            .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
+            .and_then(|value| value.get("run").and_then(Value::as_str).map(str::to_string))
+            .or_else(|| {
+                let model_path = self.store_root.join(model);
+                let mut runs = list_dirs(&model_path)
+                    .into_iter()
+                    .filter(|run| {
+                        pressure_volume_store_complete(&model_path.join(run).join("store"))
+                    })
+                    .collect::<Vec<_>>();
+                runs.sort();
+                runs.pop()
+            })
+    }
+
+    fn artifact_path(&self, render_id: &str, file_name: &str) -> Result<PathBuf> {
+        if !safe_path_component(render_id) || !safe_path_component(file_name) {
+            bail!("invalid cross-section artifact path");
+        }
+        let root = fs::canonicalize(&self.artifact_root).with_context(|| {
+            format!(
+                "canonicalize cross-section artifact root {}",
+                self.artifact_root.display()
+            )
+        })?;
+        let path = root.join(render_id).join(file_name);
+        let canonical = fs::canonicalize(&path)
+            .with_context(|| format!("cross-section artifact not found: {}", path.display()))?;
+        if !canonical.starts_with(&root) {
+            bail!("cross-section artifact path escapes root");
+        }
+        Ok(canonical)
+    }
+}
+
+fn pressure_volume_store_complete(store_path: &Path) -> bool {
+    store_path.join("manifest.json").is_file()
+        && store_path.join("index.bin").is_file()
+        && store_path.join("chunks.bin").is_file()
 }
 
 fn normalize_plot_lab_request(mut request: PlotLabRenderRequest) -> Result<PlotLabRenderRequest> {
@@ -1935,7 +2108,7 @@ impl StaticPlotLane {
         json!({
             "status": "configured",
             "root": self.root,
-            "cache_ttl_seconds": STATIC_PLOT_MANIFEST_CACHE_TTL_SECS
+            "cache_ttl_seconds": static_plot_manifest_cache_ttl_secs()
         })
     }
 
@@ -1956,8 +2129,13 @@ impl StaticPlotLane {
     }
 
     fn summary_json(&self) -> Value {
+        if let Some(summary) = self.cached_summary_json() {
+            return summary;
+        }
         match self.manifests() {
-            Ok(records) => static_plot_summary_json_with_coverage(&self.root, &records, false),
+            Ok(records) => self
+                .cached_summary_json()
+                .unwrap_or_else(|| static_plot_summary_json_with_coverage(&self.root, &records, false)),
             Err(err) => json!({
                 "status": "error",
                 "root": self.root,
@@ -1970,16 +2148,17 @@ impl StaticPlotLane {
     fn catalog_json(&self, query: &StaticPlotCatalogQuery) -> Value {
         match self.manifests() {
             Ok(records) => {
-                let summary = static_plot_summary_json_with_coverage(
-                    &self.root,
-                    &records,
-                    query.include_coverage,
-                );
+                let summary = if query.include_coverage {
+                    static_plot_summary_json_with_coverage(&self.root, &records, true)
+                } else {
+                    self.cached_summary_json().unwrap_or_else(|| {
+                        static_plot_summary_json_with_coverage(&self.root, &records, false)
+                    })
+                };
                 let mut matched = records
                     .iter()
                     .filter(|record| static_plot_record_matches(record, query))
                     .collect::<Vec<_>>();
-                matched.sort_by(|a, b| static_plot_record_compare_desc(a, b));
                 if query.catalog_index && !query.include_artifacts {
                     matched = static_plot_catalog_index_records(matched);
                 }
@@ -2205,9 +2384,10 @@ impl StaticPlotLane {
     }
 
     fn manifests(&self) -> Result<Vec<StaticPlotManifestRecord>> {
+        let ttl_secs = static_plot_manifest_cache_ttl_secs();
         if let Ok(cache) = self.manifest_cache.read() {
             if cache.loaded_at.is_some_and(|loaded_at| {
-                loaded_at.elapsed().as_secs() < STATIC_PLOT_MANIFEST_CACHE_TTL_SECS
+                loaded_at.elapsed().as_secs() < ttl_secs
             }) {
                 return Ok(cache.records.clone());
             }
@@ -2227,12 +2407,34 @@ impl StaticPlotLane {
                 manifest,
             });
         }
+        records.sort_by(static_plot_record_compare_desc);
+        let summary = static_plot_summary_json_with_coverage(&self.root, &records, false);
         if let Ok(mut cache) = self.manifest_cache.write() {
             cache.loaded_at = Some(Instant::now());
             cache.records = records.clone();
+            cache.summary = Some(summary);
         }
         Ok(records)
     }
+
+    fn cached_summary_json(&self) -> Option<Value> {
+        let ttl_secs = static_plot_manifest_cache_ttl_secs();
+        let cache = self.manifest_cache.read().ok()?;
+        if !cache
+            .loaded_at
+            .is_some_and(|loaded_at| loaded_at.elapsed().as_secs() < ttl_secs)
+        {
+            return None;
+        }
+        cache.summary.clone()
+    }
+}
+
+fn static_plot_manifest_cache_ttl_secs() -> u64 {
+    std::env::var("WXSTORE_STATIC_PLOT_MANIFEST_CACHE_TTL_SECS")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .unwrap_or(STATIC_PLOT_MANIFEST_CACHE_TTL_DEFAULT_SECS)
 }
 
 fn collect_static_plot_manifest_paths(dir: &Path, out: &mut Vec<PathBuf>) -> Result<()> {
@@ -3113,6 +3315,10 @@ async fn plots() -> impl IntoResponse {
     (no_store_headers(), Html(PLOTS_HTML))
 }
 
+async fn weather_tools() -> impl IntoResponse {
+    (no_store_headers(), Html(WEATHER_TOOLS_HTML))
+}
+
 async fn plot_lab() -> impl IntoResponse {
     (no_store_headers(), Html(PLOT_LAB_HTML))
 }
@@ -3124,6 +3330,228 @@ async fn projection_demo() -> impl IntoResponse {
 async fn ops() -> impl IntoResponse {
     (no_store_headers(), Html(OPS_HTML))
 }
+
+const WEATHER_TOOLS_HTML: &str = r####"<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>WxStore Tools</title>
+  <style>
+    * { box-sizing: border-box; }
+    body { margin:0; font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; color:#111827; background:#f6f8fb; }
+    header { position:sticky; top:0; z-index:5; display:flex; align-items:center; justify-content:space-between; gap:12px; padding:10px 14px; border-bottom:1px solid #d0d5dd; background:rgba(246,248,251,.96); }
+    h1 { margin:0; font-size:18px; }
+    nav { display:flex; gap:8px; }
+    a, button { min-height:34px; border:1px solid #111827; border-radius:6px; background:#111827; color:#fff; padding:0 10px; font:inherit; font-size:13px; font-weight:800; text-decoration:none; cursor:pointer; }
+    a.secondary, button.secondary { background:#fff; color:#111827; border-color:#cbd5e1; }
+    button:disabled { opacity:.55; cursor:default; }
+    main { display:grid; grid-template-columns:minmax(320px,420px) minmax(0,1fr); min-height:calc(100vh - 56px); }
+    aside { display:grid; align-content:start; gap:10px; padding:12px; border-right:1px solid #d0d5dd; background:#fff; max-height:calc(100vh - 56px); overflow:auto; }
+    section { display:grid; gap:8px; padding:10px; border:1px solid #e2e8f0; border-radius:8px; }
+    h2 { margin:0; font-size:13px; text-transform:uppercase; color:#475467; }
+    label { display:grid; gap:5px; min-width:0; color:#475467; font-size:11px; font-weight:900; text-transform:uppercase; }
+    input, select { min-height:34px; border:1px solid #cbd5e1; border-radius:6px; padding:0 8px; color:#111827; background:#fff; font:inherit; font-size:13px; text-transform:none; }
+    .row { display:grid; grid-template-columns:1fr 1fr; gap:8px; }
+    .stage { display:grid; grid-template-rows:minmax(320px,1fr) auto; gap:10px; padding:12px; min-width:0; }
+    .panel { border:1px solid #d0d5dd; border-radius:8px; background:#fff; min-width:0; overflow:hidden; }
+    svg { width:100%; height:100%; min-height:320px; display:block; background:#fff; }
+    .status { min-height:42px; border:1px solid #d0d5dd; border-radius:8px; background:#fff; padding:10px; font-size:13px; color:#334155; white-space:pre-wrap; }
+    img { width:100%; height:auto; display:block; background:#fff; }
+  </style>
+</head>
+<body>
+  <header>
+    <h1>WxStore Tools</h1>
+    <nav>
+      <a class="secondary" href="/plots">Plots</a>
+      <a class="secondary" href="/ops">Ops</a>
+    </nav>
+  </header>
+  <main>
+    <aside>
+      <section>
+        <h2>Meteogram</h2>
+        <div class="row">
+          <label>Model<select id="model"></select></label>
+          <label>Run<select id="run"></select></label>
+        </div>
+        <div class="row">
+          <label>Lat<input id="lat" value="35.0" /></label>
+          <label>Lon<input id="lon" value="-97.0" /></label>
+        </div>
+        <label>Hours<input id="hours" value="0-18" /></label>
+        <label>Variables<select id="vars" multiple size="8"></select></label>
+        <button id="loadMeteogram" type="button">Load Meteogram</button>
+      </section>
+      <section>
+        <h2>Cross Section</h2>
+        <div class="row">
+          <label>Start Lat<input id="startLat" value="34.05" /></label>
+          <label>Start Lon<input id="startLon" value="-118.25" /></label>
+        </div>
+        <div class="row">
+          <label>End Lat<input id="endLat" value="39.32" /></label>
+          <label>End Lon<input id="endLon" value="-120.18" /></label>
+        </div>
+        <div class="row">
+          <label>Hour<input id="crossHour" value="0" /></label>
+          <label>Product<select id="crossProduct"></select></label>
+        </div>
+        <button id="loadCross" type="button">Render Cross Section</button>
+      </section>
+    </aside>
+    <div class="stage">
+      <div class="panel" id="output"><svg id="chart" viewBox="0 0 1200 620"></svg></div>
+      <div class="status" id="status">Loading...</div>
+    </div>
+  </main>
+  <script>
+    const els = {
+      model: document.getElementById("model"),
+      run: document.getElementById("run"),
+      lat: document.getElementById("lat"),
+      lon: document.getElementById("lon"),
+      hours: document.getElementById("hours"),
+      vars: document.getElementById("vars"),
+      loadMeteogram: document.getElementById("loadMeteogram"),
+      startLat: document.getElementById("startLat"),
+      startLon: document.getElementById("startLon"),
+      endLat: document.getElementById("endLat"),
+      endLon: document.getElementById("endLon"),
+      crossHour: document.getElementById("crossHour"),
+      crossProduct: document.getElementById("crossProduct"),
+      loadCross: document.getElementById("loadCross"),
+      output: document.getElementById("output"),
+      chart: document.getElementById("chart"),
+      status: document.getElementById("status"),
+    };
+    const preferred = ["temperature_2m", "dew_point_2m", "relative_humidity_2m", "wind_gusts_10m", "wind_speed_10m", "qpf_total", "composite_reflectivity"];
+    const colors = ["#dc2626", "#2563eb", "#16a34a", "#9333ea", "#ea580c", "#0891b2", "#4f46e5"];
+    let models = [];
+    function setStatus(text) { els.status.textContent = text; }
+    async function fetchJson(url, options) {
+      const res = await fetch(url, options);
+      if (!res.ok) throw new Error(`${res.status} ${await res.text()}`);
+      return res.json();
+    }
+    function modelRuns(model) {
+      return (models.find(item => item.id === model)?.runs || []).slice().sort().reverse();
+    }
+    async function loadCatalog() {
+      const data = await fetchJson("/v1/models");
+      models = data.spatial_loaded?.models || [];
+      els.model.innerHTML = models.map(item => `<option value="${item.id}">${item.id}</option>`).join("");
+      if (models.some(item => item.id === "hrrr")) els.model.value = "hrrr";
+      populateRuns();
+      await populateVariables();
+      const products = await fetchJson("/v1/cross-section/products");
+      els.crossProduct.innerHTML = (products.products || []).map(item => `<option value="${item.product}">${item.label}</option>`).join("");
+      const cs = await fetchJson("/v1/cross-section/status");
+      setStatus(`WxStore: ${models.map(item => `${item.id}:${item.latest_run}`).join(" | ")}\nCross sections: ${cs.status}`);
+    }
+    function populateRuns() {
+      const runs = modelRuns(els.model.value);
+      els.run.innerHTML = [`<option value="latest">latest</option>`].concat(runs.map(run => `<option value="${run}">${run}</option>`)).join("");
+    }
+    async function populateVariables() {
+      const data = await fetchJson(`/v1/variables?model=${encodeURIComponent(els.model.value)}&run=${encodeURIComponent(els.run.value)}`);
+      const vars = (data.variables || []).map(item => item.name || item.id || item.variable || item).filter(Boolean);
+      const ordered = preferred.filter(v => vars.includes(v)).concat(vars.filter(v => !preferred.includes(v))).slice(0, 80);
+      els.vars.innerHTML = ordered.map(v => `<option value="${v}" ${preferred.slice(0,4).includes(v) ? "selected" : ""}>${v}</option>`).join("");
+    }
+    function selectedVars() {
+      return Array.from(els.vars.selectedOptions).map(option => option.value).slice(0, 8);
+    }
+    function drawForecast(data, vars) {
+      const svg = els.chart;
+      const W = 1200, H = 620, L = 74, R = 28, T = 34, B = 82;
+      const hours = data.hourly?.time || [];
+      const series = vars.map(v => (data.hourly?.[v] || []).map(x => x == null ? NaN : Number(x)));
+      const values = series.flat().filter(Number.isFinite);
+      if (!hours.length || !values.length) {
+        svg.innerHTML = `<text x="40" y="60" font-size="22" fill="#64748b">No data</text>`;
+        return;
+      }
+      const min = Math.min(...values), max = Math.max(...values);
+      const span = Math.max(1e-6, max - min);
+      const x = i => L + (W - L - R) * (i / Math.max(1, hours.length - 1));
+      const y = v => T + (H - T - B) * (1 - (v - min) / span);
+      let html = `<rect x="0" y="0" width="${W}" height="${H}" fill="#fff"/>`;
+      for (let g=0; g<=5; g++) {
+        const yy = T + (H - T - B) * g / 5;
+        const val = max - span * g / 5;
+        html += `<line x1="${L}" y1="${yy}" x2="${W-R}" y2="${yy}" stroke="#e2e8f0"/><text x="12" y="${yy+5}" font-size="16" fill="#475467">${val.toFixed(1)}</text>`;
+      }
+      vars.forEach((v, idx) => {
+        const pts = series[idx].map((val, i) => Number.isFinite(val) ? `${x(i).toFixed(1)},${y(val).toFixed(1)}` : "").filter(Boolean).join(" ");
+        html += `<polyline points="${pts}" fill="none" stroke="${colors[idx % colors.length]}" stroke-width="4" stroke-linejoin="round" stroke-linecap="round"/>`;
+        html += `<text x="${L + idx * 170}" y="${H-28}" font-size="17" font-weight="700" fill="${colors[idx % colors.length]}">${v}</text>`;
+      });
+      html += `<line x1="${L}" y1="${T}" x2="${L}" y2="${H-B}" stroke="#111827"/><line x1="${L}" y1="${H-B}" x2="${W-R}" y2="${H-B}" stroke="#111827"/>`;
+      svg.innerHTML = html;
+    }
+    async function loadMeteogram() {
+      els.loadMeteogram.disabled = true;
+      try {
+        const vars = selectedVars();
+        const params = new URLSearchParams({
+          model: els.model.value,
+          run: els.run.value,
+          lat: els.lat.value,
+          lon: els.lon.value,
+          hours: els.hours.value,
+          hourly: vars.join(","),
+        });
+        const data = await fetchJson(`/v1/forecast?${params.toString()}`);
+        els.output.innerHTML = `<svg id="chart" viewBox="0 0 1200 620"></svg>`;
+        els.chart = document.getElementById("chart");
+        drawForecast(data, vars);
+        setStatus(`${data.model} ${data.run} ${vars.length} variable(s) in ${Number(data.generationtime_ms || 0).toFixed(1)} ms`);
+      } catch (err) {
+        setStatus(err.message);
+      } finally {
+        els.loadMeteogram.disabled = false;
+      }
+    }
+    async function loadCross() {
+      els.loadCross.disabled = true;
+      try {
+        const report = await fetchJson("/v1/cross-section/render", {
+          method: "POST",
+          headers: {"Content-Type": "application/json"},
+          body: JSON.stringify({
+            model: "hrrr",
+            run: "latest",
+            start_lat: Number(els.startLat.value),
+            start_lon: Number(els.startLon.value),
+            end_lat: Number(els.endLat.value),
+            end_lon: Number(els.endLon.value),
+            hour: Number(els.crossHour.value),
+            product: els.crossProduct.value,
+            width: 1400,
+            height: 820,
+          }),
+        });
+        const first = (report.outputs || [])[0];
+        if (first?.webp_url || first?.png_url) {
+          els.output.innerHTML = `<img src="${first.webp_url || first.png_url}" alt="cross section" />`;
+        }
+        setStatus(`Cross section ${report.cache_hit ? "cached" : "rendered"}: ${report.rendered_count || 0} output(s), ${report.total_ms || report.server_elapsed_ms || "--"} ms`);
+      } catch (err) {
+        setStatus(err.message);
+      } finally {
+        els.loadCross.disabled = false;
+      }
+    }
+    els.model.addEventListener("change", async () => { populateRuns(); await populateVariables(); });
+    els.run.addEventListener("change", populateVariables);
+    els.loadMeteogram.addEventListener("click", loadMeteogram);
+    els.loadCross.addEventListener("click", loadCross);
+    loadCatalog().then(loadMeteogram).catch(err => setStatus(err.message));
+  </script>
+</body>
+</html>"####;
 
 const PLOT_LAB_HTML: &str = r####"<!doctype html>
 <html lang="en">
@@ -3896,6 +4324,59 @@ const INDEX_HTML: &str = r#"<!doctype html>
       font-size: 12px;
       line-height: 1.35;
     }
+    .layer-stack-panel {
+      position: absolute;
+      z-index: 1000;
+      left: 12px;
+      top: 78px;
+      width: 390px;
+      max-width: calc(100vw - 24px);
+      padding: 10px;
+      border-radius: 8px;
+      background: rgba(255,255,255,0.94);
+      box-shadow: 0 8px 24px rgba(0,0,0,0.22);
+      color: #111827;
+      font-size: 12px;
+    }
+    .layer-stack-head {
+      display: grid;
+      grid-template-columns: 1fr auto auto;
+      gap: 6px;
+      align-items: center;
+      margin-bottom: 8px;
+    }
+    .layer-stack-title { font-weight: 850; color: #111827; }
+    .layer-stack-head button { height: 30px; font-size: 12px; padding: 0 8px; }
+    .layer-stack {
+      display: grid;
+      gap: 6px;
+      max-height: 190px;
+      overflow: auto;
+    }
+    .layer-row {
+      display: grid;
+      grid-template-columns: 1fr 82px 28px;
+      gap: 6px;
+      align-items: center;
+      padding: 7px 8px;
+      border: 1px solid #dbe3ee;
+      border-radius: 6px;
+      background: #f8fafc;
+    }
+    .layer-row.primary { border-color: #2563eb; box-shadow: inset 3px 0 0 #2563eb; }
+    .layer-row-title { font-weight: 850; color: #0f172a; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .layer-row-meta { margin-top: 2px; color: #64748b; font-size: 11px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .layer-row input { width: 82px; padding: 0; }
+    .layer-row button {
+      width: 28px;
+      height: 28px;
+      padding: 0;
+      border-radius: 6px;
+      background: #e2e8f0;
+      color: #0f172a;
+      border-color: #cbd5e1;
+    }
+    .layer-empty { color: #64748b; line-height: 1.35; padding: 4px 0; }
     .usage-panel {
       position: absolute;
       z-index: 1000;
@@ -3950,6 +4431,72 @@ const INDEX_HTML: &str = r#"<!doctype html>
     .picker-title { color: #cbd5e1; font-size: 11px; font-weight: 800; text-transform: uppercase; margin-bottom: 4px; }
     .picker-value { font-size: 22px; font-weight: 850; color: #fff; line-height: 1.15; }
     .picker-meta { margin-top: 5px; color: #cbd5e1; line-height: 1.35; overflow-wrap: anywhere; }
+    .analysis-panel {
+      position: absolute;
+      z-index: 1000;
+      right: 12px;
+      top: 244px;
+      width: 440px;
+      max-height: min(640px, calc(100vh - 330px));
+      overflow: auto;
+      padding: 10px;
+      border-radius: 8px;
+      background: rgba(255,255,255,0.95);
+      box-shadow: 0 8px 24px rgba(0,0,0,0.22);
+      color: #111827;
+      font-size: 12px;
+    }
+    .analysis-head {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 8px;
+      margin-bottom: 8px;
+    }
+    .analysis-title { font-weight: 850; color: #111827; }
+    .analysis-head a { color: #2563eb; font-size: 11px; font-weight: 800; text-decoration: none; }
+    .analysis-point, .analysis-path, .analysis-message {
+      padding: 7px 8px;
+      border: 1px solid #e2e8f0;
+      border-radius: 6px;
+      background: #f8fafc;
+      color: #475569;
+      line-height: 1.35;
+      overflow-wrap: anywhere;
+    }
+    .analysis-path { display: grid; grid-template-columns: 1fr 1fr; gap: 6px; margin: 8px 0; }
+    .analysis-path strong { color: #111827; }
+    .analysis-buttons { display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 6px; margin: 8px 0; }
+    .analysis-buttons button { height: 30px; font-size: 12px; padding: 0 6px; }
+    .analysis-label { margin-top: 8px; }
+    .analysis-output { margin-top: 8px; min-height: 54px; }
+    .analysis-output svg, .analysis-output img { display: block; width: 100%; border: 1px solid #e2e8f0; border-radius: 6px; background: #fff; }
+    .analysis-output img { height: auto; }
+    .analysis-meta { margin-top: 6px; color: #64748b; font-size: 11px; line-height: 1.35; }
+    .analysis-output a { color: #2563eb; font-weight: 800; text-decoration: none; }
+    .meteogram-card {
+      overflow: hidden;
+      border: 1px solid #cbd5e1;
+      border-radius: 8px;
+      background: #ffffff;
+      box-shadow: inset 0 1px 0 rgba(255,255,255,.85);
+    }
+    .meteogram-hero {
+      display: grid;
+      gap: 6px;
+      padding: 10px 12px;
+      background: linear-gradient(135deg, #0f172a, #1e3a8a 60%, #0369a1);
+      color: #fff;
+    }
+    .meteogram-kicker { font-size: 10px; font-weight: 900; letter-spacing: .08em; text-transform: uppercase; color: #bae6fd; }
+    .meteogram-title { font-size: 17px; font-weight: 900; line-height: 1.15; }
+    .meteogram-subtitle { color: #dbeafe; font-size: 11px; line-height: 1.3; overflow-wrap: anywhere; }
+    .meteogram-stats { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 6px; padding: 8px; background: #f8fafc; }
+    .meteogram-stat { display: grid; gap: 2px; min-width: 0; padding: 7px; border: 1px solid #e2e8f0; border-radius: 6px; background: #fff; }
+    .meteogram-stat span { color: #64748b; font-size: 9px; font-weight: 900; text-transform: uppercase; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+    .meteogram-stat strong { color: #0f172a; font-size: 16px; line-height: 1.1; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+    .meteogram-chart { padding: 8px; }
+    .meteogram-chart svg { border: 0; border-radius: 0; }
     .badge {
       position: absolute;
       z-index: 900;
@@ -3969,7 +4516,9 @@ const INDEX_HTML: &str = r#"<!doctype html>
       .panel { grid-template-columns: 1fr 1fr 1fr 74px; right: 12px; }
       .wide { grid-column: 1 / -1; }
       .usage-panel { left: 12px; right: 12px; bottom: 12px; width: auto; }
+      .layer-stack-panel { left: 12px; right: 12px; top: 156px; width: auto; }
       .picker-panel { left: 12px; right: 12px; top: auto; bottom: 292px; width: auto; }
+      .analysis-panel { left: 12px; right: 12px; top: auto; bottom: 432px; width: auto; max-height: 240px; }
       .status { bottom: 154px; }
       body.compare .maps { grid-template-columns: 1fr; grid-template-rows: 1fr 1fr; }
       #badgeB { left: 12px; top: calc(50% + 72px); }
@@ -3987,6 +4536,27 @@ const INDEX_HTML: &str = r#"<!doctype html>
     <div class="picker-title">Hover Picker</div>
     <div id="pickerValue" class="picker-value">move over map</div>
     <div id="pickerMeta" class="picker-meta">Samples the selected layer/hour from the WxStore grid.</div>
+  </div>
+  <div id="analysisPanel" class="analysis-panel">
+    <div class="analysis-head">
+      <div class="analysis-title">Map Tools</div>
+      <a href="/tools">full tools</a>
+    </div>
+    <div id="selectedPoint" class="analysis-point">Click the map to choose a point.</div>
+    <div class="analysis-buttons">
+      <button id="loadMeteogram" type="button">Meteogram</button>
+      <button id="setCrossStart" type="button">Set A</button>
+      <button id="setCrossEnd" type="button">Set B</button>
+    </div>
+    <label class="analysis-label">Cross Product<select id="crossProduct"></select></label>
+    <div class="analysis-path">
+      <div><strong>A</strong><br><span id="crossStartText">unset</span></div>
+      <div><strong>B</strong><br><span id="crossEndText">unset</span></div>
+    </div>
+    <button id="renderCrossSection" type="button">Render Cross Section</button>
+    <div id="analysisOutput" class="analysis-output">
+      <div class="analysis-message">Meteograms use the clicked point. Cross sections use A to B.</div>
+    </div>
   </div>
   <div class="panel">
     <label>Model<select id="model"></select></label>
@@ -4011,6 +4581,16 @@ const INDEX_HTML: &str = r#"<!doctype html>
     <label>Compare<span class="check"><input id="compare" type="checkbox" /> side</span></label>
     <button id="apply">Apply</button>
     <a class="nav-button" href="/plots">Plots</a>
+  </div>
+  <div id="layerStackPanel" class="layer-stack-panel">
+    <div class="layer-stack-head">
+      <div class="layer-stack-title">Layer Stack</div>
+      <button id="addLayer" type="button">Add</button>
+      <button id="clearLayers" type="button">Clear</button>
+    </div>
+    <div id="layerStack" class="layer-stack">
+      <div class="layer-empty">Apply replaces the map. Add stacks the selected product over existing layers.</div>
+    </div>
   </div>
   <div id="status" class="status">Loading WxStore layers...</div>
   <div id="usagePanel" class="usage-panel">
@@ -4050,6 +4630,9 @@ const INDEX_HTML: &str = r#"<!doctype html>
       max: document.getElementById("max"),
       compare: document.getElementById("compare"),
       apply: document.getElementById("apply"),
+      addLayer: document.getElementById("addLayer"),
+      clearLayers: document.getElementById("clearLayers"),
+      layerStack: document.getElementById("layerStack"),
       status: document.getElementById("status"),
       badgeA: document.getElementById("badgeA"),
       badgeB: document.getElementById("badgeB"),
@@ -4067,6 +4650,15 @@ const INDEX_HTML: &str = r#"<!doctype html>
       usageWire: document.getElementById("usageWire"),
       usageAvg: document.getElementById("usageAvg"),
       usageRate: document.getElementById("usageRate"),
+      selectedPoint: document.getElementById("selectedPoint"),
+      loadMeteogram: document.getElementById("loadMeteogram"),
+      setCrossStart: document.getElementById("setCrossStart"),
+      setCrossEnd: document.getElementById("setCrossEnd"),
+      crossProduct: document.getElementById("crossProduct"),
+      crossStartText: document.getElementById("crossStartText"),
+      crossEndText: document.getElementById("crossEndText"),
+      renderCrossSection: document.getElementById("renderCrossSection"),
+      analysisOutput: document.getElementById("analysisOutput"),
     };
     const BASEMAPS = {
       dark: {
@@ -4108,13 +4700,20 @@ const INDEX_HTML: &str = r#"<!doctype html>
     }
     mapA.on("moveend", () => syncMaps(mapA, mapB));
     mapB.on("moveend", () => syncMaps(mapB, mapA));
-    let overlayA = null;
-    let overlayB = null;
+    let activeLayers = [];
+    let applyGeneration = 0;
     let variablesByRun = {};
     let modelInfoById = {};
     let runs = [];
     let pickerAbort = null;
     let pickerLastAt = 0;
+    let selectedPoint = null;
+    let crossStart = null;
+    let crossEnd = null;
+    const analysisLayerA = L.layerGroup().addTo(mapA);
+    const analysisLayerB = L.layerGroup().addTo(mapB);
+    const meteogramPreferred = ["2m_temperature", "2m_dewpoint", "2m_relative_humidity", "10m_wind_gusts", "10m_wind_1h_max", "qpf_1h", "qpf_total", "composite_reflectivity"];
+    const analysisColors = ['#ef4444', '#2563eb', '#16a34a', '#7c3aed', '#f97316', '#0891b2', '#334155', '#db2777'];
     const usage = {
       active: false,
       startedAt: 0,
@@ -4131,6 +4730,12 @@ const INDEX_HTML: &str = r#"<!doctype html>
 
     function tileBase() {
       return location.origin;
+    }
+
+    async function fetchJson(url, options) {
+      const res = await fetch(url, options);
+      if (!res.ok) throw new Error(`${res.status} ${await res.text()}`);
+      return res.json();
     }
 
     function populateBasemaps() {
@@ -4178,6 +4783,24 @@ const INDEX_HTML: &str = r#"<!doctype html>
       return map === mapB && els.compare.checked ? els.runB.value : els.runA.value;
     }
 
+    function activeSampleConfig(map) {
+      const top = activeLayers[activeLayers.length - 1];
+      if (top) {
+        return {
+          model: top.config.model,
+          run: map === mapB && top.config.compare ? top.config.runB : top.config.runA,
+          layer: top.config.layer,
+          hour: top.config.hour,
+        };
+      }
+      return {
+        model: els.model.value,
+        run: activeRunForMap(map),
+        layer: els.layer.value,
+        hour: els.hour.value,
+      };
+    }
+
     function formatLayerValue(value, units) {
       if (value === null || value === undefined || !Number.isFinite(Number(value))) {
         return "no data";
@@ -4187,24 +4810,25 @@ const INDEX_HTML: &str = r#"<!doctype html>
       return `${n.toFixed(precision)} ${units || ""}`.trim();
     }
 
-    function setPickerWaiting(latlng, run) {
+    function setPickerWaiting(latlng, run, layer, hour) {
       els.pickerValue.textContent = "sampling...";
-      els.pickerMeta.textContent = `${els.layer.value} f${String(els.hour.value).padStart(3, "0")} | ${run} | ${latlng.lat.toFixed(4)}, ${latlng.lng.toFixed(4)}`;
+      els.pickerMeta.textContent = `${layer} f${String(hour).padStart(3, "0")} | ${run} | ${latlng.lat.toFixed(4)}, ${latlng.lng.toFixed(4)}`;
     }
 
     async function samplePicker(map, latlng) {
       const now = performance.now();
       if (now - pickerLastAt < 120) return;
       pickerLastAt = now;
-      const run = activeRunForMap(map);
-      const layer = els.layer.value;
-      const hour = els.hour.value;
+      const sample = activeSampleConfig(map);
+      const run = sample.run;
+      const layer = sample.layer;
+      const hour = sample.hour;
       if (!run || !layer || hour === "") return;
       if (pickerAbort) pickerAbort.abort();
       pickerAbort = new AbortController();
-      setPickerWaiting(latlng, run);
+      setPickerWaiting(latlng, run, layer, hour);
       const params = new URLSearchParams({
-        model: els.model.value,
+        model: sample.model,
         run,
         variable: layer,
         forecast_hour: hour,
@@ -4230,6 +4854,422 @@ const INDEX_HTML: &str = r#"<!doctype html>
       }
     }
 
+    function escapeHtml(value) {
+      return String(value).replace(/[&<>"']/g, ch => ({
+        "&": "&amp;",
+        "<": "&lt;",
+        ">": "&gt;",
+        '"': "&quot;",
+        "'": "&#39;",
+      }[ch]));
+    }
+
+    function pointLabel(point) {
+      return point ? `${point.lat.toFixed(4)}, ${point.lng.toFixed(4)}` : "unset";
+    }
+
+    function analysisMessage(text) {
+      els.analysisOutput.innerHTML = `<div class="analysis-message">${escapeHtml(text)}</div>`;
+    }
+
+    function redrawAnalysisMarkers() {
+      analysisLayerA.clearLayers();
+      analysisLayerB.clearLayers();
+      const drawOn = group => {
+        if (selectedPoint) {
+          L.circleMarker([selectedPoint.lat, selectedPoint.lng], {
+            radius: 6,
+            color: '#111827',
+            weight: 2,
+            fillColor: '#facc15',
+            fillOpacity: 0.95,
+          }).addTo(group);
+        }
+        if (crossStart) {
+          L.circleMarker([crossStart.lat, crossStart.lng], {
+            radius: 6,
+            color: '#0f766e',
+            weight: 3,
+            fillColor: '#ccfbf1',
+            fillOpacity: 0.95,
+          }).bindTooltip("A", { permanent: true, direction: "top" }).addTo(group);
+        }
+        if (crossEnd) {
+          L.circleMarker([crossEnd.lat, crossEnd.lng], {
+            radius: 6,
+            color: '#be123c',
+            weight: 3,
+            fillColor: '#ffe4e6',
+            fillOpacity: 0.95,
+          }).bindTooltip("B", { permanent: true, direction: "top" }).addTo(group);
+        }
+        if (crossStart && crossEnd) {
+          L.polyline([[crossStart.lat, crossStart.lng], [crossEnd.lat, crossEnd.lng]], {
+            color: '#facc15',
+            weight: 3,
+            opacity: 0.95,
+            dashArray: "8 6",
+          }).addTo(group);
+        }
+      };
+      drawOn(analysisLayerA);
+      drawOn(analysisLayerB);
+    }
+
+    function updateCrossText() {
+      els.crossStartText.textContent = pointLabel(crossStart);
+      els.crossEndText.textContent = pointLabel(crossEnd);
+    }
+
+    function setSelectedPoint(latlng) {
+      selectedPoint = { lat: latlng.lat, lng: latlng.lng };
+      els.selectedPoint.textContent = `Selected ${pointLabel(selectedPoint)} | ${els.model.value} ${els.runA.value || "latest"}`;
+      redrawAnalysisMarkers();
+    }
+
+    function setCrossPoint(which) {
+      if (!selectedPoint) {
+        analysisMessage("Click the map first, then set A or B.");
+        return;
+      }
+      const point = { lat: selectedPoint.lat, lng: selectedPoint.lng };
+      if (which === "start") {
+        crossStart = point;
+      } else {
+        crossEnd = point;
+      }
+      updateCrossText();
+      redrawAnalysisMarkers();
+      analysisMessage(`Cross-section point ${which === "start" ? "A" : "B"} set to ${pointLabel(point)}.`);
+    }
+
+    function compactHours(hours) {
+      const sorted = Array.from(new Set(hours.map(Number).filter(Number.isFinite))).sort((a, b) => a - b);
+      if (!sorted.length) return "";
+      const parts = [];
+      let start = sorted[0];
+      let prev = sorted[0];
+      for (let i = 1; i < sorted.length; i += 1) {
+        const hour = sorted[i];
+        if (hour === prev + 1) {
+          prev = hour;
+          continue;
+        }
+        parts.push(start === prev ? String(start) : `${start}-${prev}`);
+        start = hour;
+        prev = hour;
+      }
+      parts.push(start === prev ? String(start) : `${start}-${prev}`);
+      return parts.join(",");
+    }
+
+    function commonForecastHours(vars, availableHours) {
+      let common = null;
+      for (const variable of vars) {
+        const hours = availableHours[variable] || [];
+        if (!hours.length) continue;
+        const set = new Set(hours.map(Number));
+        common = common === null ? Array.from(set) : common.filter(hour => set.has(hour));
+      }
+      return (common || []).sort((a, b) => a - b);
+    }
+
+    async function meteogramRequest() {
+      const data = await loadVariablesFor(els.runA.value);
+      const available = new Set(data.variables || []);
+      const candidates = [els.layer.value].concat(meteogramPreferred);
+      const vars = [];
+      for (const variable of candidates) {
+        if (available.has(variable) && !vars.includes(variable)) vars.push(variable);
+        if (vars.length >= 8) break;
+      }
+      if (!vars.length && data.variables && data.variables.length) vars.push(data.variables[0]);
+      let hours = commonForecastHours(vars, data.hours || {});
+      if (!hours.length && els.hour.value !== "") hours = [Number(els.hour.value)];
+      hours = hours.slice(0, 49);
+      return { vars, hours };
+    }
+
+    function variableLabel(variable) {
+      const labels = {
+        "2m_temperature": "2m Temp",
+        "2m_dewpoint": "2m Dewpoint",
+        "2m_relative_humidity": "2m RH",
+        "10m_wind_gusts": "10m Gust",
+        "10m_wind_1h_max": "1h Wind Max",
+        "qpf_1h": "1h QPF",
+        "qpf_total": "Run QPF",
+        "composite_reflectivity": "Comp Refl",
+        "cloud_cover": "Cloud Cover",
+        "vpd_2m": "2m VPD",
+        "stp_fixed": "STP",
+      };
+      return labels[variable] || variable.replaceAll("_", " ");
+    }
+
+    function hourlySeries(data, variable) {
+      return (data.hourly?.[variable] || []).map(value => value == null ? NaN : Number(value));
+    }
+
+    function finiteValues(values) {
+      return values.filter(Number.isFinite);
+    }
+
+    function firstFinite(values) {
+      return values.find(Number.isFinite);
+    }
+
+    function maxFinite(values) {
+      const finite = finiteValues(values);
+      return finite.length ? Math.max(...finite) : NaN;
+    }
+
+    function sumFinite(values) {
+      return finiteValues(values).reduce((sum, value) => sum + value, 0);
+    }
+
+    function unitsFor(data, variable) {
+      return data.hourly_units?.[variable] || "";
+    }
+
+    function formatMetric(value, unit) {
+      if (!Number.isFinite(value)) return "--";
+      const abs = Math.abs(value);
+      const precision = abs >= 100 ? 0 : abs >= 10 ? 1 : 2;
+      return `${value.toFixed(precision)}${unit ? " " + unit : ""}`;
+    }
+
+    function htmlStat(label, value, unit) {
+      return `<div class='meteogram-stat'><span>${escapeHtml(label)}</span><strong>${escapeHtml(formatMetric(value, unit))}</strong></div>`;
+    }
+
+    function timeLabel(iso) {
+      const date = new Date(iso);
+      if (!Number.isFinite(date.getTime())) return "";
+      return `${String(date.getUTCHours()).padStart(2, "0")}z`;
+    }
+
+    function dayLabel(iso) {
+      const date = new Date(iso);
+      if (!Number.isFinite(date.getTime())) return "";
+      return date.toLocaleDateString(undefined, { weekday: "short", month: "short", day: "numeric", timeZone: "UTC" });
+    }
+
+    function buildPanelSvg(panel, times, data, layout) {
+      const { W, L, R } = layout;
+      const H = panel.height;
+      const T = panel.y;
+      const B = 24;
+      const plotTop = T + 30;
+      const plotBottom = T + H - B;
+      const plotHeight = Math.max(1, plotBottom - plotTop);
+      const series = panel.variables
+        .filter(variable => data.hourly?.[variable])
+        .map((variable, idx) => ({
+          variable,
+          values: hourlySeries(data, variable),
+          color: panel.colors[idx % panel.colors.length],
+          kind: panel.kind || "line",
+          unit: unitsFor(data, variable),
+        }));
+      if (!series.length) return "";
+      const values = series.flatMap(item => finiteValues(item.values));
+      if (!values.length) return "";
+      let min = panel.min ?? Math.min(...values);
+      let max = panel.max ?? Math.max(...values);
+      if (panel.pad !== false) {
+        const span = Math.max(1.0e-6, max - min);
+        min -= span * 0.12;
+        max += span * 0.12;
+      }
+      if (min === max) {
+        min -= 1;
+        max += 1;
+      }
+      const x = index => L + (W - L - R) * (index / Math.max(1, times.length - 1));
+      const y = value => plotTop + plotHeight * (1 - (value - min) / (max - min));
+      let html = `<g>`;
+      html += `<rect x='12' y='${T}' width='${W - 24}' height='${H - 6}' rx='10' fill='${panel.fill}' stroke='#dbe3ee'/>`;
+      html += `<text x='24' y='${T + 20}' font-size='16' font-weight='900' fill='#0f172a'>${escapeHtml(panel.title)}</text>`;
+      for (let grid = 0; grid <= 3; grid += 1) {
+        const yy = plotTop + plotHeight * grid / 3;
+        const val = max - (max - min) * grid / 3;
+        html += `<line x1='${L}' y1='${yy.toFixed(1)}' x2='${W - R}' y2='${yy.toFixed(1)}' stroke='#e2e8f0'/>`;
+        html += `<text x='18' y='${(yy + 4).toFixed(1)}' font-size='11' fill='#64748b'>${formatMetric(val, panel.axisUnit || series[0].unit)}</text>`;
+      }
+      if (panel.kind === "bar") {
+        const barWidth = Math.max(3, (W - L - R) / Math.max(2, times.length) * 0.58);
+        series.forEach(item => {
+          item.values.forEach((value, index) => {
+            if (!Number.isFinite(value)) return;
+            const xx = x(index) - barWidth / 2;
+            const yy = y(value);
+            html += `<rect x='${xx.toFixed(1)}' y='${yy.toFixed(1)}' width='${barWidth.toFixed(1)}' height='${Math.max(1, plotBottom - yy).toFixed(1)}' rx='2' fill='${item.color}' opacity='.78'/>`;
+          });
+        });
+      } else {
+        series.forEach(item => {
+          const points = item.values
+            .map((value, index) => Number.isFinite(value) ? `${x(index).toFixed(1)},${y(value).toFixed(1)}` : "")
+            .filter(Boolean)
+            .join(" ");
+          html += `<polyline points='${points}' fill='none' stroke='${item.color}' stroke-width='4' stroke-linejoin='round' stroke-linecap='round'/>`;
+          item.values.forEach((value, index) => {
+            if (!Number.isFinite(value) || index % Math.max(1, Math.ceil(times.length / 10)) !== 0) return;
+            html += `<circle cx='${x(index).toFixed(1)}' cy='${y(value).toFixed(1)}' r='3.2' fill='#fff' stroke='${item.color}' stroke-width='2'/>`;
+          });
+        });
+      }
+      let legendX = W - R - 8;
+      series.slice().reverse().forEach(item => {
+        const label = variableLabel(item.variable);
+        const width = Math.max(70, label.length * 6.5 + 22);
+        legendX -= width;
+        html += `<rect x='${legendX}' y='${T + 8}' width='${width - 8}' height='18' rx='9' fill='#fff' stroke='#e2e8f0'/>`;
+        html += `<circle cx='${legendX + 10}' cy='${T + 17}' r='4' fill='${item.color}'/>`;
+        html += `<text x='${legendX + 18}' y='${T + 21}' font-size='11' font-weight='800' fill='#334155'>${escapeHtml(label)}</text>`;
+      });
+      html += `</g>`;
+      return html;
+    }
+
+    function drawMeteogram(data, vars) {
+      const times = data.hourly && data.hourly.time ? data.hourly.time : [];
+      const values = vars.flatMap(variable => finiteValues(hourlySeries(data, variable)));
+      if (!times.length || !values.length) {
+        analysisMessage("No meteogram values came back for that point.");
+        return;
+      }
+      const temp = hourlySeries(data, "2m_temperature");
+      const dew = hourlySeries(data, "2m_dewpoint");
+      const gust = hourlySeries(data, "10m_wind_gusts");
+      const qpf = hourlySeries(data, "qpf_1h");
+      const statHtml = [
+        htmlStat("temp", firstFinite(temp), unitsFor(data, "2m_temperature")),
+        htmlStat("dewpoint", firstFinite(dew), unitsFor(data, "2m_dewpoint")),
+        htmlStat("gust max", maxFinite(gust), unitsFor(data, "10m_wind_gusts")),
+        htmlStat("qpf", sumFinite(qpf), unitsFor(data, "qpf_1h")),
+      ].join("");
+      const panels = [
+        { title: "Temperature / Moisture", variables: ["2m_temperature", "2m_dewpoint"], colors: ['#dc2626', '#2563eb'], fill: '#fff7ed', height: 150 },
+        { title: "Humidity", variables: ["2m_relative_humidity"], colors: ['#16a34a'], fill: '#f0fdf4', min: 0, max: 100, axisUnit: "%", pad: false, height: 118 },
+        { title: "Wind Gusts", variables: ["10m_wind_gusts", "10m_wind_1h_max"], colors: ['#7c3aed', '#a855f7'], fill: '#faf5ff', height: 130 },
+        { title: "Precip / Reflectivity", variables: ["qpf_1h", "composite_reflectivity"], colors: ['#0891b2', '#f97316'], fill: '#ecfeff', height: 135 },
+      ];
+      const standardPanelVars = new Set(panels.flatMap(panel => panel.variables));
+      const selectedExtras = vars.filter(variable => !standardPanelVars.has(variable));
+      if (selectedExtras.length) {
+        panels.unshift({ title: "Selected Map Layer", variables: selectedExtras.slice(0, 2), colors: ['#db2777', '#334155'], fill: '#fdf2f8', height: 125 });
+      }
+      const W = 980;
+      const L = 96;
+      const R = 28;
+      const panelGap = 12;
+      let yOffset = 18;
+      const layout = { W, L, R };
+      const chartHeight = 18 + panels.reduce((sum, panel) => sum + panel.height + panelGap, 0) + 44;
+      let chart = `<svg viewBox='0 0 ${W} ${chartHeight}' role='img' aria-label='meteogram'>`;
+      chart += `<rect x='0' y='0' width='${W}' height='${chartHeight}' fill='#f8fafc'/>`;
+      for (const panel of panels) {
+        panel.y = yOffset;
+        chart += buildPanelSvg(panel, times, data, layout);
+        yOffset += panel.height + panelGap;
+      }
+      const axisY = yOffset - 10;
+      const x = index => L + (W - L - R) * (index / Math.max(1, times.length - 1));
+      for (let index = 0; index < times.length; index += Math.max(1, Math.ceil(times.length / 8))) {
+        const xx = x(index);
+        chart += `<line x1='${xx.toFixed(1)}' y1='18' x2='${xx.toFixed(1)}' y2='${axisY}' stroke='#cbd5e1' stroke-dasharray='3 7' opacity='.45'/>`;
+        chart += `<text x='${xx.toFixed(1)}' y='${axisY + 20}' font-size='12' font-weight='800' text-anchor='middle' fill='#475569'>${timeLabel(times[index])}</text>`;
+      }
+      chart += `<text x='${L}' y='${axisY + 42}' font-size='13' font-weight='900' fill='#0f172a'>${escapeHtml(dayLabel(times[0]))} to ${escapeHtml(dayLabel(times[times.length - 1]))}</text>`;
+      chart += `</svg>`;
+      const subtitle = `${escapeHtml(data.model)} ${escapeHtml(data.run)} | ${pointLabel(selectedPoint)} | ${times.length} forecast hours | ${Number(data.generationtime_ms || 0).toFixed(1)} ms`;
+      els.analysisOutput.innerHTML =
+        `<div class='meteogram-card'>` +
+        `<div class='meteogram-hero'><div class='meteogram-kicker'>WxStore Point Forecast</div><div class='meteogram-title'>${escapeHtml(pointLabel(selectedPoint))}</div><div class='meteogram-subtitle'>${subtitle}</div></div>` +
+        `<div class='meteogram-stats'>${statHtml}</div>` +
+        `<div class='meteogram-chart'>${chart}</div>` +
+        `</div>`;
+    }
+
+    async function loadMeteogramFromMap() {
+      if (!selectedPoint) {
+        analysisMessage("Click the map first to choose the meteogram point.");
+        return;
+      }
+      els.loadMeteogram.disabled = true;
+      analysisMessage("Loading meteogram...");
+      try {
+        const request = await meteogramRequest();
+        if (!request.vars.length || !request.hours.length) throw new Error("no available forecast variables/hours for this run");
+        const params = new URLSearchParams({
+          model: els.model.value,
+          run: els.runA.value || "latest",
+          lat: selectedPoint.lat.toString(),
+          lon: selectedPoint.lng.toString(),
+          hours: compactHours(request.hours),
+          hourly: request.vars.join(","),
+        });
+        const data = await fetchJson(`/v1/forecast?${params.toString()}`);
+        drawMeteogram(data, request.vars);
+      } catch (err) {
+        analysisMessage(`Meteogram failed: ${err.message}`);
+      } finally {
+        els.loadMeteogram.disabled = false;
+      }
+    }
+
+    async function loadCrossProducts() {
+      try {
+        const data = await fetchJson("/v1/cross-section/products");
+        const products = data.products || [];
+        els.crossProduct.innerHTML = products
+          .map(item => `<option value='${escapeHtml(item.product)}'>${escapeHtml(item.label || item.product)}</option>`)
+          .join("");
+        if (products.some(item => item.product === "wind_speed")) els.crossProduct.value = "wind_speed";
+      } catch (err) {
+        els.crossProduct.innerHTML = "<option value='wind_speed'>Wind Speed</option>";
+      }
+    }
+
+    async function renderCrossSectionFromMap() {
+      if (!crossStart || !crossEnd) {
+        analysisMessage("Set A and B from clicked map points first.");
+        return;
+      }
+      els.renderCrossSection.disabled = true;
+      analysisMessage("Rendering cross section...");
+      try {
+        const report = await fetchJson("/v1/cross-section/render", {
+          method: "POST",
+          headers: {"Content-Type": "application/json"},
+          body: JSON.stringify({
+            model: els.model.value,
+            run: "latest",
+            start_lat: crossStart.lat,
+            start_lon: crossStart.lng,
+            end_lat: crossEnd.lat,
+            end_lon: crossEnd.lng,
+            hour: Number(els.hour.value || 0),
+            product: els.crossProduct.value || "wind_speed",
+            width: 1400,
+            height: 820,
+          }),
+        });
+        const first = (report.outputs || [])[0];
+        const imageUrl = first && (first.webp_url || first.png_url);
+        if (!imageUrl) throw new Error("renderer returned no image");
+        els.analysisOutput.innerHTML =
+          `<a href='${escapeHtml(imageUrl)}' target='_blank' rel='noopener'><img src='${escapeHtml(imageUrl)}' alt='cross section'></a>` +
+          `<div class='analysis-meta'>${escapeHtml(report.model || els.model.value)} ${escapeHtml(report.run || els.runA.value || "latest")} f${String(report.hour ?? els.hour.value ?? 0).padStart(3, "0")} | ${escapeHtml(els.crossProduct.value)} | ${report.cache_hit ? "cached" : "rendered"} | ${report.total_ms || report.server_elapsed_ms || "--"} ms</div>`;
+      } catch (err) {
+        analysisMessage(`Cross section failed: ${err.message}`);
+      } finally {
+        els.renderCrossSection.disabled = false;
+      }
+    }
+
     function formatBytes(bytes) {
       if (!Number.isFinite(bytes) || bytes <= 0) return "0 B";
       const units = ["B", "KB", "MB", "GB"];
@@ -4247,9 +5287,11 @@ const INDEX_HTML: &str = r#"<!doctype html>
     }
 
     function currentVisibleOverlayTiles() {
-      return [overlayA, overlayB].reduce((count, layer) => {
-        if (!layer || !layer._tiles) return count;
-        return count + Object.keys(layer._tiles).length;
+      return activeLayers.reduce((count, entry) => {
+        return count + [entry.layerA, entry.layerB].reduce((layerCount, layer) => {
+          if (!layer || !layer._tiles) return layerCount;
+          return layerCount + Object.keys(layer._tiles).length;
+        }, 0);
       }, 0);
     }
 
@@ -4421,6 +5463,7 @@ const INDEX_HTML: &str = r#"<!doctype html>
 
     async function refreshLayerList() {
       const run = els.runA.value;
+      const previous = els.layer.value;
       const data = await loadVariablesFor(run);
       els.layer.innerHTML = "";
       for (const name of data.variables) {
@@ -4430,13 +5473,18 @@ const INDEX_HTML: &str = r#"<!doctype html>
         els.layer.appendChild(opt);
       }
       const preferred = ["vpd_2m", "stp_fixed", "2m_temperature", "composite_reflectivity"].find(v => data.hours[v]);
-      if (preferred) els.layer.value = preferred;
+      if (previous && data.variables.includes(previous)) {
+        els.layer.value = previous;
+      } else if (preferred) {
+        els.layer.value = preferred;
+      }
       await refreshHours();
     }
 
     async function refreshHours() {
       const runA = await loadVariablesFor(els.runA.value);
       const runB = await loadVariablesFor(els.runB.value);
+      const previous = els.hour.value;
       const a = runA.hours[els.layer.value] || [];
       const b = runB.hours[els.layer.value] || [];
       const common = els.compare.checked ? a.filter(hour => b.includes(hour)) : a;
@@ -4447,59 +5495,200 @@ const INDEX_HTML: &str = r#"<!doctype html>
         opt.textContent = `f${String(hour).padStart(3, "0")}`;
         els.hour.appendChild(opt);
       }
+      if (previous !== "" && common.map(String).includes(String(previous))) {
+        els.hour.value = previous;
+      }
       const [palette, min, max] = defaultsFor(els.layer.value);
       els.palette.value = palette;
       els.min.value = min;
       els.max.value = max;
     }
 
-    async function layerFor(run, map, existingOverlay, badge) {
+    function currentLayerConfig() {
       const layer = els.layer.value;
       const hour = els.hour.value;
-      if (!run || !layer || hour === "") return existingOverlay;
       const palette = els.palette.value === "auto" ? defaultsFor(layer)[0] : els.palette.value;
-      const range = `${els.min.value},${els.max.value}`;
-      const url = `/v1/mapbox/layers/${els.model.value}/${run}/${layer}?hours=${hour}&palette=${encodeURIComponent(palette)}&range=${encodeURIComponent(range)}&base_url=${encodeURIComponent(tileBase())}`;
+      return {
+        id: `${Date.now()}_${Math.random().toString(16).slice(2)}`,
+        model: els.model.value,
+        runA: els.runA.value,
+        runB: els.runB.value,
+        compare: els.compare.checked,
+        layer,
+        hour,
+        palette,
+        range: `${els.min.value},${els.max.value}`,
+        opacity: 0.72,
+      };
+    }
+
+    function layerLabel(config) {
+      return `${config.model} ${config.layer} f${String(config.hour).padStart(3, "0")}`;
+    }
+
+    async function fetchLayerDoc(config, run) {
+      const url = `/v1/mapbox/layers/${config.model}/${run}/${config.layer}?hours=${config.hour}&palette=${encodeURIComponent(config.palette)}&range=${encodeURIComponent(config.range)}&base_url=${encodeURIComponent(tileBase())}`;
       const res = await fetch(url);
       if (!res.ok) throw new Error(`${run} layer failed: ${res.status}`);
       const data = await res.json();
       const frame = data.frames && data.frames[0];
       if (!frame) throw new Error(`${run} has no frame`);
-      if (existingOverlay) map.removeLayer(existingOverlay);
-      const next = L.tileLayer(frame.tiles[0], { opacity: 0.72, maxZoom: data.maxzoom || 9 }).addTo(map);
+      return { data, frame };
+    }
+
+    function addTileLayer(map, frame, data, opacity) {
+      const next = L.tileLayer(frame.tiles[0], { opacity, maxZoom: data.maxzoom || 9 }).addTo(map);
       next.on("tileload tileerror loading load", updateUsageDisplay);
-      if (data.bounds) {
-        map.fitBounds([[data.bounds[1], data.bounds[0]], [data.bounds[3], data.bounds[2]]], { padding: [18, 18] });
-      }
-      badge.textContent = `${run} f${String(hour).padStart(3, "0")}`;
       return next;
     }
 
-    async function applyLayer() {
-      document.body.classList.toggle("compare", els.compare.checked);
-      setTimeout(() => { mapA.invalidateSize(); mapB.invalidateSize(); }, 40);
-      overlayA = await layerFor(els.runA.value, mapA, overlayA, els.badgeA);
-      if (els.compare.checked) {
-        overlayB = await layerFor(els.runB.value, mapB, overlayB, els.badgeB);
-      } else if (overlayB) {
-        mapB.removeLayer(overlayB);
-        overlayB = null;
+    function fitToBounds(bounds) {
+      if (!bounds) return;
+      mapA.fitBounds([[bounds[1], bounds[0]], [bounds[3], bounds[2]]], { padding: [18, 18] });
+    }
+
+    async function createLayerEntry(config, fit) {
+      if (!config.runA || !config.layer || config.hour === "") throw new Error("choose a run, layer, and hour first");
+      const a = await fetchLayerDoc(config, config.runA);
+      const entry = {
+        id: config.id,
+        config,
+        opacity: config.opacity,
+        layerA: addTileLayer(mapA, a.frame, a.data, config.opacity),
+        layerB: null,
+        bounds: a.data.bounds,
+      };
+      try {
+        if (config.compare) {
+          const b = await fetchLayerDoc(config, config.runB);
+          entry.layerB = addTileLayer(mapB, b.frame, b.data, config.opacity);
+        }
+      } catch (err) {
+        removeLayerEntry(entry);
+        throw err;
       }
-      const palette = els.palette.value === "auto" ? defaultsFor(els.layer.value)[0] : els.palette.value;
-      setStatus(`${els.model.value} ${els.domain.value} ${els.layer.value} f${String(els.hour.value).padStart(3, "0")} | ${palette} ${els.min.value},${els.max.value} | A=${els.runA.value}${els.compare.checked ? " B=" + els.runB.value : ""}`);
+      if (fit) fitToBounds(entry.bounds);
+      return entry;
+    }
+
+    function removeLayerEntry(entry) {
+      if (entry.layerA) mapA.removeLayer(entry.layerA);
+      if (entry.layerB) mapB.removeLayer(entry.layerB);
+    }
+
+    function clearActiveLayers() {
+      for (const entry of activeLayers) removeLayerEntry(entry);
+      activeLayers = [];
+      syncLayerBadges();
+      renderLayerStack();
+      updateUsageDisplay();
+    }
+
+    function syncLayerBadges() {
+      const top = activeLayers[activeLayers.length - 1];
+      if (!top) {
+        els.badgeA.textContent = "";
+        els.badgeB.textContent = "";
+        return;
+      }
+      els.badgeA.textContent = `${top.config.runA} ${top.config.layer} f${String(top.config.hour).padStart(3, "0")}`;
+      els.badgeB.textContent = top.config.compare ? `${top.config.runB} ${top.config.layer} f${String(top.config.hour).padStart(3, "0")}` : "";
+    }
+
+    function renderLayerStack() {
+      if (!activeLayers.length) {
+        els.layerStack.innerHTML = `<div class="layer-empty">Apply replaces the map. Add stacks the selected product over existing layers.</div>`;
+        return;
+      }
+      els.layerStack.innerHTML = activeLayers.map((entry, index) => {
+        const isPrimary = index === activeLayers.length - 1;
+        const meta = `${entry.config.runA}${entry.config.compare ? " / " + entry.config.runB : ""} | ${entry.config.palette} ${entry.config.range}`;
+        return `<div class="layer-row ${isPrimary ? "primary" : ""}" data-layer-id="${entry.id}">` +
+          `<div><div class="layer-row-title">${escapeHtml(layerLabel(entry.config))}</div><div class="layer-row-meta">${escapeHtml(meta)}</div></div>` +
+          `<input type="range" min="0" max="1" step="0.05" value="${entry.opacity}" data-opacity="${entry.id}" title="Opacity" />` +
+          `<button type="button" data-remove-layer="${entry.id}" title="Remove layer">x</button>` +
+          `</div>`;
+      }).join("");
+      els.layerStack.querySelectorAll("[data-opacity]").forEach(input => {
+        input.addEventListener("input", () => {
+          const entry = activeLayers.find(item => item.id === input.dataset.opacity);
+          if (!entry) return;
+          entry.opacity = Number(input.value);
+          if (entry.layerA) entry.layerA.setOpacity(entry.opacity);
+          if (entry.layerB) entry.layerB.setOpacity(entry.opacity);
+        });
+      });
+      els.layerStack.querySelectorAll("[data-remove-layer]").forEach(button => {
+        button.addEventListener("click", () => {
+          const index = activeLayers.findIndex(item => item.id === button.dataset.removeLayer);
+          if (index < 0) return;
+          const [entry] = activeLayers.splice(index, 1);
+          removeLayerEntry(entry);
+          syncLayerBadges();
+          renderLayerStack();
+          updateUsageDisplay();
+        });
+      });
+    }
+
+    async function applyLayer() {
+      const generation = ++applyGeneration;
+      const config = currentLayerConfig();
+      document.body.classList.toggle("compare", config.compare);
+      setTimeout(() => { mapA.invalidateSize(); mapB.invalidateSize(); }, 40);
+      setStatus(`Loading ${layerLabel(config)}...`);
+      const entry = await createLayerEntry(config, true);
+      if (generation !== applyGeneration) {
+        removeLayerEntry(entry);
+        return;
+      }
+      clearActiveLayers();
+      activeLayers.push(entry);
+      syncLayerBadges();
+      renderLayerStack();
+      setStatus(`${layerLabel(config)} | ${config.palette} ${config.range} | A=${config.runA}${config.compare ? " B=" + config.runB : ""}`);
+    }
+
+    async function addLayerFromControls() {
+      const generation = ++applyGeneration;
+      const config = currentLayerConfig();
+      document.body.classList.toggle("compare", config.compare);
+      setTimeout(() => { mapA.invalidateSize(); mapB.invalidateSize(); }, 40);
+      setStatus(`Adding ${layerLabel(config)}...`);
+      const entry = await createLayerEntry(config, activeLayers.length === 0);
+      if (generation !== applyGeneration) {
+        removeLayerEntry(entry);
+        return;
+      }
+      activeLayers.push(entry);
+      syncLayerBadges();
+      renderLayerStack();
+      updateUsageDisplay();
+      setStatus(`Added ${layerLabel(config)}. ${activeLayers.length} active overlay${activeLayers.length === 1 ? "" : "s"}.`);
     }
 
     els.model.addEventListener("change", () => {
       loadRunList();
-      refreshLayerList().then(applyLayer).catch(err => setStatus(err.message));
+      refreshLayerList()
+        .then(() => setStatus(`Prepared ${els.model.value}. Click Apply to replace the map or Add to stack this product.`))
+        .catch(err => setStatus(err.message));
     });
-    els.domain.addEventListener("change", () => applyLayer().catch(err => setStatus(err.message)));
+    els.domain.addEventListener("change", () => setStatus(`Domain set to ${els.domain.value}. Click Apply or Add when ready.`));
     els.basemap.addEventListener("change", () => setBasemap(els.basemap.value));
-    els.runA.addEventListener("change", () => refreshLayerList().then(applyLayer).catch(err => setStatus(err.message)));
-    els.runB.addEventListener("change", () => refreshHours().then(applyLayer).catch(err => setStatus(err.message)));
-    els.layer.addEventListener("change", () => refreshHours().then(applyLayer).catch(err => setStatus(err.message)));
-    els.compare.addEventListener("change", () => refreshHours().then(applyLayer).catch(err => setStatus(err.message)));
+    els.runA.addEventListener("change", () => refreshLayerList().then(() => setStatus("Run A changed. Click Apply or Add to load it.")).catch(err => setStatus(err.message)));
+    els.runB.addEventListener("change", () => refreshHours().then(() => setStatus("Run B changed. Click Apply or Add to load it.")).catch(err => setStatus(err.message)));
+    els.layer.addEventListener("change", () => refreshHours().then(() => setStatus(`${els.layer.value} selected. Click Apply or Add to load it.`)).catch(err => setStatus(err.message)));
+    els.compare.addEventListener("change", () => {
+      document.body.classList.toggle("compare", els.compare.checked);
+      refreshHours().then(() => setStatus(`Compare ${els.compare.checked ? "enabled" : "disabled"}. Click Apply or Add to load this view.`)).catch(err => setStatus(err.message));
+    });
     els.apply.addEventListener("click", () => applyLayer().catch(err => setStatus(err.message)));
+    els.addLayer.addEventListener("click", () => addLayerFromControls().catch(err => setStatus(err.message)));
+    els.clearLayers.addEventListener("click", () => {
+      ++applyGeneration;
+      clearActiveLayers();
+      setStatus("Cleared overlay layers.");
+    });
     els.usageStart.addEventListener("click", startUsageMonitor);
     els.usageStop.addEventListener("click", stopUsageMonitor);
     els.usageReset.addEventListener("click", () => {
@@ -4508,9 +5697,14 @@ const INDEX_HTML: &str = r#"<!doctype html>
       resetUsageCounters();
       if (wasActive) startUsageMonitor();
     });
+    els.loadMeteogram.addEventListener("click", loadMeteogramFromMap);
+    els.setCrossStart.addEventListener("click", () => setCrossPoint("start"));
+    els.setCrossEnd.addEventListener("click", () => setCrossPoint("end"));
+    els.renderCrossSection.addEventListener("click", renderCrossSectionFromMap);
     for (const map of [mapA, mapB]) {
       map.on("moveend zoomend", updateUsageDisplay);
       map.on("mousemove", event => samplePicker(map, event.latlng));
+      map.on("click", event => setSelectedPoint(event.latlng));
       map.on("mouseout", () => {
         els.pickerValue.textContent = "move over map";
         els.pickerMeta.textContent = "Samples the selected layer/hour from the WxStore grid.";
@@ -4518,6 +5712,7 @@ const INDEX_HTML: &str = r#"<!doctype html>
     }
     populateBasemaps();
     setBasemap(els.basemap.value);
+    loadCrossProducts();
     loadModelList().then(refreshLayerList).then(applyLayer).catch(err => setStatus(err.message));
   </script>
 </body>
@@ -4616,6 +5811,43 @@ const PLOTS_HTML: &str = r#"<!doctype html>
     .export-row {
       display: grid;
       gap: 6px;
+    }
+    .load-row {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 8px;
+    }
+    .quick-panel {
+      display: grid;
+      gap: 8px;
+      padding: 9px;
+      border: 1px solid #e2e8f0;
+      border-radius: 8px;
+      background: #f8fafc;
+    }
+    .quick-title {
+      color: #475467;
+      font-size: 10px;
+      font-weight: 900;
+      text-transform: uppercase;
+    }
+    .chip-row {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 6px;
+    }
+    .chip {
+      min-height: 28px;
+      padding: 0 8px;
+      border-color: #cbd5e1;
+      background: #fff;
+      color: #111827;
+      font-size: 12px;
+    }
+    .chip.active {
+      border-color: #111827;
+      background: #111827;
+      color: #fff;
     }
     .meta {
       display: grid;
@@ -4775,6 +6007,24 @@ const PLOTS_HTML: &str = r#"<!doctype html>
       <label id="variantWrap" hidden>Projection<select id="variant"></select></label>
       <label id="ensembleWrap" hidden>GEFS<select id="ensemble"></select></label>
       <label>Product<input id="productSearch" placeholder="filter products" /><select id="product"></select></label>
+      <div class="load-row">
+        <button id="loadSelection" type="button">Load Now</button>
+        <button id="loadLatest" type="button" class="secondary">Latest</button>
+      </div>
+      <div class="quick-panel">
+        <div class="quick-title">Fast Paths</div>
+        <div class="chip-row" id="presetButtons"></div>
+        <div class="quick-title">Domains</div>
+        <div class="chip-row" id="domainButtons"></div>
+        <div class="quick-title" id="ensembleButtonsTitle">GEFS</div>
+        <div class="chip-row" id="ensembleButtons"></div>
+        <div class="quick-title" id="variantButtonsTitle">Projection</div>
+        <div class="chip-row" id="variantButtons"></div>
+        <div class="quick-title" id="productCategoryButtonsTitle">Product Groups</div>
+        <div class="chip-row" id="productCategoryButtons"></div>
+        <div class="quick-title" id="productButtonsTitle">Products</div>
+        <div class="chip-row" id="productButtons"></div>
+      </div>
       <div class="controls">
         <button id="prev" type="button" class="secondary">Prev</button>
         <button id="play" type="button">Play</button>
@@ -4820,6 +6070,18 @@ const PLOTS_HTML: &str = r#"<!doctype html>
       ensembleWrap: document.getElementById("ensembleWrap"),
       product: document.getElementById("product"),
       productSearch: document.getElementById("productSearch"),
+      loadSelection: document.getElementById("loadSelection"),
+      loadLatest: document.getElementById("loadLatest"),
+      presetButtons: document.getElementById("presetButtons"),
+      domainButtons: document.getElementById("domainButtons"),
+      ensembleButtonsTitle: document.getElementById("ensembleButtonsTitle"),
+      ensembleButtons: document.getElementById("ensembleButtons"),
+      variantButtonsTitle: document.getElementById("variantButtonsTitle"),
+      variantButtons: document.getElementById("variantButtons"),
+      productCategoryButtonsTitle: document.getElementById("productCategoryButtonsTitle"),
+      productCategoryButtons: document.getElementById("productCategoryButtons"),
+      productButtonsTitle: document.getElementById("productButtonsTitle"),
+      productButtons: document.getElementById("productButtons"),
       refresh: document.getElementById("refresh"),
       prev: document.getElementById("prev"),
       play: document.getElementById("play"),
@@ -4848,7 +6110,22 @@ const PLOTS_HTML: &str = r#"<!doctype html>
     let refreshTimer = null;
     let loadingSeries = false;
     let followLatestRun = true;
+    let stagedDirty = false;
+    let loadedAxesKey = "";
+    let loadedSelectionKey = "";
+    let stagedProductKey = "";
+    let loadedProductKey = "";
+    let activeProductCategory = "popular";
     const VARIANT_ORDER = ["auto", "geo", "lambert", "albers", "mercator", "robinson"];
+    const PRODUCT_CATEGORIES = [
+      ["popular", "Popular"],
+      ["surface", "Surface"],
+      ["upper_air", "Upper Air"],
+      ["severe", "Severe"],
+      ["precip", "Precip"],
+      ["clouds", "Clouds"],
+      ["all", "All"],
+    ];
 
     function valueText(value) {
       return value === null || value === undefined ? "" : String(value);
@@ -4986,8 +6263,377 @@ const PLOTS_HTML: &str = r#"<!doctype html>
       return els.variant.value || "auto";
     }
 
+    function currentAxesKey() {
+      return [
+        els.run.value,
+        els.domain.value,
+        selectedEnsemble(),
+        selectedVariant(),
+      ].join("|");
+    }
+
+    function currentSelectionKey() {
+      return `${currentAxesKey()}|${stagedProductKey || els.product.value || ""}`;
+    }
+
+    function axesAreDirty() {
+      return currentAxesKey() !== loadedAxesKey;
+    }
+
+    function currentSelectionLabel() {
+      const run = els.run.value ? runLabelFromKey(els.run.value) : "no run";
+      const parts = [run, els.domain.value || "no domain"];
+      const ensemble = selectedEnsemble();
+      const variant = selectedVariant();
+      if (ensemble !== "control") parts.push(ensembleLabel(ensemble));
+      if (variant !== "auto") parts.push(variantLabel(variant));
+      if (stagedProductKey || els.product.value) parts.push(productLabel(stagedProductKey || els.product.value));
+      return parts.join(" / ");
+    }
+
     function setStatus(text) {
       els.status.textContent = text;
+    }
+
+    function updateProductControlState() {
+      const staleAxes = axesAreDirty();
+      els.product.disabled = staleAxes || !series.products.length;
+      els.productSearch.disabled = staleAxes || !series.products.length;
+      if (staleAxes) {
+        els.product.innerHTML = `<option value="">Load selection first</option>`;
+        els.productCategoryButtonsTitle.hidden = true;
+        els.productCategoryButtons.hidden = true;
+        els.productCategoryButtons.innerHTML = "";
+        els.productButtonsTitle.hidden = true;
+        els.productButtons.hidden = true;
+        els.productButtons.innerHTML = "";
+      }
+    }
+
+    function stageProduct(productKey, reason = "Product staged") {
+      if (!productKey) return;
+      stagedProductKey = productKey;
+      selectOption(els.product, productKey);
+      selectedIndex = 0;
+      markSelectionDirty(reason);
+    }
+
+    function markSelectionDirty(reason = "Selection changed") {
+      stagedDirty = currentSelectionKey() !== loadedSelectionKey;
+      els.loadSelection.disabled = !els.run.value || !els.domain.value;
+      updateProductControlState();
+      if (stagedDirty) {
+        stopPlayback();
+        els.exportMp4.disabled = true;
+        setStatus(`${reason}. Press Load Now for ${currentSelectionLabel()}.`);
+      }
+      renderQuickButtons();
+    }
+
+    function selectOption(select, value) {
+      const option = Array.from(select.options).find(item => item.value === value);
+      if (!option) return false;
+      select.value = value;
+      return true;
+    }
+
+    function orderedSubset(values, preferred) {
+      const seen = new Set();
+      const out = [];
+      for (const value of preferred) {
+        if (values.includes(value) && !seen.has(value)) {
+          out.push(value);
+          seen.add(value);
+        }
+      }
+      for (const value of values) {
+        if (!seen.has(value)) out.push(value);
+      }
+      return out;
+    }
+
+    function productCategory(key) {
+      const value = normalizeProduct(key).toLowerCase();
+      if (/cape|cin|stp|srh|shear|helicity|lapse|sig_tor|supercell|updraft/.test(value)) return "severe";
+      if (/qpf|precip|rain|snow|sleet|ice|reflectivity|refd|cref/.test(value)) return "precip";
+      if (/cloud|ceil|visibility|fog|cig/.test(value)) return "clouds";
+      if (/850mb|700mb|500mb|300mb|250mb|200mb|mb_|height_winds|temperature_height_winds|rh_height_winds|vorticity|jet/.test(value)) return "upper_air";
+      if (/2m|10m|surface|mslp|pressure|dewpoint|relative_humidity|apparent|wind|gust|temperature/.test(value)) return "surface";
+      return "popular";
+    }
+
+    function productCategoryLabel(key) {
+      return PRODUCT_CATEGORIES.find(item => item[0] === key)?.[1] || key.replaceAll("_", " ");
+    }
+
+    function preferredProductsForCategory(category, productValues) {
+      const preferred = {
+        popular: [
+          "2m_temperature",
+          "temperature_2m",
+          "500mb_height_winds",
+          "mslp_10m_winds",
+          "10m_winds",
+          "qpf_total",
+          "composite_reflectivity",
+          "sbcape",
+          "mucape",
+          "cloud_cover",
+        ],
+        surface: [
+          "2m_temperature",
+          "temperature_2m",
+          "2m_dewpoint",
+          "2m_relative_humidity",
+          "apparent_temperature_2m",
+          "10m_winds",
+          "10m_wind_gust",
+          "mslp_10m_winds",
+        ],
+        upper_air: [
+          "500mb_height_winds",
+          "500mb_temperature_height_winds",
+          "500mb_rh_height_winds",
+          "700mb_height_winds",
+          "850mb_height_winds",
+          "300mb_height_winds",
+          "250mb_height_winds",
+          "200mb_height_winds",
+        ],
+        severe: [
+          "sbcape",
+          "mucape",
+          "mlcape",
+          "sbcin",
+          "mucin",
+          "mlcin",
+          "stp",
+          "srh_0_1km",
+          "srh_0_3km",
+          "bulk_shear_0_6km",
+        ],
+        precip: [
+          "qpf_total",
+          "qpf_1h",
+          "precipitation",
+          "snow",
+          "composite_reflectivity",
+        ],
+        clouds: [
+          "cloud_cover",
+          "total_cloud_cover",
+          "low_cloud_cover",
+          "mid_cloud_cover",
+          "high_cloud_cover",
+          "ceiling",
+          "visibility",
+        ],
+      }[category] || [];
+      return preferred.filter(key => productValues.includes(key));
+    }
+
+    function preferredProductForActiveCategory(products) {
+      const productValues = products.map(item => item.key);
+      const byKey = key => products.find(item => item.key === key);
+      const preferred = preferredProductsForCategory(activeProductCategory, productValues)
+        .map(byKey)
+        .find(Boolean);
+      if (preferred) return preferred;
+      if (activeProductCategory !== "all" && activeProductCategory !== "popular") {
+        const inCategory = products.find(item => productCategory(item.key) === activeProductCategory);
+        if (inCategory) return inCategory;
+      }
+      return null;
+    }
+
+    function setModel(model, preserveDomain = true) {
+      const previousDomain = preserveDomain ? els.domain.value : "";
+      const previousEnsemble = els.ensemble.value;
+      const previousVariant = els.variant.value;
+      if (!selectOption(els.model, model)) return false;
+      followLatestRun = true;
+      populateRuns(false);
+      populateDomains(false);
+      if (previousDomain) selectOption(els.domain, previousDomain);
+      populateEnsembles(false);
+      if (previousEnsemble) selectOption(els.ensemble, previousEnsemble);
+      populateVariants(false);
+      if (previousVariant) selectOption(els.variant, previousVariant);
+      return true;
+    }
+
+    function renderChipRow(container, values, selected, labelFn, onClick) {
+      container.innerHTML = values.map(value => (
+        `<button type="button" class="chip ${value === selected ? "active" : ""}" data-value="${htmlEscape(value)}">${htmlEscape(labelFn(value))}</button>`
+      )).join("");
+      container.querySelectorAll("button[data-value]").forEach(button => {
+        button.addEventListener("click", () => onClick(button.dataset.value));
+      });
+    }
+
+    function applyPreset(kind) {
+      if (kind === "gefs_all_members") {
+        const wantedDomain = els.domain.value || "global";
+        if (!setModel("gefs")) return;
+        if (!selectOption(els.domain, wantedDomain)) selectOption(els.domain, "global") || selectOption(els.domain, "conus");
+        populateEnsembles(false);
+        selectOption(els.ensemble, "all_members");
+        populateVariants(false);
+        selectOption(els.variant, "auto");
+        selectedIndex = 0;
+        markSelectionDirty("GEFS all members staged");
+        return;
+      }
+      if (kind === "gefs_control") {
+        if (!setModel("gefs")) return;
+        populateEnsembles(false);
+        selectOption(els.ensemble, "control");
+        populateVariants(false);
+        selectedIndex = 0;
+        markSelectionDirty("GEFS control staged");
+        return;
+      }
+      if (kind === "hrrr_conus") {
+        if (!setModel("hrrr", false)) return;
+        selectOption(els.domain, "conus");
+        populateEnsembles(false);
+        populateVariants(false);
+        selectedIndex = 0;
+        markSelectionDirty("HRRR CONUS staged");
+        return;
+      }
+      if (kind === "gfs_global") {
+        if (!setModel("gfs", false)) return;
+        selectOption(els.domain, "global");
+        populateEnsembles(false);
+        populateVariants(false);
+        selectedIndex = 0;
+        markSelectionDirty("GFS global staged");
+        return;
+      }
+      if (kind === "gfs_conus") {
+        if (!setModel("gfs", false)) return;
+        selectOption(els.domain, "conus");
+        populateEnsembles(false);
+        populateVariants(false);
+        selectedIndex = 0;
+        markSelectionDirty("GFS CONUS staged");
+      }
+    }
+
+    function renderQuickButtons() {
+      if (!els.presetButtons) return;
+      const models = Array.from(els.model.options).map(option => option.value);
+      const presets = [
+        ["gefs_all_members", "GEFS all members", models.includes("gefs")],
+        ["gefs_control", "GEFS control", models.includes("gefs")],
+        ["hrrr_conus", "HRRR CONUS", models.includes("hrrr")],
+        ["gfs_global", "GFS global", models.includes("gfs")],
+        ["gfs_conus", "GFS CONUS", models.includes("gfs")],
+      ].filter(item => item[2]);
+      renderChipRow(els.presetButtons, presets.map(item => item[0]), "", value => presets.find(item => item[0] === value)?.[1] || value, applyPreset);
+
+      const domains = Array.from(els.domain.options).map(option => option.value);
+      renderChipRow(
+        els.domainButtons,
+        orderedSubset(domains, ["conus", "global", "north_america", "europe", "africa", "asia", "australia", "south_america", "antarctica"]).slice(0, 12),
+        els.domain.value,
+        value => value.replaceAll("_", " "),
+        value => {
+          selectOption(els.domain, value);
+          populateEnsembles(false);
+          populateVariants(false);
+          selectedIndex = 0;
+          markSelectionDirty("Domain staged");
+        }
+      );
+
+      const ensembles = Array.from(els.ensemble.options).map(option => option.value);
+      const showEnsembles = !els.ensembleWrap.hidden && ensembles.length > 1;
+      els.ensembleButtonsTitle.hidden = !showEnsembles;
+      els.ensembleButtons.hidden = !showEnsembles;
+      if (showEnsembles) {
+        renderChipRow(
+          els.ensembleButtons,
+          orderedSubset(ensembles, ["all_members", "control", "gec00"]),
+          selectedEnsemble(),
+          ensembleLabel,
+          value => {
+            selectOption(els.ensemble, value);
+            populateVariants(false);
+            selectedIndex = 0;
+            markSelectionDirty("GEFS member view staged");
+          }
+        );
+      } else {
+        els.ensembleButtons.innerHTML = "";
+      }
+
+      const variants = Array.from(els.variant.options).map(option => option.value);
+      const showVariants = !els.variantWrap.hidden && variants.length > 1;
+      els.variantButtonsTitle.hidden = !showVariants;
+      els.variantButtons.hidden = !showVariants;
+      if (showVariants) {
+        renderChipRow(
+          els.variantButtons,
+          orderedSubset(variants, VARIANT_ORDER),
+          selectedVariant(),
+          variantLabel,
+          value => {
+            selectOption(els.variant, value);
+            selectedIndex = 0;
+            markSelectionDirty("Projection staged");
+          }
+        );
+      } else {
+        els.variantButtons.innerHTML = "";
+      }
+
+      const productValues = axesAreDirty() ? [] : series.products.map(item => item.key);
+      const availableCategories = PRODUCT_CATEGORIES
+        .map(item => item[0])
+        .filter(category => category === "all" || productValues.some(product => productCategory(product) === category) || preferredProductsForCategory(category, productValues).length > 0);
+      if (!availableCategories.includes(activeProductCategory)) {
+        activeProductCategory = availableCategories.includes("popular") ? "popular" : (availableCategories[0] || "popular");
+      }
+      const showCategories = productValues.length > 0;
+      els.productCategoryButtonsTitle.hidden = !showCategories;
+      els.productCategoryButtons.hidden = !showCategories;
+      if (showCategories) {
+        renderChipRow(
+          els.productCategoryButtons,
+          availableCategories,
+          activeProductCategory,
+          productCategoryLabel,
+          value => {
+            activeProductCategory = value;
+            renderQuickButtons();
+          }
+        );
+      } else {
+        els.productCategoryButtons.innerHTML = "";
+      }
+      const categoryProducts = activeProductCategory === "all"
+        ? productValues
+        : productValues.filter(product => productCategory(product) === activeProductCategory);
+      const productButtons = orderedSubset(
+        categoryProducts,
+        preferredProductsForCategory(activeProductCategory, productValues)
+      ).slice(0, activeProductCategory === "all" ? 24 : 18);
+      const showProducts = productButtons.length > 0;
+      els.productButtonsTitle.hidden = !showProducts;
+      els.productButtons.hidden = !showProducts;
+      if (showProducts) {
+        renderChipRow(
+          els.productButtons,
+          productButtons,
+          stagedProductKey || loadedProductKey || els.product.value,
+          productLabel,
+          value => stageProduct(value, "Product staged")
+        );
+      } else {
+        els.productButtons.innerHTML = "";
+      }
     }
 
     function populateModels(preserve = true) {
@@ -5084,6 +6730,7 @@ const PLOTS_HTML: &str = r#"<!doctype html>
       } else {
         els.variant.value = variants[0];
       }
+      renderQuickButtons();
     }
 
     function filteredProducts() {
@@ -5093,7 +6740,7 @@ const PLOTS_HTML: &str = r#"<!doctype html>
     }
 
     function populateProducts(preserve = true) {
-      const previous = preserve ? els.product.value : "";
+      const previous = stagedProductKey || (preserve ? els.product.value : "");
       const products = filteredProducts();
       els.product.innerHTML = products.map(item => {
         const suffix = `${item.available}/${item.total}`;
@@ -5102,13 +6749,16 @@ const PLOTS_HTML: &str = r#"<!doctype html>
       if (products.some(item => item.key === previous)) {
         els.product.value = previous;
       } else {
-        const preferred = products.find(item => /2m_temperature|temperature_2m/.test(item.key))
+        const preferred = preferredProductForActiveCategory(products)
+          || products.find(item => /2m_temperature|temperature_2m/.test(item.key))
           || products.find(item => /composite_reflectivity/.test(item.key))
           || products.find(item => /sbcape|cape/.test(item.key))
           || products.find(item => item.available > 0)
           || products[0];
         if (preferred) els.product.value = preferred.key;
       }
+      stagedProductKey = els.product.value || "";
+      updateProductControlState();
     }
 
     function buildProducts(manifests) {
@@ -5130,7 +6780,7 @@ const PLOTS_HTML: &str = r#"<!doctype html>
     }
 
     function buildFrames() {
-      const product = els.product.value;
+      const product = loadedProductKey || els.product.value;
       series.frames = series.manifests
         .map(manifest => {
           const artifact = (manifest.artifacts || []).find(item => normalizeProduct(item.artifact_key) === product);
@@ -5184,7 +6834,7 @@ const PLOTS_HTML: &str = r#"<!doctype html>
         return;
       }
       const state = stateOf(frame.artifact);
-      const label = `${modelOf(frame.manifest)} ${frame.manifest.date || ""} ${frame.manifest.cycle_utc ?? ""}z ${frame.manifest.domain || ""} ${productLabel(els.product.value)} f${String(frame.hour).padStart(3, "0")}`;
+      const label = `${modelOf(frame.manifest)} ${frame.manifest.date || ""} ${frame.manifest.cycle_utc ?? ""}z ${frame.manifest.domain || ""} ${productLabel(loadedProductKey || els.product.value)} f${String(frame.hour).padStart(3, "0")}`;
       const ensemble = ensembleKey(frame.manifest);
       const variant = variantKey(frame.manifest);
       const badges = [label];
@@ -5245,7 +6895,7 @@ const PLOTS_HTML: &str = r#"<!doctype html>
         domain: els.domain.value,
         ensemble: selectedEnsemble(),
         projection: selectedVariant(),
-        product: els.product.value,
+        product: loadedProductKey || els.product.value,
         fps: "2",
         crf: "18",
         preset: "faster",
@@ -5314,42 +6964,63 @@ const PLOTS_HTML: &str = r#"<!doctype html>
     async function fetchSeries(preserveProduct = true) {
       if (!els.run.value || !els.domain.value || loadingSeries) return;
       loadingSeries = true;
-      setStatus("Loading selected run/domain artifacts...");
-      const parts = selectedRunParts();
-      const params = new URLSearchParams({
-        include_artifacts: "true",
-        model: parts.model,
-        date: parts.date,
-        cycle_utc: parts.cycle,
-        domain: els.domain.value,
-        ensemble: selectedEnsemble(),
-        projection: selectedVariant(),
-        state: "all",
-        manifest_limit: "20000",
-        artifact_limit: "1000",
-        _: String(Date.now()),
-      });
-      if (parts.source) params.set("source", parts.source);
-      const res = await fetch(`/v1/static-plots?${params.toString()}`, { cache: "no-store" });
-      if (!res.ok) throw new Error(`static plot frames failed: ${res.status}`);
-      const data = await res.json();
-      series.manifests = (data.manifests || []).sort((a, b) => (a.forecast_hour ?? 0) - (b.forecast_hour ?? 0));
-      series.products = buildProducts(series.manifests);
-      populateProducts(preserveProduct);
-      selectedIndex = Math.min(selectedIndex, Math.max(0, series.manifests.length - 1));
-      renderFrame();
-      const complete = series.frames.filter(frame => isAvailable(frame.artifact)).length;
-      const variant = selectedVariant();
-      const variantText = variant === "auto" ? "" : ` / ${variantLabel(variant)}`;
-      setStatus(`${series.manifests.length} hours loaded for ${runLabelFromKey(els.run.value)} / ${els.domain.value}${variantText}; ${complete}/${series.frames.length} selected-product frames complete.`);
-      loadingSeries = false;
+      els.loadSelection.disabled = true;
+      setStatus(`Loading ${currentSelectionLabel()}...`);
+      try {
+        const parts = selectedRunParts();
+        const params = new URLSearchParams({
+          include_artifacts: "true",
+          model: parts.model,
+          date: parts.date,
+          cycle_utc: parts.cycle,
+          domain: els.domain.value,
+          ensemble: selectedEnsemble(),
+          projection: selectedVariant(),
+          state: "all",
+          manifest_limit: "20000",
+          artifact_limit: "1000",
+          _: String(Date.now()),
+        });
+        if (parts.source) params.set("source", parts.source);
+        const res = await fetch(`/v1/static-plots?${params.toString()}`, { cache: "no-store" });
+        if (!res.ok) throw new Error(`static plot frames failed: ${res.status}`);
+        const data = await res.json();
+        series.manifests = (data.manifests || []).sort((a, b) => (a.forecast_hour ?? 0) - (b.forecast_hour ?? 0));
+        series.products = buildProducts(series.manifests);
+        loadedAxesKey = currentAxesKey();
+        populateProducts(preserveProduct);
+        loadedProductKey = els.product.value || stagedProductKey || loadedProductKey;
+        stagedProductKey = loadedProductKey;
+        selectedIndex = Math.min(selectedIndex, Math.max(0, series.manifests.length - 1));
+        loadedSelectionKey = currentSelectionKey();
+        stagedDirty = false;
+        renderFrame();
+        renderQuickButtons();
+        const complete = series.frames.filter(frame => isAvailable(frame.artifact)).length;
+        const variant = selectedVariant();
+        const variantText = variant === "auto" ? "" : ` / ${variantLabel(variant)}`;
+        setStatus(`${series.manifests.length} hours loaded for ${runLabelFromKey(els.run.value)} / ${els.domain.value}${variantText}; ${complete}/${series.frames.length} selected-product frames complete.`);
+      } finally {
+        loadingSeries = false;
+        els.loadSelection.disabled = !els.run.value || !els.domain.value;
+      }
     }
 
-    async function reloadAll(preserve = true) {
+    async function loadSelectionNow(preserveProduct = true) {
+      stopPlayback();
+      selectedIndex = 0;
+      await fetchSeries(preserveProduct);
+    }
+
+    async function reloadAll(preserve = true, loadCurrent = true) {
       stopPlayback();
       setStatus("Refreshing plot inventory...");
       await fetchCatalog(preserve);
-      await fetchSeries(preserve);
+      if (loadCurrent && !stagedDirty) {
+        await fetchSeries(preserve);
+      } else {
+        markSelectionDirty("Inventory refreshed");
+      }
     }
 
     els.model.addEventListener("change", () => {
@@ -5360,7 +7031,7 @@ const PLOTS_HTML: &str = r#"<!doctype html>
       populateEnsembles(false);
       populateVariants(false);
       selectedIndex = 0;
-      fetchSeries(false).catch(err => setStatus(err.message));
+      markSelectionDirty("Model staged");
     });
     els.run.addEventListener("change", () => {
       stopPlayback();
@@ -5369,42 +7040,61 @@ const PLOTS_HTML: &str = r#"<!doctype html>
       populateEnsembles(false);
       populateVariants(false);
       selectedIndex = 0;
-      fetchSeries(false).catch(err => setStatus(err.message));
+      markSelectionDirty("Run staged");
     });
     els.domain.addEventListener("change", () => {
       stopPlayback();
       populateEnsembles(false);
       populateVariants(false);
       selectedIndex = 0;
-      fetchSeries(false).catch(err => setStatus(err.message));
+      markSelectionDirty("Domain staged");
     });
     els.ensemble.addEventListener("change", () => {
       stopPlayback();
       populateVariants(false);
       selectedIndex = 0;
-      fetchSeries(false).catch(err => setStatus(err.message));
+      markSelectionDirty("GEFS member view staged");
     });
     els.variant.addEventListener("change", () => {
       stopPlayback();
       selectedIndex = 0;
-      fetchSeries(false).catch(err => setStatus(err.message));
+      markSelectionDirty("Projection staged");
     });
     els.product.addEventListener("change", () => {
-      selectedIndex = 0;
-      renderFrame();
+      stageProduct(els.product.value, "Product staged");
     });
     els.productSearch.addEventListener("input", () => {
+      if (axesAreDirty()) {
+        markSelectionDirty("Selection staged");
+        return;
+      }
+      const previous = els.product.value;
       populateProducts(true);
       selectedIndex = 0;
-      renderFrame();
+      if (els.product.value !== previous) {
+        markSelectionDirty("Product staged");
+      } else {
+        renderQuickButtons();
+      }
     });
     els.prev.addEventListener("click", () => step(-1));
     els.next.addEventListener("click", () => step(1));
     els.play.addEventListener("click", togglePlayback);
     els.exportMp4.addEventListener("click", exportCurrentMp4);
-    els.refresh.addEventListener("click", () => {
+    els.loadSelection.addEventListener("click", () => {
+      loadSelectionNow(true).catch(err => setStatus(err.message));
+    });
+    els.loadLatest.addEventListener("click", () => {
       followLatestRun = true;
-      reloadAll(true).catch(err => setStatus(err.message));
+      populateRuns(false);
+      populateDomains(false);
+      populateEnsembles(false);
+      populateVariants(false);
+      selectedIndex = 0;
+      markSelectionDirty("Latest run staged");
+    });
+    els.refresh.addEventListener("click", () => {
+      reloadAll(true, !stagedDirty).catch(err => setStatus(err.message));
     });
     els.hours.addEventListener("click", event => {
       const target = event.target.closest("[data-index]");
@@ -5423,8 +7113,13 @@ const PLOTS_HTML: &str = r#"<!doctype html>
 
     reloadAll(false).catch(err => setStatus(err.message));
     refreshTimer = setInterval(() => {
-      fetchCatalog(true).then(() => fetchSeries(true)).catch(err => setStatus(err.message));
-    }, 5000);
+      if (stagedDirty || loadedSelectionKey !== currentSelectionKey()) {
+        return;
+      }
+      fetchCatalog(true)
+        .then(() => fetchSeries(true))
+        .catch(err => setStatus(err.message));
+    }, 30000);
   </script>
 </body>
 </html>
@@ -5847,6 +7542,26 @@ struct ForecastQuery {
     hourly: Option<String>,
     forecast_hours: Option<String>,
     hours: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct CrossSectionRenderRequest {
+    model: Option<String>,
+    run: Option<String>,
+    products: Option<String>,
+    product: Option<String>,
+    hour: Option<u8>,
+    hours: Option<String>,
+    start_lat: f64,
+    start_lon: f64,
+    end_lat: f64,
+    end_lon: f64,
+    route_name: Option<String>,
+    spacing_km: Option<f32>,
+    top_pressure_hpa: Option<f64>,
+    width: Option<u32>,
+    height: Option<u32>,
+    force: Option<bool>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -7061,6 +8776,222 @@ async fn forecast(
     .map_err(|err| internal_error(format!("join error: {err}")))?
     .map_err(|err| bad_request(err.to_string()))?;
     Ok(Json(read))
+}
+
+async fn cross_section_status(State(state): State<Arc<AppState>>) -> Json<Value> {
+    Json(state.cross_sections.status_json())
+}
+
+async fn cross_section_products() -> Json<Value> {
+    Json(json!({
+        "schema": "wxstore.cross_section.products.v1",
+        "products": [
+            {"product": "temperature", "label": "Temperature"},
+            {"product": "wind_speed", "label": "Wind Speed"},
+            {"product": "theta_e", "label": "Theta-e"},
+            {"product": "rh", "label": "Relative Humidity"},
+            {"product": "q", "label": "Specific Humidity"},
+            {"product": "omega", "label": "Vertical Motion"},
+            {"product": "vorticity", "label": "Absolute Vorticity"},
+            {"product": "shear", "label": "Deep-Layer Shear"},
+            {"product": "lapse_rate", "label": "Lapse Rate"},
+            {"product": "cloud", "label": "Cloud Water/Ice"},
+            {"product": "cloud_total", "label": "Total Hydrometeors"},
+            {"product": "wetbulb", "label": "Wet Bulb"},
+            {"product": "icing", "label": "Icing"},
+            {"product": "frontogenesis", "label": "Frontogenesis"},
+            {"product": "vpd", "label": "Vapor Pressure Deficit"},
+            {"product": "dewpoint_dep", "label": "Dewpoint Depression"},
+            {"product": "moisture_transport", "label": "Moisture Transport"},
+            {"product": "pv", "label": "Potential Vorticity"},
+            {"product": "fire_wx", "label": "Fire Weather"}
+        ]
+    }))
+}
+
+async fn cross_section_render(
+    State(state): State<Arc<AppState>>,
+    Json(request): Json<CrossSectionRenderRequest>,
+) -> Result<Json<Value>, ApiError> {
+    let lane = state.cross_sections.clone();
+    let response = tokio::task::spawn_blocking(move || run_cross_section_render(&lane, request))
+        .await
+        .map_err(|err| internal_error(format!("join error: {err}")))?
+        .map_err(|err| bad_request(err.to_string()))?;
+    Ok(Json(response))
+}
+
+async fn cross_section_artifact(
+    State(state): State<Arc<AppState>>,
+    AxumPath((render_id, file_name)): AxumPath<(String, String)>,
+) -> Result<Response, ApiError> {
+    let path = state
+        .cross_sections
+        .artifact_path(&render_id, &file_name)
+        .map_err(|err| not_found(err.to_string()))?;
+    let bytes = fs::read(&path).map_err(|err| not_found(err.to_string()))?;
+    let mut response = Bytes::from(bytes).into_response();
+    let content_type = match path.extension().and_then(|ext| ext.to_str()).unwrap_or("") {
+        "png" => "image/png",
+        "webp" => "image/webp",
+        "json" => "application/json",
+        _ => "application/octet-stream",
+    };
+    response
+        .headers_mut()
+        .insert(header::CONTENT_TYPE, HeaderValue::from_static(content_type));
+    response.headers_mut().insert(
+        header::CACHE_CONTROL,
+        HeaderValue::from_static("public, max-age=86400"),
+    );
+    Ok(response)
+}
+
+fn run_cross_section_render(
+    lane: &CrossSectionLane,
+    request: CrossSectionRenderRequest,
+) -> Result<Value> {
+    if !lane.renderer.is_file() {
+        bail!(
+            "cross-section renderer is not present: {}",
+            lane.renderer.display()
+        );
+    }
+    if !request.start_lat.is_finite()
+        || !request.start_lon.is_finite()
+        || !request.end_lat.is_finite()
+        || !request.end_lon.is_finite()
+    {
+        bail!("cross-section coordinates must be finite");
+    }
+    let start_lon = normalize_lon(request.start_lon);
+    let end_lon = normalize_lon(request.end_lon);
+    let model = request.model.unwrap_or_else(|| "hrrr".to_string());
+    let run = request.run.unwrap_or_else(|| "latest".to_string());
+    let store = lane.resolve_store(&model, &run)?;
+    let product = request
+        .products
+        .or(request.product)
+        .unwrap_or_else(|| "wind_speed".to_string());
+    let hour = request.hour.unwrap_or(0);
+    let route_name = request
+        .route_name
+        .unwrap_or_else(|| "Selected cross section".to_string());
+    let route_id = stable_cross_section_id(&json!({
+        "model": &model,
+        "run": &run,
+        "product": &product,
+        "hour": hour,
+        "hours": request.hours.clone(),
+        "start": [request.start_lat, start_lon],
+        "end": [request.end_lat, end_lon],
+        "spacing_km": request.spacing_km,
+        "top_pressure_hpa": request.top_pressure_hpa,
+        "width": request.width,
+        "height": request.height,
+    }));
+    let out_dir = lane.artifact_root.join(&route_id);
+    let report_path = out_dir.join("volume_cross_section_render_report.json");
+    if report_path.is_file() && !request.force.unwrap_or(false) {
+        let mut report: Value = serde_json::from_slice(&fs::read(&report_path)?)?;
+        annotate_cross_section_report(lane, &route_id, &mut report);
+        report["cache_hit"] = json!(true);
+        return Ok(report);
+    }
+    fs::create_dir_all(&out_dir)?;
+
+    let mut command = ProcessCommand::new(&lane.renderer);
+    command
+        .arg("--store")
+        .arg(&store)
+        .arg("--out-dir")
+        .arg(&out_dir)
+        .arg("--products")
+        .arg(&product)
+        .arg("--hour")
+        .arg(hour.to_string())
+        .arg("--route-id")
+        .arg(&route_id)
+        .arg("--route-name")
+        .arg(&route_name)
+        .arg("--start-lat")
+        .arg(request.start_lat.to_string())
+        .arg("--start-lon")
+        .arg(start_lon.to_string())
+        .arg("--end-lat")
+        .arg(request.end_lat.to_string())
+        .arg("--end-lon")
+        .arg(end_lon.to_string())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    if let Some(hours) = request.hours.as_deref() {
+        command.arg("--hours").arg(hours);
+    }
+    if let Some(spacing) = request.spacing_km {
+        command.arg("--spacing-km").arg(spacing.to_string());
+    }
+    if let Some(top) = request.top_pressure_hpa {
+        command.arg("--top-pressure-hpa").arg(top.to_string());
+    }
+    if let Some(width) = request.width {
+        command.arg("--width").arg(width.to_string());
+    }
+    if let Some(height) = request.height {
+        command.arg("--height").arg(height.to_string());
+    }
+    let started = Instant::now();
+    let output = command.output()?;
+    if !output.status.success() {
+        bail!(
+            "cross-section renderer exited {}: {}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    let mut report: Value = serde_json::from_slice(&fs::read(&report_path)?)?;
+    annotate_cross_section_report(lane, &route_id, &mut report);
+    report["cache_hit"] = json!(false);
+    report["server_elapsed_ms"] = json!(started.elapsed().as_millis());
+    Ok(report)
+}
+
+fn annotate_cross_section_report(lane: &CrossSectionLane, render_id: &str, report: &mut Value) {
+    report["schema"] = json!("wxstore.cross_section.render.v1");
+    report["render_id"] = json!(render_id);
+    report["artifact_base_url"] = json!(format!("/v1/cross-section/artifacts/{render_id}"));
+    if let Some(outputs) = report.get_mut("outputs").and_then(Value::as_array_mut) {
+        for output in outputs {
+            for key in ["png_path", "webp_path", "summary_path"] {
+                let Some(path) = output.get(key).and_then(Value::as_str) else {
+                    continue;
+                };
+                let Some(file_name) = Path::new(path).file_name().and_then(|name| name.to_str())
+                else {
+                    continue;
+                };
+                let url_key = match key {
+                    "png_path" => "png_url",
+                    "webp_path" => "webp_url",
+                    "summary_path" => "summary_url",
+                    _ => continue,
+                };
+                output[url_key] = json!(format!(
+                    "/v1/cross-section/artifacts/{render_id}/{file_name}"
+                ));
+            }
+        }
+    }
+    let _ = lane;
+}
+
+fn stable_cross_section_id(value: &Value) -> String {
+    let body = serde_json::to_string(value).unwrap_or_else(|_| format!("{value:?}"));
+    let mut hash = 0xcbf29ce484222325u64;
+    for byte in body.as_bytes() {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    format!("cs_{hash:016x}")
 }
 
 async fn resolve(
@@ -8714,6 +10645,26 @@ impl SpatialGrid {
     }
 }
 
+fn wxa_grid_metadata_compatible(existing: &Value, incoming: &Value) -> bool {
+    if existing == incoming {
+        return true;
+    }
+
+    let existing_type = existing.get("type").and_then(Value::as_str);
+    let incoming_type = incoming.get("type").and_then(Value::as_str);
+    if existing_type != incoming_type {
+        return false;
+    }
+
+    if existing_type == Some("curvilinear_latlon_sampled") {
+        return ["type", "nx", "ny", "bounds", "corners", "monotonic", "sample_strategy"]
+            .iter()
+            .all(|key| existing.get(*key) == incoming.get(*key));
+    }
+
+    false
+}
+
 impl SpatialLane {
     fn open(root: &Path) -> Result<Self> {
         if !root.is_dir() {
@@ -9705,22 +11656,85 @@ fn write_spatial_wxa_grids(
     if path.is_file() {
         let (existing_bytes, existing_meta, existing_records) = read_wxa_dense2d(&path)
             .with_context(|| format!("read existing WXA metadata {}", path.display()))?;
-        if existing_meta.model != model
-            || existing_meta.run != run
-            || existing_meta.member.as_deref() != member
-            || existing_meta.variable != product
-            || existing_meta.nx != first.nx
-            || existing_meta.ny != first.ny
-            || existing_meta.chunk_y != cy
-            || existing_meta.chunk_x != cx
-            || existing_meta.dtype != "f32_le"
-            || existing_meta.codec != "zstd_level_1"
-            || existing_meta.units != first.units
-            || existing_meta.grid != first_grid_meta
-        {
+        let mut incompatibilities = Vec::new();
+        if existing_meta.model != model {
+            incompatibilities.push(format!(
+                "model existing={} incoming={}",
+                existing_meta.model, model
+            ));
+        }
+        if existing_meta.run != run {
+            incompatibilities.push(format!("run existing={} incoming={}", existing_meta.run, run));
+        }
+        if existing_meta.member.as_deref() != member {
+            incompatibilities.push(format!(
+                "member existing={:?} incoming={:?}",
+                existing_meta.member.as_deref(),
+                member
+            ));
+        }
+        if existing_meta.variable != product {
+            incompatibilities.push(format!(
+                "variable existing={} incoming={}",
+                existing_meta.variable, product
+            ));
+        }
+        if existing_meta.nx != first.nx || existing_meta.ny != first.ny {
+            incompatibilities.push(format!(
+                "shape existing={}x{} incoming={}x{}",
+                existing_meta.nx, existing_meta.ny, first.nx, first.ny
+            ));
+        }
+        if existing_meta.chunk_y != cy || existing_meta.chunk_x != cx {
+            incompatibilities.push(format!(
+                "chunk existing={}x{} incoming={}x{}",
+                existing_meta.chunk_x, existing_meta.chunk_y, cx, cy
+            ));
+        }
+        if existing_meta.dtype != "f32_le" {
+            incompatibilities.push(format!("dtype existing={}", existing_meta.dtype));
+        }
+        if existing_meta.codec != "zstd_level_1" {
+            incompatibilities.push(format!("codec existing={}", existing_meta.codec));
+        }
+        if existing_meta.units != first.units {
+            incompatibilities.push(format!(
+                "units existing={} incoming={}",
+                existing_meta.units, first.units
+            ));
+        }
+        if !wxa_grid_metadata_compatible(&existing_meta.grid, &first_grid_meta) {
+            let existing_grid = serde_json::to_string(&existing_meta.grid).unwrap_or_default();
+            let incoming_grid = serde_json::to_string(&first_grid_meta).unwrap_or_default();
+            incompatibilities.push(format!(
+                "grid metadata differs existing_type={} incoming_type={} existing_len={} incoming_len={} existing_bounds={} incoming_bounds={}",
+                existing_meta
+                    .grid
+                    .get("type")
+                    .and_then(Value::as_str)
+                    .unwrap_or("unknown"),
+                first_grid_meta
+                    .get("type")
+                    .and_then(Value::as_str)
+                    .unwrap_or("unknown"),
+                existing_grid.len(),
+                incoming_grid.len(),
+                existing_meta
+                    .grid
+                    .get("bounds")
+                    .map(Value::to_string)
+                    .unwrap_or_else(|| "null".to_string()),
+                first_grid_meta
+                    .get("bounds")
+                    .map(Value::to_string)
+                    .unwrap_or_else(|| "null".to_string())
+            ));
+        }
+        if !incompatibilities.is_empty() {
             bail!(
-                "existing WXA product is incompatible with incoming grids: {}",
-                path.display()
+                "existing WXA product is incompatible with incoming grids: {} ({})",
+                path.display(),
+                incompatibilities.join("; ")
             );
         }
         for record in existing_records
@@ -9966,6 +11980,7 @@ fn interpolated_geographic_value(grid: &SpatialGrid, lat: f64, lon: f64) -> Opti
     match grid.grid_meta.get("type").and_then(Value::as_str)? {
         "regular_latlon" => interpolated_regular_latlon_value(grid, lat, lon),
         "rectilinear_latlon" => interpolated_rectilinear_latlon_value(grid, lat, lon),
+        "curvilinear_latlon_sampled" => interpolated_curvilinear_sampled_value(grid, lat, lon),
         _ => None,
     }
 }
@@ -10017,6 +12032,179 @@ fn interpolated_rectilinear_latlon_value(grid: &SpatialGrid, lat: f64, lon: f64)
         .unwrap_or(false);
     let x = axis_fraction(&lon_axis, lon, lon_wrap)?;
     bilinear_grid_value(grid, x, y, lon_wrap)
+}
+
+fn interpolated_curvilinear_sampled_value(grid: &SpatialGrid, lat: f64, lon: f64) -> Option<f32> {
+    let bounds = grid_bounds(grid);
+    if lat < bounds[1] - 0.25 || lat > bounds[3] + 0.25 {
+        return None;
+    }
+    if bounds[0] <= bounds[2] && (lon < bounds[0] - 0.25 || lon > bounds[2] + 0.25) {
+        return None;
+    }
+
+    let sample = grid.grid_meta.get("sample")?.as_object()?;
+    let sample_nx = sample.get("nx")?.as_u64()? as usize;
+    let sample_ny = sample.get("ny")?.as_u64()? as usize;
+    let xs = value_f64_array(sample.get("x")?)?;
+    let ys = value_f64_array(sample.get("y")?)?;
+    let lats = value_f64_array(sample.get("lat")?)?;
+    let lons = value_f64_array(sample.get("lon")?)?;
+    if sample_nx < 2
+        || sample_ny < 2
+        || xs.len() != sample_nx
+        || ys.len() != sample_ny
+        || lats.len() != sample_nx * sample_ny
+        || lons.len() != sample_nx * sample_ny
+    {
+        return None;
+    }
+
+    let mut nearest = None::<(usize, f64)>;
+    for (index, (&sample_lat, &sample_lon)) in lats.iter().zip(lons.iter()).enumerate() {
+        if !sample_lat.is_finite() || !sample_lon.is_finite() {
+            continue;
+        }
+        let dlat = sample_lat - lat;
+        let dlon = normalized_lon_delta(sample_lon - lon) * lat.to_radians().cos().abs().max(0.25);
+        let dist2 = dlat * dlat + dlon * dlon;
+        if nearest.is_none_or(|(_, best_dist)| dist2 < best_dist) {
+            nearest = Some((index, dist2));
+        }
+    }
+    let (nearest_index, _) = nearest?;
+    let nearest_sx = nearest_index % sample_nx;
+    let nearest_sy = nearest_index / sample_nx;
+
+    let sx_start = nearest_sx.saturating_sub(1);
+    let sx_end = nearest_sx.min(sample_nx - 2);
+    let sy_start = nearest_sy.saturating_sub(1);
+    let sy_end = nearest_sy.min(sample_ny - 2);
+
+    let mut best = None::<(f64, f64, f64)>;
+    for sy in sy_start..=sy_end {
+        for sx in sx_start..=sx_end {
+            let Some((tx, ty, err2)) =
+                inverse_curvilinear_sample_cell(lat, lon, sx, sy, sample_nx, &lats, &lons)
+            else {
+                continue;
+            };
+            if best.is_none_or(|(_, _, best_err2)| err2 < best_err2) {
+                best = Some((sx as f64 + tx, sy as f64 + ty, err2));
+            }
+        }
+    }
+
+    let (sample_xf, sample_yf, _) = best?;
+    let sample_x0 = sample_xf.floor().clamp(0.0, (sample_nx - 2) as f64) as usize;
+    let sample_y0 = sample_yf.floor().clamp(0.0, (sample_ny - 2) as f64) as usize;
+    let sample_x1 = sample_x0 + 1;
+    let sample_y1 = sample_y0 + 1;
+    let tx = (sample_xf - sample_x0 as f64).clamp(0.0, 1.0);
+    let ty = (sample_yf - sample_y0 as f64).clamp(0.0, 1.0);
+    let gx = bilerp(
+        xs[sample_x0],
+        xs[sample_x1],
+        xs[sample_x0],
+        xs[sample_x1],
+        tx,
+        ty,
+    );
+    let gy = bilerp(
+        ys[sample_y0],
+        ys[sample_y0],
+        ys[sample_y1],
+        ys[sample_y1],
+        tx,
+        ty,
+    );
+    bilinear_grid_value(grid, gx, gy, false)
+}
+
+fn inverse_curvilinear_sample_cell(
+    target_lat: f64,
+    target_lon: f64,
+    sx: usize,
+    sy: usize,
+    sample_nx: usize,
+    lats: &[f64],
+    lons: &[f64],
+) -> Option<(f64, f64, f64)> {
+    let i00 = sy * sample_nx + sx;
+    let i10 = i00 + 1;
+    let i01 = i00 + sample_nx;
+    let i11 = i01 + 1;
+    let lat00 = lats[i00];
+    let lat10 = lats[i10];
+    let lat01 = lats[i01];
+    let lat11 = lats[i11];
+    let lon00 = lons[i00];
+    let lon10 = lon00 + normalized_lon_delta(lons[i10] - lon00);
+    let lon01 = lon00 + normalized_lon_delta(lons[i01] - lon00);
+    let lon11 = lon00 + normalized_lon_delta(lons[i11] - lon00);
+    let target_lon = unwrap_lon_near(target_lon, lon00);
+    if ![
+        lat00, lat10, lat01, lat11, lon00, lon10, lon01, lon11, target_lat, target_lon,
+    ]
+    .iter()
+    .all(|value| value.is_finite())
+    {
+        return None;
+    }
+
+    let min_lat = lat00.min(lat10).min(lat01).min(lat11) - 0.5;
+    let max_lat = lat00.max(lat10).max(lat01).max(lat11) + 0.5;
+    let min_lon = lon00.min(lon10).min(lon01).min(lon11) - 0.5;
+    let max_lon = lon00.max(lon10).max(lon01).max(lon11) + 0.5;
+    if target_lat < min_lat || target_lat > max_lat || target_lon < min_lon || target_lon > max_lon
+    {
+        return None;
+    }
+
+    let mut tx = if (max_lon - min_lon).abs() > 1.0e-9 {
+        ((target_lon - min_lon) / (max_lon - min_lon)).clamp(0.0, 1.0)
+    } else {
+        0.5
+    };
+    let mut ty = if (max_lat - min_lat).abs() > 1.0e-9 {
+        ((target_lat - min_lat) / (max_lat - min_lat)).clamp(0.0, 1.0)
+    } else {
+        0.5
+    };
+
+    for _ in 0..8 {
+        let lat_here = bilerp(lat00, lat10, lat01, lat11, tx, ty);
+        let lon_here = bilerp(lon00, lon10, lon01, lon11, tx, ty);
+        let f_lat = lat_here - target_lat;
+        let f_lon = lon_here - target_lon;
+        let dlat_dtx = (lat10 - lat00) * (1.0 - ty) + (lat11 - lat01) * ty;
+        let dlat_dty = (lat01 - lat00) * (1.0 - tx) + (lat11 - lat10) * tx;
+        let dlon_dtx = (lon10 - lon00) * (1.0 - ty) + (lon11 - lon01) * ty;
+        let dlon_dty = (lon01 - lon00) * (1.0 - tx) + (lon11 - lon10) * tx;
+        let det = dlat_dtx * dlon_dty - dlon_dtx * dlat_dty;
+        if det.abs() < 1.0e-12 {
+            break;
+        }
+        let step_tx = (f_lat * dlon_dty - f_lon * dlat_dty) / det;
+        let step_ty = (dlat_dtx * f_lon - dlon_dtx * f_lat) / det;
+        tx = (tx - step_tx).clamp(-0.25, 1.25);
+        ty = (ty - step_ty).clamp(-0.25, 1.25);
+        if step_tx.abs().max(step_ty.abs()) < 1.0e-5 {
+            break;
+        }
+    }
+
+    let lat_here = bilerp(lat00, lat10, lat01, lat11, tx, ty);
+    let lon_here = bilerp(lon00, lon10, lon01, lon11, tx, ty);
+    let err_lat = lat_here - target_lat;
+    let err_lon =
+        normalized_lon_delta(lon_here - target_lon) * target_lat.to_radians().cos().abs().max(0.25);
+    let err2 = err_lat * err_lat + err_lon * err_lon;
+    if tx >= -0.05 && tx <= 1.05 && ty >= -0.05 && ty <= 1.05 && err2 <= 0.25 {
+        Some((tx.clamp(0.0, 1.0), ty.clamp(0.0, 1.0), err2))
+    } else {
+        None
+    }
 }
 
 fn axis_fraction(axis: &[f64], value: f64, wraps: bool) -> Option<f64> {
