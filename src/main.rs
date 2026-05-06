@@ -131,6 +131,8 @@ struct ServeArgs {
     spatial_root: Option<PathBuf>,
     #[arg(long)]
     static_plots_root: Option<PathBuf>,
+    #[arg(long)]
+    archive_root: Option<PathBuf>,
     #[arg(long, default_value = "127.0.0.1")]
     host: String,
     #[arg(long, default_value_t = 8897)]
@@ -253,6 +255,7 @@ async fn main() -> Result<()> {
                     spatial.as_ref(),
                     static_plots.as_ref(),
                     None,
+                    None,
                 ))?
             );
             Ok(())
@@ -278,6 +281,15 @@ async fn main() -> Result<()> {
 
 async fn serve(args: ServeArgs) -> Result<()> {
     let ops_root = infer_ops_root(&args);
+    let archive_root = args
+        .archive_root
+        .clone()
+        .unwrap_or_else(|| ops_root.join("archive"));
+    let archive = if archive_root.is_dir() {
+        Some(Arc::new(ArchiveLane::open(&archive_root)?))
+    } else {
+        None
+    };
     let state = Arc::new(AppState {
         profile: Arc::new(ProfileLane::open(&args.profile_store)?),
         diagnostic: args
@@ -300,6 +312,8 @@ async fn serve(args: ServeArgs) -> Result<()> {
             .map(|lane| lane.map(Arc::new))?,
         plot_lab: Arc::new(PlotLabLane::from_env(&ops_root)?),
         cross_sections: Arc::new(CrossSectionLane::from_env(&ops_root)?),
+        soundings: Arc::new(SoundingLane::from_env(&ops_root)?),
+        archive,
         ops_root,
         cache: RwLock::new(ResponseCache::default()),
     });
@@ -312,6 +326,8 @@ async fn serve(args: ServeArgs) -> Result<()> {
         .route("/cross-sections", get(weather_tools))
         .route("/plot-lab", get(plot_lab))
         .route("/projection-demo", get(projection_demo))
+        .route("/hrrrarchive", get(archive_viewer))
+        .route("/archive", get(archive_viewer))
         .route("/ops", get(ops))
         .route("/livez", get(livez))
         .route("/readyz", get(readyz))
@@ -365,6 +381,34 @@ async fn serve(args: ServeArgs) -> Result<()> {
         .route(
             "/v1/cross-section/artifacts/{render_id}/{file_name}",
             get(cross_section_artifact),
+        )
+        .route("/v1/sounding/status", get(sounding_status))
+        .route("/v1/sounding/render", post(sounding_render))
+        .route(
+            "/v1/sounding/artifacts/{render_id}/{file_name}",
+            get(sounding_artifact),
+        )
+        .route("/v1/archive/status", get(archive_status))
+        .route("/v1/archive/events", get(archive_events))
+        .route("/v1/archive/events/{event_id}", get(archive_event))
+        .route(
+            "/v1/archive/events/{event_id}/polygons",
+            get(archive_event_polygons),
+        )
+        .route(
+            "/v1/archive/events/{event_id}/runs",
+            get(archive_event_runs),
+        )
+        .route("/v1/hrrrarchive/status", get(archive_status))
+        .route("/v1/hrrrarchive/events", get(archive_events))
+        .route("/v1/hrrrarchive/events/{event_id}", get(archive_event))
+        .route(
+            "/v1/hrrrarchive/events/{event_id}/polygons",
+            get(archive_event_polygons),
+        )
+        .route(
+            "/v1/hrrrarchive/events/{event_id}/runs",
+            get(archive_event_runs),
         )
         .route("/v1/latest/{model}/{domain}", get(latest))
         .route("/v1/resolve", get(resolve))
@@ -564,6 +608,8 @@ fn import_rustwx_grids(args: ImportRustwxGridsArgs) -> Result<()> {
     let started = Instant::now();
     let source_count = args.manifests.len();
     let mut source_manifests = Vec::with_capacity(source_count);
+    let model_overridden = args.model.is_some();
+    let run_overridden = args.run.is_some();
     let mut batch_model = args.model.clone();
     let mut batch_run = args.run.clone();
     let member = args.member.clone().or_else(|| Some("control".to_string()));
@@ -581,7 +627,7 @@ fn import_rustwx_grids(args: ImportRustwxGridsArgs) -> Result<()> {
         )
         .with_context(|| format!("parse {}", manifest_path.display()))?;
         let model = batch_model.get_or_insert_with(|| manifest.model.clone());
-        if model != &manifest.model {
+        if !model_overridden && model != &manifest.model {
             bail!(
                 "manifest model mismatch in batch import: expected '{}', got '{}' from {}",
                 model,
@@ -590,7 +636,7 @@ fn import_rustwx_grids(args: ImportRustwxGridsArgs) -> Result<()> {
             );
         }
         let run = batch_run.get_or_insert_with(|| manifest.run_id.clone());
-        if run != &manifest.run_id {
+        if !run_overridden && run != &manifest.run_id {
             bail!(
                 "manifest run mismatch in batch import: expected '{}', got '{}' from {}",
                 run,
@@ -1219,6 +1265,8 @@ struct AppState {
     static_plots: Option<Arc<StaticPlotLane>>,
     plot_lab: Arc<PlotLabLane>,
     cross_sections: Arc<CrossSectionLane>,
+    soundings: Arc<SoundingLane>,
+    archive: Option<Arc<ArchiveLane>>,
     ops_root: PathBuf,
     cache: RwLock<ResponseCache>,
 }
@@ -1259,6 +1307,24 @@ struct CrossSectionLane {
     renderer: PathBuf,
     store_root: PathBuf,
     artifact_root: PathBuf,
+}
+
+struct SoundingLane {
+    renderer: PathBuf,
+    volume_renderer: PathBuf,
+    pressure_volume_root: PathBuf,
+    artifact_root: PathBuf,
+    cache_root: PathBuf,
+}
+
+struct ArchiveLane {
+    root: PathBuf,
+}
+
+#[derive(Debug, Deserialize)]
+struct ArchiveEventsQuery {
+    rank: Option<String>,
+    limit: Option<usize>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -1692,6 +1758,441 @@ impl CrossSectionLane {
             bail!("cross-section artifact path escapes root");
         }
         Ok(canonical)
+    }
+}
+
+impl SoundingLane {
+    fn from_env(ops_root: &Path) -> Result<Self> {
+        let renderer = std::env::var_os("WXSTORE_SOUNDING_RENDERER")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| {
+                let node_path = PathBuf::from(
+                    "/opt/free-weather-api/build/rustwx-target/release/sounding_plot",
+                );
+                if node_path.exists() {
+                    node_path
+                } else {
+                    ops_root.join("bin").join(if cfg!(windows) {
+                        "sounding_plot.exe"
+                    } else {
+                        "sounding_plot"
+                    })
+                }
+            });
+        let volume_renderer = std::env::var_os("WXSTORE_VOLUME_SOUNDING_RENDERER")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| {
+                let node_path = PathBuf::from(
+                    "/opt/free-weather-api/build/rustwx-target/release/volume_store_sounding_render",
+                );
+                if node_path.exists() {
+                    node_path
+                } else {
+                    ops_root.join("bin").join(if cfg!(windows) {
+                        "volume_store_sounding_render.exe"
+                    } else {
+                        "volume_store_sounding_render"
+                    })
+                }
+            });
+        let pressure_volume_root = std::env::var_os("WXSTORE_PRESSURE_VOLUME_ROOT")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| ops_root.join("pressure_volume"));
+        let artifact_root = std::env::var_os("WXSTORE_SOUNDING_ARTIFACT_ROOT")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| ops_root.join("soundings"));
+        let cache_root = std::env::var_os("WXSTORE_SOUNDING_CACHE_ROOT")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| ops_root.join("cache"));
+        fs::create_dir_all(&artifact_root).with_context(|| {
+            format!("create sounding artifact root {}", artifact_root.display())
+        })?;
+        fs::create_dir_all(&cache_root)
+            .with_context(|| format!("create sounding cache root {}", cache_root.display()))?;
+        Ok(Self {
+            renderer,
+            volume_renderer,
+            pressure_volume_root,
+            artifact_root,
+            cache_root,
+        })
+    }
+
+    fn status_json(&self) -> Value {
+        let renderer_present = self.renderer.is_file();
+        let volume_renderer_present = self.volume_renderer.is_file();
+        let stores = self.available_pressure_stores();
+        let status = if volume_renderer_present && !stores.is_empty() {
+            "ready"
+        } else if renderer_present {
+            "legacy_renderer_ready"
+        } else {
+            "renderer_missing"
+        };
+        json!({
+            "schema": "wxstore.sounding.status.v1",
+            "status": status,
+            "renderer": self.renderer,
+            "renderer_present": renderer_present,
+            "volume_renderer": self.volume_renderer,
+            "volume_renderer_present": volume_renderer_present,
+            "pressure_volume_root": self.pressure_volume_root,
+            "pressure_stores": stores,
+            "artifact_root": self.artifact_root,
+            "cache_root": self.cache_root
+        })
+    }
+
+    fn available_pressure_stores(&self) -> Vec<Value> {
+        let mut stores = Vec::new();
+        let Ok(models) = fs::read_dir(&self.pressure_volume_root) else {
+            return stores;
+        };
+        for model_entry in models.flatten() {
+            let model_path = model_entry.path();
+            if !model_path.is_dir() {
+                continue;
+            }
+            let model = model_entry.file_name().to_string_lossy().to_string();
+            let Ok(runs) = fs::read_dir(&model_path) else {
+                continue;
+            };
+            for run_entry in runs.flatten() {
+                let store_path = run_entry.path().join("store");
+                if pressure_volume_store_complete(&store_path) {
+                    stores.push(json!({
+                        "model": model,
+                        "run": run_entry.file_name().to_string_lossy(),
+                        "store": store_path
+                    }));
+                }
+            }
+        }
+        stores.sort_by(|a, b| {
+            let ak = format!("{}|{}", a["model"], a["run"]);
+            let bk = format!("{}|{}", b["model"], b["run"]);
+            bk.cmp(&ak)
+        });
+        stores
+    }
+
+    fn latest_volume_run(&self, model: &str) -> Option<String> {
+        let latest = self.pressure_volume_root.join(model).join("latest.json");
+        fs::read(latest)
+            .ok()
+            .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
+            .and_then(|value| value.get("run").and_then(Value::as_str).map(str::to_string))
+            .or_else(|| {
+                let model_path = self.pressure_volume_root.join(model);
+                let mut runs = list_dirs(&model_path)
+                    .into_iter()
+                    .filter(|run| {
+                        pressure_volume_store_complete(&model_path.join(run).join("store"))
+                    })
+                    .collect::<Vec<_>>();
+                runs.sort();
+                runs.pop()
+            })
+    }
+
+    fn resolve_volume_run(&self, model: &str, run: &str) -> Result<String> {
+        let run = if run == "latest" {
+            self.latest_volume_run(model)
+                .ok_or_else(|| anyhow!("no latest pressure volume store for {model}"))?
+        } else {
+            run.to_string()
+        };
+        let store = self
+            .pressure_volume_root
+            .join(model)
+            .join(&run)
+            .join("store");
+        if !pressure_volume_store_complete(&store) {
+            bail!(
+                "pressure volume store is not available for {model}/{run}: {}",
+                store.display()
+            );
+        }
+        Ok(run)
+    }
+
+    fn resolve_volume_store(&self, model: &str, run: &str) -> Result<(String, PathBuf)> {
+        let resolved_run = self.resolve_volume_run(model, run)?;
+        let store = self
+            .pressure_volume_root
+            .join(model)
+            .join(&resolved_run)
+            .join("store");
+        Ok((resolved_run, store))
+    }
+
+    fn artifact_path(&self, render_id: &str, file_name: &str) -> Result<PathBuf> {
+        if !safe_path_component(render_id) || !safe_path_component(file_name) {
+            bail!("invalid sounding artifact path");
+        }
+        let root = fs::canonicalize(&self.artifact_root).with_context(|| {
+            format!(
+                "canonicalize sounding artifact root {}",
+                self.artifact_root.display()
+            )
+        })?;
+        let path = root.join(render_id).join(file_name);
+        let canonical = fs::canonicalize(&path)
+            .with_context(|| format!("sounding artifact not found: {}", path.display()))?;
+        if !canonical.starts_with(&root) {
+            bail!("sounding artifact path escapes root");
+        }
+        Ok(canonical)
+    }
+}
+
+impl ArchiveLane {
+    fn open(root: &Path) -> Result<Self> {
+        fs::create_dir_all(root.join("events")).with_context(|| {
+            format!(
+                "create archive events root {}",
+                root.join("events").display()
+            )
+        })?;
+        Ok(Self {
+            root: root.to_path_buf(),
+        })
+    }
+
+    fn status_json(&self) -> Value {
+        let events = self.event_summaries(None, None).unwrap_or_default();
+        let complete_pressure_stores = events
+            .iter()
+            .flat_map(|event| {
+                event
+                    .get("runs")
+                    .and_then(Value::as_array)
+                    .into_iter()
+                    .flatten()
+            })
+            .filter(|run| {
+                run.get("pressure_store_complete")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false)
+            })
+            .count();
+        json!({
+            "schema": "wxstore.archive.status.v1",
+            "status": if events.is_empty() { "empty" } else { "ready" },
+            "root": self.root,
+            "event_count": events.len(),
+            "complete_pressure_stores": complete_pressure_stores,
+            "events_url": "/v1/hrrrarchive/events"
+        })
+    }
+
+    fn event_summaries(&self, rank: Option<&str>, limit: Option<usize>) -> Result<Vec<Value>> {
+        let mut summaries = Vec::new();
+        for event_id in list_dirs(&self.root.join("events")) {
+            let event = self.read_event(&event_id)?;
+            if !archive_rank_matches(&event, rank) {
+                continue;
+            }
+            let runs = archive_runs_with_store_status(&event);
+            summaries.push(json!({
+                "event_id": event_id,
+                "convective_day": event.get("convective_day").cloned().unwrap_or(Value::String(event_id.clone())),
+                "max_outlook": event.get("max_outlook").cloned().unwrap_or(Value::Null),
+                "peak_iso": event.get("peak_iso").cloned().unwrap_or(Value::Null),
+                "tornado_count": event.get("tornado_count").cloned().unwrap_or(Value::Null),
+                "max_ef": event.get("max_ef").cloned().unwrap_or(Value::Null),
+                "mrgl": event.get("mrgl").cloned().unwrap_or(Value::Null),
+                "bounds": event.get("bounds").cloned().unwrap_or(Value::Null),
+                "runs": runs,
+                "url": format!("/v1/hrrrarchive/events/{event_id}"),
+                "polygons_url": format!("/v1/hrrrarchive/events/{event_id}/polygons"),
+                "runs_url": format!("/v1/hrrrarchive/events/{event_id}/runs")
+            }));
+        }
+        summaries.sort_by(|a, b| {
+            let ak = a
+                .get("convective_day")
+                .and_then(Value::as_str)
+                .unwrap_or("");
+            let bk = b
+                .get("convective_day")
+                .and_then(Value::as_str)
+                .unwrap_or("");
+            ak.cmp(bk)
+        });
+        if let Some(limit) = limit {
+            summaries.truncate(limit);
+        }
+        Ok(summaries)
+    }
+
+    fn read_event(&self, event_id: &str) -> Result<Value> {
+        if !safe_path_component(event_id) {
+            bail!("invalid archive event id");
+        }
+        let path = self.root.join("events").join(event_id).join("event.json");
+        serde_json::from_slice(
+            &fs::read(&path).with_context(|| format!("read archive event {}", path.display()))?,
+        )
+        .with_context(|| format!("parse archive event {}", path.display()))
+    }
+
+    fn event_json(&self, event_id: &str) -> Result<Value> {
+        let mut event = self.read_event(event_id)?;
+        let runs = archive_runs_with_store_status(&event);
+        if let Some(object) = event.as_object_mut() {
+            object.insert("runs".to_string(), Value::Array(runs));
+            object.insert(
+                "polygons_url".to_string(),
+                Value::String(format!("/v1/hrrrarchive/events/{event_id}/polygons")),
+            );
+            object.insert(
+                "runs_url".to_string(),
+                Value::String(format!("/v1/hrrrarchive/events/{event_id}/runs")),
+            );
+        }
+        Ok(event)
+    }
+
+    fn polygons_json(&self, event_id: &str) -> Result<Value> {
+        if !safe_path_component(event_id) {
+            bail!("invalid archive event id");
+        }
+        let event_dir = self.root.join("events").join(event_id);
+        let mrgl = read_optional_json(event_dir.join("mrgl.geojson"))?;
+        let volume_mask = read_optional_json(event_dir.join("volume_mask.geojson"))?;
+        let mut features = Vec::new();
+        if let Some(value) = mrgl {
+            append_geojson_features(&mut features, "mrgl", value);
+        }
+        if let Some(value) = volume_mask {
+            append_geojson_features(&mut features, "volume_mask", value);
+        }
+        Ok(json!({
+            "type": "FeatureCollection",
+            "schema": "wxstore.archive.polygons.v1",
+            "event_id": event_id,
+            "features": features
+        }))
+    }
+
+    fn runs_json(&self, event_id: &str) -> Result<Value> {
+        let event = self.read_event(event_id)?;
+        Ok(json!({
+            "schema": "wxstore.archive.runs.v1",
+            "event_id": event_id,
+            "model": "hrrr_archive",
+            "runs": archive_runs_with_store_status(&event)
+        }))
+    }
+}
+
+fn archive_rank_matches(event: &Value, rank: Option<&str>) -> bool {
+    let Some(rank) = rank.map(|value| value.to_ascii_lowercase()) else {
+        return true;
+    };
+    let outlook = event
+        .get("max_outlook")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_ascii_uppercase();
+    match rank.as_str() {
+        "high" => outlook == "HIGH",
+        "mdt" | "moderate" => outlook == "MDT",
+        "mdt-plus" | "mdt_plus" | "moderate-plus" | "moderate_plus" => {
+            outlook == "MDT" || outlook == "HIGH"
+        }
+        _ => true,
+    }
+}
+
+fn archive_runs_with_store_status(event: &Value) -> Vec<Value> {
+    event
+        .get("runs")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default()
+        .into_iter()
+        .map(|mut run| {
+            let complete = run
+                .get("store_path")
+                .and_then(Value::as_str)
+                .map(|path| pressure_volume_store_complete(Path::new(path)))
+                .unwrap_or(false);
+            let run_id = run
+                .get("run_id")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_string();
+            if let Some(object) = run.as_object_mut() {
+                object.insert(
+                    "model".to_string(),
+                    Value::String("hrrr_archive".to_string()),
+                );
+                object.insert("pressure_store_complete".to_string(), Value::Bool(complete));
+                object.insert(
+                    "cross_section_model".to_string(),
+                    Value::String("hrrr_archive".to_string()),
+                );
+                object.insert(
+                    "cross_section_run".to_string(),
+                    Value::String(run_id.clone()),
+                );
+                object.insert(
+                    "cross_section_url".to_string(),
+                    Value::String("/v1/cross-section/render".to_string()),
+                );
+            }
+            run
+        })
+        .collect()
+}
+
+fn read_optional_json(path: PathBuf) -> Result<Option<Value>> {
+    if !path.is_file() {
+        return Ok(None);
+    }
+    serde_json::from_slice(&fs::read(&path).with_context(|| format!("read {}", path.display()))?)
+        .with_context(|| format!("parse {}", path.display()))
+        .map(Some)
+}
+
+fn append_geojson_features(features: &mut Vec<Value>, layer: &str, value: Value) {
+    match value.get("type").and_then(Value::as_str) {
+        Some("FeatureCollection") => {
+            if let Some(items) = value.get("features").and_then(Value::as_array) {
+                for item in items {
+                    let mut item = item.clone();
+                    add_archive_layer_property(&mut item, layer);
+                    features.push(item);
+                }
+            }
+        }
+        Some("Feature") => {
+            let mut value = value;
+            add_archive_layer_property(&mut value, layer);
+            features.push(value);
+        }
+        Some("Polygon") | Some("MultiPolygon") => {
+            features.push(json!({
+                "type": "Feature",
+                "properties": { "layer": layer },
+                "geometry": value
+            }));
+        }
+        _ => {}
+    }
+}
+
+fn add_archive_layer_property(feature: &mut Value, layer: &str) {
+    let Some(object) = feature.as_object_mut() else {
+        return;
+    };
+    let properties = object
+        .entry("properties".to_string())
+        .or_insert_with(|| json!({}));
+    if let Some(properties) = properties.as_object_mut() {
+        properties.insert("layer".to_string(), Value::String(layer.to_string()));
     }
 }
 
@@ -3344,9 +3845,490 @@ async fn projection_demo() -> impl IntoResponse {
     (no_store_headers(), Html(PROJECTION_DEMO_HTML))
 }
 
+async fn archive_viewer() -> impl IntoResponse {
+    (no_store_headers(), Html(ARCHIVE_HTML))
+}
+
 async fn ops() -> impl IntoResponse {
     (no_store_headers(), Html(OPS_HTML))
 }
+
+const ARCHIVE_HTML: &str = r####"<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>HRRR Archive</title>
+  <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
+  <style>
+    * { box-sizing:border-box; }
+    body { margin:0; font-family:Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; color:#111827; background:#f6f8fb; }
+    header { display:flex; align-items:center; justify-content:space-between; gap:12px; padding:10px 14px; border-bottom:1px solid #d0d5dd; background:#fff; }
+    h1 { margin:0; font-size:18px; }
+    .head-actions { display:flex; align-items:center; gap:8px; }
+    .mobile-toggle { display:none; }
+    main { display:grid; grid-template-columns:350px minmax(0,1fr); height:calc(100vh - 55px); min-height:640px; }
+    aside { border-right:1px solid #d0d5dd; background:#fff; overflow:auto; }
+    .toolbar { display:flex; gap:8px; padding:10px; border-bottom:1px solid #e2e8f0; }
+    button, select { min-height:34px; border:1px solid #111827; border-radius:6px; padding:0 10px; font:inherit; font-size:13px; font-weight:800; background:#111827; color:#fff; }
+    button.secondary { background:#fff; color:#111827; border-color:#cbd5e1; }
+    button:disabled { opacity:.55; cursor:default; }
+    select { background:#fff; color:#111827; border-color:#cbd5e1; min-width:0; }
+    label { display:grid; gap:4px; color:#475467; font-size:10px; font-weight:900; text-transform:uppercase; }
+    .event { width:100%; display:grid; gap:4px; padding:10px 12px; border:0; border-bottom:1px solid #e5e7eb; border-radius:0; text-align:left; background:#fff; color:#111827; cursor:pointer; }
+    .event:hover, .event.active { background:#eef6ff; }
+    .event strong { font-size:15px; }
+    .event span { color:#475467; font-size:12px; font-weight:700; }
+    .stage { position:relative; min-width:0; min-height:0; }
+    #map { width:100%; height:100%; background:#e5e7eb; }
+    .panel { position:absolute; z-index:900; left:12px; top:12px; width:min(520px, calc(100% - 24px)); display:grid; gap:8px; padding:10px; border-radius:8px; background:rgba(255,255,255,.96); box-shadow:0 8px 24px rgba(0,0,0,.18); }
+    .summary { color:#334155; font-size:13px; line-height:1.35; }
+    .controls { display:grid; grid-template-columns:1.25fr 1.25fr .7fr; gap:8px; }
+    .buttons { display:grid; grid-template-columns:repeat(4,minmax(0,1fr)); gap:6px; }
+    .runbar { display:flex; flex-wrap:wrap; gap:6px; }
+    .pill { display:inline-flex; align-items:center; min-height:24px; border:1px solid #cbd5e1; border-radius:999px; padding:0 8px; color:#334155; background:#f8fafc; font-size:12px; font-weight:900; }
+    .pill.ready { color:#14532d; background:#dcfce7; border-color:#86efac; }
+    .output { position:absolute; z-index:910; right:12px; top:12px; width:430px; max-width:calc(100% - 24px); max-height:calc(100% - 24px); overflow:auto; border-radius:8px; background:rgba(255,255,255,.96); box-shadow:0 8px 24px rgba(0,0,0,.18); display:none; }
+    .output.show { display:block; }
+    .output-head { display:flex; justify-content:space-between; gap:8px; align-items:center; padding:8px 10px; border-bottom:1px solid #e2e8f0; font-weight:900; }
+    .output-body { padding:8px; display:grid; gap:8px; color:#334155; font-size:12px; }
+    .output img { width:100%; height:auto; display:block; border:1px solid #e2e8f0; border-radius:6px; background:#fff; }
+    .static-sections { display:grid; gap:12px; }
+    .static-section { display:grid; gap:7px; }
+    .static-filter { display:flex; flex-wrap:wrap; gap:6px; }
+    .static-filter button.active { background:#111827; color:#fff; border-color:#111827; }
+    .static-section-head { display:flex; align-items:center; justify-content:space-between; gap:8px; color:#111827; font-size:12px; font-weight:900; text-transform:uppercase; }
+    .static-section-head span { color:#64748b; font-size:11px; }
+    .static-domain-head { margin-top:2px; color:#334155; font-size:11px; font-weight:900; text-transform:uppercase; }
+    .static-grid { display:grid; grid-template-columns:repeat(2,minmax(0,1fr)); gap:8px; }
+    .static-card { display:grid; gap:4px; color:#334155; font-size:11px; font-weight:800; }
+    .static-card img { aspect-ratio:16/9; object-fit:cover; }
+    .static-card a { color:#2563eb; text-decoration:none; }
+    .static-card-actions { display:flex; gap:8px; flex-wrap:wrap; font-size:11px; }
+    .status { position:absolute; z-index:880; left:12px; bottom:12px; max-width:min(760px, calc(100% - 24px)); padding:8px 10px; border-radius:7px; background:rgba(17,24,39,.86); color:#e5e7eb; font-size:12px; line-height:1.35; }
+    a { color:#2563eb; font-weight:900; }
+    @media (max-width:980px) {
+      html, body { height:100%; overflow:hidden; }
+      header { position:relative; z-index:1300; min-height:55px; padding:8px 10px; }
+      h1 { font-size:16px; }
+      .head-actions .pill { display:none; }
+      .mobile-toggle { display:inline-grid; place-items:center; min-height:34px; padding:0 9px; }
+      main { display:block; height:calc(100dvh - 55px); min-height:0; }
+      aside {
+        display:none;
+        position:fixed;
+        z-index:1250;
+        top:62px;
+        left:10px;
+        right:10px;
+        max-height:min(68dvh, 520px);
+        overflow:auto;
+        border:1px solid #cbd5e1;
+        border-radius:8px;
+        box-shadow:0 14px 32px rgba(15,23,42,.28);
+      }
+      body.events-open aside { display:block; }
+      .stage { height:100%; min-height:0; }
+      .panel {
+        display:none;
+        position:absolute;
+        left:10px;
+        right:10px;
+        top:10px;
+        width:auto;
+        max-height:calc(100% - 72px);
+        overflow:auto;
+      }
+      body.tools-open .panel { display:grid; }
+      .controls { grid-template-columns:1fr; }
+      .buttons { grid-template-columns:repeat(2,minmax(0,1fr)); }
+      .output { position:absolute; left:10px; right:10px; width:auto; top:auto; bottom:10px; max-height:min(74dvh, calc(100% - 28px)); }
+      .status { left:10px; right:10px; bottom:10px; max-width:none; }
+      .static-grid { grid-template-columns:1fr; }
+    }
+  </style>
+</head>
+<body>
+  <header>
+    <h1>HRRR Severe Archive</h1>
+    <div class="head-actions">
+      <button id="eventsToggle" class="secondary mobile-toggle" type="button">Events</button>
+      <button id="toolsToggle" class="secondary mobile-toggle" type="button">Tools</button>
+      <span class="pill">archive only</span>
+    </div>
+  </header>
+  <main>
+    <aside>
+      <div class="toolbar">
+        <select id="rank"><option value="high">HIGH</option><option value="mdt-plus">MDT+</option></select>
+        <button id="refresh">Refresh</button>
+      </div>
+      <div id="events"></div>
+    </aside>
+    <section class="stage">
+      <div id="map"></div>
+      <div class="panel">
+        <div class="summary" id="summary">Loading archive...</div>
+        <div class="runbar" id="runs"></div>
+        <div class="controls">
+          <label>Product<select id="product"></select></label>
+          <label>Run<select id="run"></select></label>
+          <label>Hour<select id="hour"></select></label>
+        </div>
+        <div class="buttons">
+          <button id="loadTile">Map Tile</button>
+          <button id="loadStatic" class="secondary">Plots</button>
+          <button id="loadSounding" class="secondary">Sounding</button>
+          <button id="renderCross" class="secondary">Cross</button>
+        </div>
+        <div class="buttons">
+          <button id="setA" class="secondary">Set A</button>
+          <button id="setB" class="secondary">Set B</button>
+          <button id="clearTile" class="secondary">Clear</button>
+          <button id="hideOutput" class="secondary">Hide</button>
+        </div>
+      </div>
+      <div class="output" id="output">
+        <div class="output-head"><span id="outputTitle">Archive output</span><button id="closeOutput" class="secondary">Close</button></div>
+        <div class="output-body" id="outputBody"></div>
+      </div>
+      <div class="status" id="status">SPC outlook polygons load first. Archive tiles and soundings appear as event processing completes.</div>
+    </section>
+  </main>
+  <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+  <script>
+    const $ = id => document.getElementById(id);
+    const els = {
+      events:$("events"), rank:$("rank"), refresh:$("refresh"), summary:$("summary"), runs:$("runs"),
+      product:$("product"), run:$("run"), hour:$("hour"), loadTile:$("loadTile"), loadStatic:$("loadStatic"),
+      loadSounding:$("loadSounding"), renderCross:$("renderCross"), setA:$("setA"), setB:$("setB"),
+      clearTile:$("clearTile"), status:$("status"), output:$("output"), outputTitle:$("outputTitle"),
+      outputBody:$("outputBody"), closeOutput:$("closeOutput"), hideOutput:$("hideOutput"),
+      eventsToggle:$("eventsToggle"), toolsToggle:$("toolsToggle")
+    };
+    let map, base, polygons, archiveTile, selectedEvent, selectedPoint, pointMarker, pointA, pointB, pathLayer;
+    let eventBody = null;
+    let variables = {};
+    let staticPlotCards = [];
+    let staticPlotGroupLimits = {};
+    let staticPlotDomainFilter = "conus";
+    const STATIC_INITIAL_LIMIT = 4;
+    const STATIC_DOMAIN_ORDER = ["conus", "midwest", "southeast", "southern_plains"];
+    const STATIC_GROUP_ORDER = ["severe", "surface", "precip", "clouds", "upper_air", "other"];
+    const preferred = ["stp_fixed","sbcape","mlcape","mucape","srh_0_1km","srh_0_3km","bulk_shear_0_6km","2m_dewpoint","2m_temperature","composite_reflectivity"];
+    function defaultsFor(name) {
+      const lower = String(name || "").toLowerCase();
+      if (lower.includes("stp") || lower.includes("scp") || lower.includes("ehi")) return ["magma", "0", "5"];
+      if (lower.includes("cape")) return ["magma", "0", "5000"];
+      if (lower.includes("cin")) return ["magma", "-250", "0"];
+      if (lower.includes("srh")) return ["magma", "-150", "500"];
+      if (lower.includes("shear") || lower.includes("wind")) return ["wind", "0", "80"];
+      if (lower.includes("rh") || lower.includes("humidity") || lower.includes("cloud")) return ["humidity", "0", "100"];
+      if (lower.includes("qpf") || lower.includes("precip")) return ["magma", "0", "75"];
+      if (lower.includes("reflectivity")) return ["magma", "0", "75"];
+      if (lower.includes("temp") || lower.includes("dewpoint") || lower.includes("wetbulb")) return ["temperature", "-30", "35"];
+      return ["temperature", "0", "1"];
+    }
+    function esc(v) { return String(v ?? "").replace(/[&<>"']/g, ch => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[ch])); }
+    function setStatus(text) { els.status.textContent = text; }
+    function showOutput(title, html) { els.outputTitle.textContent = title; els.outputBody.innerHTML = html; els.output.classList.add("show"); }
+    function hideOutput() { els.output.classList.remove("show"); }
+    function isMobileLayout() { return window.matchMedia("(max-width: 980px)").matches; }
+    function closeMobileDrawer(name) {
+      if (!isMobileLayout()) return;
+      document.body.classList.remove(name);
+    }
+    async function fetchJson(url, options) {
+      const res = await fetch(url, options);
+      if (!res.ok) throw new Error(`${res.status} ${await res.text()}`);
+      return res.json();
+    }
+    function ensureMap() {
+      if (map) return;
+      map = L.map("map", { preferCanvas:true, zoomControl:true }).setView([38, -97], 4);
+      base = L.tileLayer("https://tile.openstreetmap.org/{z}/{x}/{y}.png", { maxZoom:12, attribution:"&copy; OpenStreetMap" }).addTo(map);
+      map.on("click", event => setSelectedPoint(event.latlng));
+    }
+    async function loadEvents() {
+      ensureMap();
+      const body = await fetchJson(`/v1/hrrrarchive/events?rank=${encodeURIComponent(els.rank.value)}`);
+      const events = body.events || [];
+      els.events.innerHTML = events.map(ev => {
+        const ready = (ev.runs || []).some(run => run.pressure_store_complete);
+        return `<button class="event ${ev.event_id === selectedEvent ? "active" : ""}" data-id="${esc(ev.event_id)}"><strong>${esc(ev.convective_day)}</strong><span>${esc(ev.max_outlook)} | peak ${esc(ev.peak_iso)} | ${esc(ev.tornado_count)} tor | ${ready ? "store ready" : "planned"}</span></button>`;
+      }).join("");
+      for (const button of els.events.querySelectorAll("button")) button.onclick = () => {
+        closeMobileDrawer("events-open");
+        loadEvent(button.dataset.id);
+      };
+      if (!selectedEvent && events.length) {
+        const ready = events.find(ev => (ev.runs || []).some(run => run.pressure_store_complete));
+        loadEvent((ready || events[events.length - 1]).event_id);
+      }
+    }
+    async function loadEvent(id) {
+      selectedEvent = id;
+      eventBody = await fetchJson(`/v1/hrrrarchive/events/${encodeURIComponent(id)}`);
+      const poly = await fetchJson(`/v1/hrrrarchive/events/${encodeURIComponent(id)}/polygons`);
+      for (const button of els.events.querySelectorAll("button")) button.classList.toggle("active", button.dataset.id === id);
+      drawPolygons(poly);
+      populateRuns(eventBody.runs || []);
+      els.summary.innerHTML = `<strong>${esc(eventBody.convective_day)}</strong> ${esc(eventBody.max_outlook)} | peak ${esc(eventBody.peak_iso)} | EF${esc(eventBody.max_ef)} max | ${esc(eventBody.tornado_count)} tornadoes`;
+      await loadArchiveVariables();
+      setStatus(`${eventBody.convective_day}: SPC outlook and WxStore coverage loaded. Click the map for sounding/cross-section points.`);
+    }
+    function populateRuns(runs) {
+      els.run.innerHTML = runs.map(run => `<option value="${esc(run.run_id)}">${esc(run.kind)} ${esc(run.init_iso)}${run.pressure_store_complete ? " ready" : " planned"}</option>`).join("");
+      const ready = runs.find(run => run.pressure_store_complete) || runs[0];
+      if (ready) els.run.value = ready.run_id;
+      els.runs.innerHTML = runs.map(run => `<button class="secondary" data-run="${esc(run.run_id)}">${esc(run.kind)} f${esc(run.peak_fhour)} ${run.pressure_store_complete ? "ready" : "planned"}</button>`).join("");
+      for (const button of els.runs.querySelectorAll("button")) button.onclick = () => { els.run.value = button.dataset.run; loadArchiveVariables(); };
+    }
+    function selectedRun() {
+      return (eventBody?.runs || []).find(run => run.run_id === els.run.value) || (eventBody?.runs || [])[0] || {};
+    }
+    async function loadArchiveVariables() {
+      const run = els.run.value;
+      variables = {};
+      els.product.innerHTML = `<option value="">processing...</option>`;
+      els.hour.innerHTML = `<option value="">--</option>`;
+      try {
+        const data = await fetchJson(`/v1/variables?model=hrrr_archive&run=${encodeURIComponent(run)}`);
+        variables = data.available_hours || {};
+        const names = Object.keys(variables).sort();
+        const ordered = preferred.filter(name => names.includes(name)).concat(names.filter(name => !preferred.includes(name)));
+        els.product.innerHTML = ordered.map(name => `<option value="${esc(name)}">${esc(name.replaceAll("_"," "))}</option>`).join("");
+        if (ordered.length) els.product.value = ordered[0];
+        populateHours();
+      } catch (err) {
+        const runInfo = selectedRun();
+        const hours = runInfo.pressure_fhours || runInfo.plot_fhours || [];
+        els.product.innerHTML = `<option value="">archive tiles pending</option>`;
+        els.hour.innerHTML = hours.map(hour => `<option value="${hour}">f${String(hour).padStart(3,"0")}</option>`).join("");
+        if (runInfo.peak_fhour != null) els.hour.value = String(runInfo.peak_fhour);
+        setStatus(`Archive tiles pending for ${run}. Polygons, pressure soundings, and static plots may still be available.`);
+      }
+    }
+    function populateHours() {
+      const hours = variables[els.product.value] || [];
+      els.hour.innerHTML = hours.map(hour => `<option value="${hour}">f${String(hour).padStart(3,"0")}</option>`).join("");
+      const runInfo = selectedRun();
+      if (runInfo.peak_fhour != null && hours.map(String).includes(String(runInfo.peak_fhour))) els.hour.value = String(runInfo.peak_fhour);
+    }
+    function drawPolygons(poly) {
+      ensureMap();
+      if (polygons) polygons.remove();
+      polygons = L.geoJSON(poly, {
+        style: feature => {
+          const layer = feature.properties && feature.properties.layer;
+          if (layer === "volume_mask") return { color:"#0891b2", weight:3, opacity:.95, fill:false, dashArray:"8 5" };
+          return { color:"#991b1b", weight:3, opacity:.95, fillColor:"#ef4444", fillOpacity:.16 };
+        },
+        onEachFeature: (feature, layer) => {
+          const kind = feature.properties && feature.properties.layer === "volume_mask" ? "WxStore coverage" : "SPC outlook";
+          layer.bindTooltip(kind, { sticky:true });
+        }
+      }).addTo(map);
+      const bounds = polygons.getBounds();
+      if (bounds.isValid()) map.fitBounds(bounds.pad(.12));
+      setTimeout(() => map.invalidateSize(), 50);
+    }
+    async function loadTile() {
+      if (!els.product.value) { setStatus("No archive tile product is available for this run yet."); return; }
+      const run = els.run.value;
+      const product = els.product.value;
+      const hour = els.hour.value;
+      const [palette, min, max] = defaultsFor(product);
+      setStatus(`Loading archive tile ${product} f${String(hour).padStart(3,"0")}...`);
+      const params = new URLSearchParams({ hours:String(hour), palette, range:`${min},${max}`, base_url:location.origin });
+      const url = `/v1/mapbox/layers/hrrr_archive/${encodeURIComponent(run)}/${encodeURIComponent(product)}?${params.toString()}`;
+      const data = await fetchJson(url);
+      const frame = data.frames && data.frames[0];
+      if (!frame) throw new Error("archive layer returned no tile frame");
+      if (archiveTile) map.removeLayer(archiveTile);
+      archiveTile = L.tileLayer(frame.tiles[0], { opacity:.72, maxZoom:data.maxzoom || 9 }).addTo(map);
+      if (data.bounds) map.fitBounds([[data.bounds[1], data.bounds[0]], [data.bounds[3], data.bounds[2]]], { padding:[18,18] });
+      setStatus(`${eventBody.convective_day} ${product} f${String(hour).padStart(3,"0")} loaded from hrrr_archive.`);
+    }
+    function setSelectedPoint(latlng) {
+      selectedPoint = { lat:latlng.lat, lng:latlng.lng };
+      if (pointMarker) pointMarker.remove();
+      pointMarker = L.circleMarker([selectedPoint.lat, selectedPoint.lng], { radius:6, color:"#111827", weight:2, fillColor:"#facc15", fillOpacity:.95 }).addTo(map);
+      setStatus(`Selected ${selectedPoint.lat.toFixed(4)}, ${selectedPoint.lng.toFixed(4)} for archive sounding/cross-section.`);
+    }
+    function setRoutePoint(which) {
+      if (!selectedPoint) { setStatus("Click the map first."); return; }
+      if (which === "A") pointA = {...selectedPoint}; else pointB = {...selectedPoint};
+      if (pathLayer) pathLayer.remove();
+      const items = [];
+      if (pointA) items.push(L.circleMarker([pointA.lat, pointA.lng], { radius:6, color:"#0f766e", weight:3, fillColor:"#ccfbf1", fillOpacity:.95 }).bindTooltip("A", { permanent:true }));
+      if (pointB) items.push(L.circleMarker([pointB.lat, pointB.lng], { radius:6, color:"#be123c", weight:3, fillColor:"#ffe4e6", fillOpacity:.95 }).bindTooltip("B", { permanent:true }));
+      if (pointA && pointB) items.push(L.polyline([[pointA.lat, pointA.lng], [pointB.lat, pointB.lng]], { color:"#facc15", weight:3, opacity:.95, dashArray:"8 6" }));
+      pathLayer = L.layerGroup(items).addTo(map);
+      setStatus(`Set ${which}: ${selectedPoint.lat.toFixed(4)}, ${selectedPoint.lng.toFixed(4)}`);
+    }
+    async function loadSounding() {
+      if (!selectedPoint) { setStatus("Click the map first."); return; }
+      const runInfo = selectedRun();
+      setStatus("Rendering archive sounding...");
+      const report = await fetchJson("/v1/sounding/render", {
+        method:"POST",
+        headers:{"Content-Type":"application/json"},
+        body:JSON.stringify({ model:"hrrr_archive", run:els.run.value, hour:Number(els.hour.value || runInfo.peak_fhour || 0), lat:selectedPoint.lat, lon:selectedPoint.lng, source:"aws", sample_method:"inverse-distance4", crop_radius_deg:1.25 })
+      });
+      const url = report.png_url || report.output?.png_url;
+      showOutput("Archive sounding", `<a href="${esc(url)}" target="_blank" rel="noopener"><img src="${esc(url)}" alt="sounding"></a><div>${esc(report.resolved_run)} f${String(report.request?.forecast_hour ?? els.hour.value).padStart(3,"0")} | ${esc(report.profile?.levels || "--")} levels | ${esc(report.server_elapsed_ms || report.timing?.total_ms || "--")} ms</div>`);
+      setStatus("Archive sounding rendered.");
+    }
+    async function renderCross() {
+      if (!pointA || !pointB) { setStatus("Set A and B first."); return; }
+      const runInfo = selectedRun();
+      setStatus("Rendering archive cross section...");
+      const report = await fetchJson("/v1/cross-section/render", {
+        method:"POST",
+        headers:{"Content-Type":"application/json"},
+        body:JSON.stringify({ model:"hrrr_archive", run:els.run.value, hour:Number(els.hour.value || runInfo.peak_fhour || 0), start_lat:pointA.lat, start_lon:pointA.lng, end_lat:pointB.lat, end_lon:pointB.lng, product:"wind_speed", width:1400, height:820 })
+      });
+      const first = (report.outputs || [])[0];
+      const url = first && (first.webp_url || first.png_url);
+      showOutput("Archive cross section", `<a href="${esc(url)}" target="_blank" rel="noopener"><img src="${esc(url)}" alt="cross section"></a><div>${esc(report.resolved_run || els.run.value)} f${String(report.hour ?? els.hour.value).padStart(3,"0")} | ${esc(report.product || "wind_speed")}</div>`);
+      setStatus("Archive cross section rendered.");
+    }
+    function artifactProductKey(artifact) {
+      const key = String(artifact?.artifact_key || "");
+      if (key.includes(":")) return key.split(":").pop();
+      const path = String(artifact?.relative_path || artifact?.path || "");
+      const match = path.match(/_f\d{3}_[^_]+_(.+)\.(png|webp)$/);
+      return match ? match[1] : key;
+    }
+    function staticPlotPriority(item) {
+      const key = artifactProductKey(item.artifact);
+      const selected = els.product.value;
+      if (selected && key === selected) return -100;
+      const preferredIndex = preferred.indexOf(key);
+      if (preferredIndex >= 0) return preferredIndex;
+      const lower = key.toLowerCase();
+      if (/cape|cin|stp|srh|shear|helicity|lapse|ehi|supercell/.test(lower)) return 20;
+      if (/2m|10m|surface|mslp|dewpoint|relative_humidity|apparent|gust|temperature|wetbulb/.test(lower)) return 30;
+      if (/qpf|precip|rain|snow|ice|reflectivity/.test(lower)) return 40;
+      if (/cloud|visibility|fog|satellite/.test(lower)) return 50;
+      if (/850mb|700mb|500mb|300mb|250mb|200mb|height_winds|vorticity/.test(lower)) return 70;
+      return 60;
+    }
+    function staticPlotCategory(item) {
+      const lower = artifactProductKey(item.artifact).toLowerCase();
+      if (/cape|cin|stp|srh|shear|helicity|lapse|ehi|supercell|uh_/.test(lower)) return "severe";
+      if (/2m|10m|surface|mslp|dewpoint|relative_humidity|apparent|gust|temperature|wetbulb/.test(lower)) return "surface";
+      if (/qpf|precip|rain|snow|ice|reflectivity/.test(lower)) return "precip";
+      if (/cloud|visibility|fog|satellite/.test(lower)) return "clouds";
+      if (/850mb|700mb|500mb|300mb|250mb|200mb|height_winds|vorticity/.test(lower)) return "upper_air";
+      return "other";
+    }
+    function staticPlotCategoryLabel(group) {
+      return {
+        severe:"Severe",
+        surface:"Surface",
+        precip:"Precip / Radar",
+        clouds:"Clouds / Visibility",
+        upper_air:"Upper Air",
+        other:"Other"
+      }[group] || group.replaceAll("_", " ");
+    }
+    function staticPlotCardHtml(item) {
+      const key = artifactProductKey(item.artifact);
+      const url = item.artifact.url;
+      return `<div class="static-card"><a href="${esc(url)}" target="_blank" rel="noopener"><img loading="lazy" decoding="async" src="${esc(url)}" alt="${esc(key)}"></a><span>${esc(item.manifest.domain)} ${esc(key)}</span><div class="static-card-actions"><a href="${esc(url)}" target="_blank" rel="noopener">Full size</a><a href="${esc(url)}" download>Download</a></div></div>`;
+    }
+    function renderStaticPlotGroups(hour) {
+      const domains = STATIC_DOMAIN_ORDER;
+      const groups = new Map();
+      for (const item of staticPlotCards) {
+        const group = staticPlotCategory(item);
+        if (!groups.has(group)) groups.set(group, []);
+        groups.get(group).push(item);
+      }
+      const filterHtml = `<div class="static-filter">${domains.map(domain => `<button class="secondary ${staticPlotDomainFilter === domain ? "active" : ""}" type="button" data-static-domain="${esc(domain)}">${esc(domain.replaceAll("_", " "))}</button>`).join("")}</div>`;
+      const sections = STATIC_GROUP_ORDER
+        .filter(group => groups.has(group))
+        .map(group => {
+          const items = groups.get(group);
+          const limit = staticPlotGroupLimits[group] || STATIC_INITIAL_LIMIT;
+          const shown = items.slice(0, limit);
+          const more = items.length > shown.length
+            ? `<button class="secondary" type="button" data-static-more="${esc(group)}">Show ${Math.min(5, items.length - shown.length)} more</button>`
+            : "";
+          return `<div class="static-section"><div class="static-section-head">${esc(staticPlotCategoryLabel(group))}<span>${shown.length}/${items.length}</span></div><div class="static-grid">${shown.map(staticPlotCardHtml).join("")}</div>${more}</div>`;
+        });
+      const body = sections.length
+        ? `<div class="static-sections">${sections.join("")}</div><div>${esc(staticPlotDomainFilter.replaceAll("_", " "))} plots for f${String(hour).padStart(3,"0")}. Pick another region above to fetch that region only.</div>`
+        : `<div>No ${esc(staticPlotDomainFilter.replaceAll("_", " "))} static plots are published for f${String(hour).padStart(3,"0")} yet.</div>`;
+      showOutput("Archive static plots", `${filterHtml}${body}`);
+      els.outputBody.querySelectorAll("[data-static-domain]").forEach(button => {
+        button.onclick = () => {
+          loadStaticPlots(button.dataset.staticDomain).catch(err => setStatus(err.message));
+        };
+      });
+      els.outputBody.querySelectorAll("[data-static-more]").forEach(button => {
+        button.onclick = () => {
+          const key = button.dataset.staticMore;
+          staticPlotGroupLimits[key] = (staticPlotGroupLimits[key] || STATIC_INITIAL_LIMIT) + 5;
+          renderStaticPlotGroups(hour);
+        };
+      });
+    }
+    async function loadStaticPlots() {
+      const runInfo = selectedRun();
+      const hour = Number(els.hour.value || runInfo.peak_fhour || 0);
+      const domain = arguments[0] || staticPlotDomainFilter || "conus";
+      staticPlotDomainFilter = domain;
+      setStatus(`Loading ${domain.replaceAll("_", " ")} static plots for f${String(hour).padStart(3,"0")}...`);
+      const params = new URLSearchParams({ model:"hrrr", date:runInfo.date_yyyymmdd || "", cycle_utc:String(runInfo.cycle_utc ?? 6), forecast_hour:String(hour), domain, include_artifacts:"true", manifest_limit:"40", artifact_limit:"1000" });
+      const data = await fetchJson(`/v1/static-plots?${params.toString()}`);
+      const cards = (data.manifests || [])
+        .flatMap(manifest => (manifest.artifacts || [])
+          .filter(a => a.state === "complete" && a.exists !== false)
+          .map(a => ({ manifest, artifact:a })))
+        .sort((a, b) => staticPlotPriority(a) - staticPlotPriority(b)
+          || String(a.manifest.domain || "").localeCompare(String(b.manifest.domain || ""))
+          || artifactProductKey(a.artifact).localeCompare(artifactProductKey(b.artifact)));
+      staticPlotCards = cards;
+      staticPlotGroupLimits = {};
+      renderStaticPlotGroups(hour);
+      setStatus(`Loaded ${cards.length} ${domain.replaceAll("_", " ")} plot artifacts for f${String(hour).padStart(3,"0")}.`);
+    }
+    els.refresh.onclick = loadEvents;
+    els.rank.onchange = () => { selectedEvent = null; loadEvents().catch(err => setStatus(err.message)); };
+    els.run.onchange = loadArchiveVariables;
+    els.product.onchange = populateHours;
+    els.loadTile.onclick = () => loadTile().catch(err => setStatus(err.message));
+    els.clearTile.onclick = () => { if (archiveTile) map.removeLayer(archiveTile); archiveTile = null; setStatus("Archive tile cleared."); };
+    els.loadStatic.onclick = () => loadStaticPlots().catch(err => setStatus(err.message));
+    els.loadSounding.onclick = () => loadSounding().catch(err => setStatus(err.message));
+    els.setA.onclick = () => setRoutePoint("A");
+    els.setB.onclick = () => setRoutePoint("B");
+    els.renderCross.onclick = () => renderCross().catch(err => setStatus(err.message));
+    els.closeOutput.onclick = hideOutput;
+    els.hideOutput.onclick = hideOutput;
+    els.eventsToggle.onclick = () => {
+      document.body.classList.toggle("events-open");
+      document.body.classList.remove("tools-open");
+      setTimeout(() => map && map.invalidateSize(), 60);
+    };
+    els.toolsToggle.onclick = () => {
+      document.body.classList.toggle("tools-open");
+      document.body.classList.remove("events-open");
+      setTimeout(() => map && map.invalidateSize(), 60);
+    };
+    window.addEventListener("resize", () => {
+      if (!isMobileLayout()) {
+        document.body.classList.remove("events-open", "tools-open");
+      }
+      setTimeout(() => map && map.invalidateSize(), 60);
+    });
+    loadEvents().catch(err => setStatus(err.message));
+  </script>
+</body>
+</html>"####;
 
 const WEATHER_TOOLS_HTML: &str = r####"<!doctype html>
 <html lang="en">
@@ -4483,7 +5465,7 @@ const INDEX_HTML: &str = r#"<!doctype html>
     }
     .analysis-path { display: grid; grid-template-columns: 1fr 1fr; gap: 6px; margin: 8px 0; }
     .analysis-path strong { color: #111827; }
-    .analysis-buttons { display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 6px; margin: 8px 0; }
+    .analysis-buttons { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 6px; margin: 8px 0; }
     .analysis-buttons button { height: 30px; font-size: 12px; padding: 0 6px; }
     .analysis-label { margin-top: 8px; }
     .analysis-output { margin-top: 8px; min-height: 54px; }
@@ -4562,6 +5544,7 @@ const INDEX_HTML: &str = r#"<!doctype html>
     <div id="selectedPoint" class="analysis-point">Click the map to choose a point.</div>
     <div class="analysis-buttons">
       <button id="loadMeteogram" type="button">Meteogram</button>
+      <button id="loadSounding" type="button">Sounding</button>
       <button id="setCrossStart" type="button">Set A</button>
       <button id="setCrossEnd" type="button">Set B</button>
     </div>
@@ -4572,7 +5555,7 @@ const INDEX_HTML: &str = r#"<!doctype html>
     </div>
     <button id="renderCrossSection" type="button">Render Cross Section</button>
     <div id="analysisOutput" class="analysis-output">
-      <div class="analysis-message">Meteograms use the clicked point. Cross sections use A to B.</div>
+      <div class="analysis-message">Meteograms and soundings use the clicked point. Cross sections use A to B.</div>
     </div>
   </div>
   <div class="panel">
@@ -4669,6 +5652,7 @@ const INDEX_HTML: &str = r#"<!doctype html>
       usageRate: document.getElementById("usageRate"),
       selectedPoint: document.getElementById("selectedPoint"),
       loadMeteogram: document.getElementById("loadMeteogram"),
+      loadSounding: document.getElementById("loadSounding"),
       setCrossStart: document.getElementById("setCrossStart"),
       setCrossEnd: document.getElementById("setCrossEnd"),
       crossProduct: document.getElementById("crossProduct"),
@@ -5237,6 +6221,40 @@ const INDEX_HTML: &str = r#"<!doctype html>
       }
     }
 
+    async function loadSoundingFromMap() {
+      if (!selectedPoint) {
+        analysisMessage("Click the map first to choose the sounding point.");
+        return;
+      }
+      els.loadSounding.disabled = true;
+      analysisMessage("Rendering sounding...");
+      try {
+        const report = await fetchJson("/v1/sounding/render", {
+          method: "POST",
+          headers: {"Content-Type": "application/json"},
+          body: JSON.stringify({
+            model: els.model.value,
+            run: els.runA.value || "latest",
+            lat: selectedPoint.lat,
+            lon: selectedPoint.lng,
+            hour: Number(els.hour.value || 0),
+            sample_method: "inverse-distance4",
+            crop_radius_deg: 1.25,
+          }),
+        });
+        const imageUrl = report.png_url || report.output?.png_url;
+        if (!imageUrl) throw new Error("sounding renderer returned no image");
+        const profile = report.profile || {};
+        els.analysisOutput.innerHTML =
+          `<a href='${escapeHtml(imageUrl)}' target='_blank' rel='noopener'><img src='${escapeHtml(imageUrl)}' alt='sounding'></a>` +
+          `<div class='analysis-meta'>${escapeHtml(report.model || els.model.value)} ${escapeHtml(report.resolved_run || els.runA.value || "latest")} f${String(report.request?.forecast_hour ?? els.hour.value ?? 0).padStart(3, "0")} | ${escapeHtml(profile.levels || "--")} levels | ${report.cache_hit ? "cached" : "rendered"} | ${report.server_elapsed_ms || report.timing?.total_ms || "--"} ms</div>`;
+      } catch (err) {
+        analysisMessage(`Sounding failed: ${err.message}`);
+      } finally {
+        els.loadSounding.disabled = false;
+      }
+    }
+
     async function loadCrossProducts() {
       try {
         const data = await fetchJson("/v1/cross-section/products");
@@ -5715,6 +6733,7 @@ const INDEX_HTML: &str = r#"<!doctype html>
       if (wasActive) startUsageMonitor();
     });
     els.loadMeteogram.addEventListener("click", loadMeteogramFromMap);
+    els.loadSounding.addEventListener("click", loadSoundingFromMap);
     els.setCrossStart.addEventListener("click", () => setCrossPoint("start"));
     els.setCrossEnd.addEventListener("click", () => setCrossPoint("end"));
     els.renderCrossSection.addEventListener("click", renderCrossSectionFromMap);
@@ -7584,6 +8603,22 @@ struct CrossSectionRenderRequest {
     force: Option<bool>,
 }
 
+#[derive(Debug, Clone, Deserialize)]
+struct SoundingRenderRequest {
+    model: Option<String>,
+    run: Option<String>,
+    source: Option<String>,
+    hour: Option<u16>,
+    forecast_hour: Option<u16>,
+    lat: f64,
+    lon: f64,
+    sample_method: Option<String>,
+    crop_radius_deg: Option<f64>,
+    box_radius_km: Option<f64>,
+    station_id: Option<String>,
+    force: Option<bool>,
+}
+
 #[derive(Debug, Deserialize)]
 struct CanonicalQuery {
     hours: Option<String>,
@@ -7631,6 +8666,79 @@ async fn status(State(state): State<Arc<AppState>>) -> Json<Value> {
         state.spatial.as_deref(),
         state.static_plots.as_deref(),
         Some(state.cache_stats()),
+        state.archive.as_deref(),
+    ))
+}
+
+async fn archive_status(State(state): State<Arc<AppState>>) -> Result<Json<Value>, ApiError> {
+    let Some(archive) = state.archive.as_deref() else {
+        return Err(not_found("archive root is not configured"));
+    };
+    Ok(Json(archive.status_json()))
+}
+
+async fn archive_events(
+    State(state): State<Arc<AppState>>,
+    Query(query): Query<ArchiveEventsQuery>,
+) -> Result<Json<Value>, ApiError> {
+    let Some(archive) = state.archive.as_deref() else {
+        return Err(not_found("archive root is not configured"));
+    };
+    let limit = query.limit.map(|limit| limit.min(5000));
+    let events = archive
+        .event_summaries(query.rank.as_deref(), limit)
+        .map_err(|err| internal_error(err.to_string()))?;
+    Ok(Json(json!({
+        "schema": "wxstore.archive.events.v1",
+        "root": archive.root,
+        "rank": query.rank,
+        "event_count": events.len(),
+        "events": events
+    })))
+}
+
+async fn archive_event(
+    State(state): State<Arc<AppState>>,
+    AxumPath(event_id): AxumPath<String>,
+) -> Result<Json<Value>, ApiError> {
+    let Some(archive) = state.archive.as_deref() else {
+        return Err(not_found("archive root is not configured"));
+    };
+    archive
+        .event_json(&event_id)
+        .map(Json)
+        .map_err(|err| not_found(err.to_string()))
+}
+
+async fn archive_event_runs(
+    State(state): State<Arc<AppState>>,
+    AxumPath(event_id): AxumPath<String>,
+) -> Result<Json<Value>, ApiError> {
+    let Some(archive) = state.archive.as_deref() else {
+        return Err(not_found("archive root is not configured"));
+    };
+    archive
+        .runs_json(&event_id)
+        .map(Json)
+        .map_err(|err| not_found(err.to_string()))
+}
+
+async fn archive_event_polygons(
+    State(state): State<Arc<AppState>>,
+    AxumPath(event_id): AxumPath<String>,
+) -> Result<Response, ApiError> {
+    let Some(archive) = state.archive.as_deref() else {
+        return Err(not_found("archive root is not configured"));
+    };
+    let value = archive
+        .polygons_json(&event_id)
+        .map_err(|err| not_found(err.to_string()))?;
+    let bytes = serde_json::to_vec(&value).map_err(|err| internal_error(err.to_string()))?;
+    Ok(bytes_response(
+        Bytes::from(bytes),
+        "application/geo+json",
+        false,
+        false,
     ))
 }
 
@@ -8904,6 +10012,357 @@ async fn cross_section_artifact(
     Ok(response)
 }
 
+async fn sounding_status(State(state): State<Arc<AppState>>) -> Json<Value> {
+    Json(state.soundings.status_json())
+}
+
+async fn sounding_render(
+    State(state): State<Arc<AppState>>,
+    Json(request): Json<SoundingRenderRequest>,
+) -> Result<Json<Value>, ApiError> {
+    let lane = state.soundings.clone();
+    let spatial = state.spatial.clone();
+    let response = tokio::task::spawn_blocking(move || {
+        run_sounding_render(&lane, spatial.as_deref(), request)
+    })
+    .await
+    .map_err(|err| internal_error(format!("join error: {err}")))?
+    .map_err(|err| bad_request(err.to_string()))?;
+    Ok(Json(response))
+}
+
+async fn sounding_artifact(
+    State(state): State<Arc<AppState>>,
+    AxumPath((render_id, file_name)): AxumPath<(String, String)>,
+) -> Result<Response, ApiError> {
+    let path = state
+        .soundings
+        .artifact_path(&render_id, &file_name)
+        .map_err(|err| not_found(err.to_string()))?;
+    let bytes = fs::read(&path).map_err(|err| not_found(err.to_string()))?;
+    let mut response = Bytes::from(bytes).into_response();
+    let content_type = match path.extension().and_then(|ext| ext.to_str()).unwrap_or("") {
+        "png" => "image/png",
+        "json" => "application/json",
+        _ => "application/octet-stream",
+    };
+    response
+        .headers_mut()
+        .insert(header::CONTENT_TYPE, HeaderValue::from_static(content_type));
+    response.headers_mut().insert(
+        header::CACHE_CONTROL,
+        HeaderValue::from_static("public, max-age=86400"),
+    );
+    Ok(response)
+}
+
+fn run_sounding_render(
+    lane: &SoundingLane,
+    spatial: Option<&SpatialLane>,
+    request: SoundingRenderRequest,
+) -> Result<Value> {
+    if !request.lat.is_finite() || !request.lon.is_finite() {
+        bail!("sounding coordinates must be finite");
+    }
+    if !(-90.0..=90.0).contains(&request.lat) {
+        bail!("sounding latitude must be within [-90, 90]");
+    }
+    let model = normalize_cli_token(request.model.as_deref().unwrap_or("hrrr"), "model")?;
+    let requested_run = request.run.unwrap_or_else(|| "latest".to_string());
+    let volume_store = lane.resolve_volume_store(&model, &requested_run).ok();
+    let resolved_run = volume_store
+        .as_ref()
+        .map(|(run, _)| run.clone())
+        .map(Ok)
+        .unwrap_or_else(|| {
+            if is_archive_sounding_model(&model) {
+                lane.resolve_volume_run(&model, &requested_run)
+            } else {
+                resolve_sounding_run(spatial, &model, &requested_run)
+            }
+        })?;
+    let volume_store = volume_store.or_else(|| {
+        lane.resolve_volume_store(&model, &resolved_run)
+            .ok()
+            .filter(|_| lane.volume_renderer.is_file())
+    });
+    let using_volume_store = volume_store.is_some();
+    if using_volume_store && !lane.volume_renderer.is_file() {
+        bail!(
+            "volume-store sounding renderer is not present: {}",
+            lane.volume_renderer.display()
+        );
+    }
+    if !using_volume_store && !lane.renderer.is_file() {
+        bail!(
+            "sounding renderer is not present: {}",
+            lane.renderer.display()
+        );
+    }
+    let (date, cycle) = if using_volume_store {
+        parse_run_date_cycle(&resolved_run).unwrap_or_default()
+    } else {
+        parse_run_date_cycle(&resolved_run)?
+    };
+    let render_model = sounding_cli_model(&model);
+    let source = if using_volume_store {
+        "pressure_volume".to_string()
+    } else {
+        normalize_cli_token(
+            request
+                .source
+                .as_deref()
+                .unwrap_or_else(|| default_sounding_source(&render_model)),
+            "source",
+        )?
+    };
+    let hour = request.forecast_hour.or(request.hour).unwrap_or(0);
+    if hour > 840 {
+        bail!("forecast hour is too large");
+    }
+    let sample_method = normalize_sounding_sample_method(
+        request
+            .sample_method
+            .as_deref()
+            .unwrap_or("inverse-distance4"),
+    )?;
+    let crop_radius_deg = request.crop_radius_deg.unwrap_or(1.25).clamp(0.25, 6.0);
+    let lon = normalize_lon(request.lon);
+    let render_id = stable_sounding_id(&json!({
+        "model": &model,
+        "render_model": &render_model,
+        "run": &resolved_run,
+        "requested_run": &requested_run,
+        "source": &source,
+        "hour": hour,
+        "lat": request.lat,
+        "lon": lon,
+        "backend": if using_volume_store { "pressure_volume" } else { "grib" },
+        "sample_method": &sample_method,
+        "crop_radius_deg": crop_radius_deg,
+        "box_radius_km": request.box_radius_km,
+        "station_id": request.station_id
+    }));
+    let out_dir = lane.artifact_root.join(&render_id);
+    let png_path = out_dir.join("sounding.png");
+    let report_path = out_dir.join("sounding_manifest.json");
+    if report_path.is_file() && png_path.is_file() && !request.force.unwrap_or(false) {
+        let mut report: Value = serde_json::from_slice(&fs::read(&report_path)?)?;
+        annotate_sounding_report(&render_id, &mut report);
+        report["cache_hit"] = json!(true);
+        report["requested_run"] = json!(requested_run);
+        report["resolved_run"] = json!(resolved_run);
+        report["model"] = json!(model);
+        report["render_model"] = json!(render_model);
+        report["backend"] = json!(if using_volume_store {
+            "pressure_volume"
+        } else {
+            "grib"
+        });
+        return Ok(report);
+    }
+    fs::create_dir_all(&out_dir)?;
+
+    let mut command = if let Some((_, store)) = volume_store.as_ref() {
+        if hour > u16::from(u8::MAX) {
+            bail!("pressure VolumeStore soundings only support f000-f255, got f{hour:03}");
+        }
+        let mut command = ProcessCommand::new(&lane.volume_renderer);
+        command
+            .arg("--store")
+            .arg(store)
+            .arg("--out-dir")
+            .arg(&out_dir)
+            .arg("--hour")
+            .arg(hour.to_string())
+            .arg(format!("--lat={}", request.lat))
+            .arg(format!("--lon={}", lon))
+            .arg("--sample-method")
+            .arg("nearest")
+            .arg("--output")
+            .arg(&png_path)
+            .arg("--manifest")
+            .arg(&report_path)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        if let Some(station_id) = request
+            .station_id
+            .as_deref()
+            .filter(|value| !value.is_empty())
+        {
+            command.arg("--station-id").arg(station_id);
+        }
+        command
+    } else {
+        let mut command = ProcessCommand::new(&lane.renderer);
+        command
+            .arg("--model")
+            .arg(&render_model)
+            .arg("--date")
+            .arg(&date)
+            .arg("--cycle")
+            .arg(cycle.to_string())
+            .arg("--forecast-hour")
+            .arg(hour.to_string())
+            .arg("--source")
+            .arg(&source)
+            .arg(format!("--lat={}", request.lat))
+            .arg(format!("--lon={}", lon))
+            .arg("--crop-radius-deg")
+            .arg(crop_radius_deg.to_string())
+            .arg("--sample-method")
+            .arg(&sample_method)
+            .arg("--out-dir")
+            .arg(&out_dir)
+            .arg("--cache-dir")
+            .arg(&lane.cache_root)
+            .arg("--output")
+            .arg(&png_path)
+            .arg("--manifest")
+            .arg(&report_path)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        if let Some(box_radius_km) = request.box_radius_km {
+            command
+                .arg("--box-radius-km")
+                .arg(box_radius_km.to_string());
+        }
+        if let Some(station_id) = request
+            .station_id
+            .as_deref()
+            .filter(|value| !value.is_empty())
+        {
+            command.arg("--station-id").arg(station_id);
+        }
+        command
+    };
+    let started = Instant::now();
+    let output = command.output()?;
+    if !output.status.success() {
+        bail!(
+            "sounding renderer exited {}: {}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    let mut report: Value = serde_json::from_slice(&fs::read(&report_path)?)?;
+    annotate_sounding_report(&render_id, &mut report);
+    report["cache_hit"] = json!(false);
+    report["requested_run"] = json!(requested_run);
+    report["resolved_run"] = json!(resolved_run);
+    report["model"] = json!(model);
+    report["render_model"] = json!(render_model);
+    report["backend"] = json!(if using_volume_store {
+        "pressure_volume"
+    } else {
+        "grib"
+    });
+    report["server_elapsed_ms"] = json!(started.elapsed().as_millis());
+    Ok(report)
+}
+
+fn annotate_sounding_report(render_id: &str, report: &mut Value) {
+    report["schema"] = json!("wxstore.sounding.render.v1");
+    report["render_id"] = json!(render_id);
+    report["artifact_base_url"] = json!(format!("/v1/sounding/artifacts/{render_id}"));
+    report["png_url"] = json!(format!("/v1/sounding/artifacts/{render_id}/sounding.png"));
+    report["manifest_url"] = json!(format!(
+        "/v1/sounding/artifacts/{render_id}/sounding_manifest.json"
+    ));
+    if let Some(output) = report.get_mut("output").and_then(Value::as_object_mut) {
+        output.insert(
+            "png_url".to_string(),
+            Value::String(format!("/v1/sounding/artifacts/{render_id}/sounding.png")),
+        );
+        output.insert(
+            "manifest_url".to_string(),
+            Value::String(format!(
+                "/v1/sounding/artifacts/{render_id}/sounding_manifest.json"
+            )),
+        );
+    }
+}
+
+fn stable_sounding_id(value: &Value) -> String {
+    let body = serde_json::to_string(value).unwrap_or_else(|_| format!("{value:?}"));
+    let mut hash = 0xcbf29ce484222325u64;
+    for byte in body.as_bytes() {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    format!("snd_{hash:016x}")
+}
+
+fn resolve_sounding_run(
+    spatial: Option<&SpatialLane>,
+    model: &str,
+    requested_run: &str,
+) -> Result<String> {
+    if requested_run != "latest" {
+        return Ok(requested_run.to_string());
+    }
+    spatial
+        .and_then(|lane| lane.latest_run_for_model(model))
+        .ok_or_else(|| anyhow!("no latest run is available for model '{model}'"))
+}
+
+fn sounding_cli_model(model: &str) -> String {
+    match model {
+        "hrrr_archive" | "hrrr-archive" => "hrrr".to_string(),
+        "ecmwf" | "ecmwf_open_data" => "ecmwf-open-data".to_string(),
+        value => value.to_string(),
+    }
+}
+
+fn is_archive_sounding_model(model: &str) -> bool {
+    matches!(model, "hrrr_archive" | "hrrr-archive")
+}
+
+fn default_sounding_source(model: &str) -> &'static str {
+    match model {
+        "hrrr" | "hrrr_archive" | "hrrr-archive" => "aws",
+        _ => "nomads",
+    }
+}
+
+fn normalize_sounding_sample_method(value: &str) -> Result<String> {
+    let method = value.trim().to_ascii_lowercase().replace('_', "-");
+    match method.as_str() {
+        "nearest" | "inverse-distance4" | "box-mean" => Ok(method),
+        _ => bail!("unsupported sounding sample method '{value}'"),
+    }
+}
+
+fn parse_run_date_cycle(run: &str) -> Result<(String, u8)> {
+    let chars = run.chars().collect::<Vec<_>>();
+    let mut date = None;
+    for start in 0..chars.len().saturating_sub(7) {
+        let candidate = chars[start..start + 8].iter().collect::<String>();
+        if candidate.chars().all(|ch| ch.is_ascii_digit()) {
+            date = Some(candidate);
+        }
+    }
+    let Some(date) = date else {
+        bail!("could not find YYYYMMDD in run id '{run}'");
+    };
+    let mut cycle = None;
+    for start in 0..chars.len().saturating_sub(2) {
+        if chars[start].is_ascii_digit()
+            && chars[start + 1].is_ascii_digit()
+            && matches!(chars[start + 2], 'z' | 'Z')
+        {
+            let value = chars[start..start + 2].iter().collect::<String>();
+            if let Ok(parsed) = value.parse::<u8>() {
+                if parsed <= 23 {
+                    cycle = Some(parsed);
+                }
+            }
+        }
+    }
+    let cycle = cycle.ok_or_else(|| anyhow!("could not find cycle hour in run id '{run}'"))?;
+    Ok((date, cycle))
+}
+
 fn run_cross_section_render(
     lane: &CrossSectionLane,
     request: CrossSectionRenderRequest,
@@ -9241,6 +10700,7 @@ fn store_status(
     spatial: Option<&SpatialLane>,
     static_plots: Option<&StaticPlotLane>,
     cache: Option<CacheStats>,
+    archive: Option<&ArchiveLane>,
 ) -> Value {
     let spatial_models = spatial.map(SpatialLane::model_ids).unwrap_or_default();
     let profile_ready = !profile.manifest.variables.is_empty()
@@ -9272,7 +10732,8 @@ fn store_status(
             "profile_pressure_core": profile.lane_manifest_json(),
             "diag_scalar_basic": diagnostic.map(DiagnosticLane::lane_manifest_json).unwrap_or_else(|| json!({"status": "unavailable"})),
             "surface_spatial": spatial.map(SpatialLane::lane_manifest_json).unwrap_or_else(|| json!({"status": "unavailable"})),
-            "static_plots": static_plots.map(StaticPlotLane::lane_manifest_json).unwrap_or_else(|| json!({"status": "unavailable"}))
+            "static_plots": static_plots.map(StaticPlotLane::lane_manifest_json).unwrap_or_else(|| json!({"status": "unavailable"})),
+            "archive": archive.map(ArchiveLane::status_json).unwrap_or_else(|| json!({"status": "unavailable"}))
         },
         "monitoring": monitoring_status(profile, diagnostic, spatial, static_plots, &cache_stats),
         "cache": cache_stats
@@ -12873,7 +14334,11 @@ fn grid_meta_from_latlon(
     lon: &[f32],
     record: &RustwxGridExportRecord,
 ) -> Value {
-    if model == "hrrr" && !lat.is_empty() && lat.len() == nx * ny && lon.len() == nx * ny {
+    if matches!(model, "hrrr" | "hrrr_archive")
+        && !lat.is_empty()
+        && lat.len() == nx * ny
+        && lon.len() == nx * ny
+    {
         let hrrr = HrrrLambert::default();
         let (x_start, y_start, x_end, y_end) = if let Some(crop) = record.crop {
             (crop.x_start, crop.y_start, crop.x_end, crop.y_end)
