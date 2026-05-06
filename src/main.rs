@@ -2119,6 +2119,14 @@ fn archive_runs_with_store_status(event: &Value) -> Vec<Value> {
                 .and_then(Value::as_str)
                 .map(|path| pressure_volume_store_complete(Path::new(path)))
                 .unwrap_or(false);
+            let pressure_hours = if complete {
+                run.get("store_path")
+                    .and_then(Value::as_str)
+                    .and_then(|path| pressure_volume_store_hours(Path::new(path)))
+            } else {
+                None
+            };
+            let static_hours = archive_static_plot_hours_from_run(&run);
             let run_id = run
                 .get("run_id")
                 .and_then(Value::as_str)
@@ -2130,6 +2138,14 @@ fn archive_runs_with_store_status(event: &Value) -> Vec<Value> {
                     Value::String("hrrr_archive".to_string()),
                 );
                 object.insert("pressure_store_complete".to_string(), Value::Bool(complete));
+                if let Some(hours) = pressure_hours {
+                    object.insert("pressure_fhours".to_string(), hours_to_json_array(&hours));
+                } else {
+                    object.remove("pressure_fhours");
+                }
+                if let Some(hours) = static_hours {
+                    object.insert("plot_fhours".to_string(), hours_to_json_array(&hours));
+                }
                 object.insert(
                     "cross_section_model".to_string(),
                     Value::String("hrrr_archive".to_string()),
@@ -2200,6 +2216,94 @@ fn pressure_volume_store_complete(store_path: &Path) -> bool {
     store_path.join("manifest.json").is_file()
         && store_path.join("index.bin").is_file()
         && store_path.join("chunks.bin").is_file()
+}
+
+fn pressure_volume_store_hours(store_path: &Path) -> Option<Vec<u16>> {
+    let manifest_path = store_path.join("manifest.json");
+    let manifest: Value = serde_json::from_slice(&fs::read(manifest_path).ok()?).ok()?;
+    let mut hours: Vec<u16> = manifest
+        .get("forecast_hours")
+        .and_then(Value::as_array)?
+        .iter()
+        .filter_map(|hour| hour.as_u64())
+        .filter_map(|hour| u16::try_from(hour).ok())
+        .collect();
+    hours.sort_unstable();
+    hours.dedup();
+    Some(hours)
+}
+
+fn hours_to_json_array(hours: &[u16]) -> Value {
+    Value::Array(
+        hours
+            .iter()
+            .map(|hour| Value::Number(serde_json::Number::from(*hour)))
+            .collect(),
+    )
+}
+
+fn archive_static_plot_hours_from_run(run: &Value) -> Option<Vec<u16>> {
+    let date = run.get("date_yyyymmdd").and_then(Value::as_str)?;
+    let cycle = run.get("cycle_utc").and_then(Value::as_u64)?;
+    let weather_root = archive_weather_root_from_run(run)?;
+    let static_dir = weather_root.join("static_plots").join("conus");
+    let entries = fs::read_dir(static_dir).ok()?;
+    let prefix = format!("rustwx_hrrr_{date}_{cycle}z_f");
+    let mut hours = BTreeSet::new();
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+            continue;
+        };
+        if !name.starts_with(&prefix) || !name.ends_with("_run_manifest.json") {
+            continue;
+        }
+        let hour_start = prefix.len();
+        let Some(hour_text) = name.get(hour_start..hour_start + 3) else {
+            continue;
+        };
+        let Ok(hour) = hour_text.parse::<u16>() else {
+            continue;
+        };
+        let manifest = fs::read(&path)
+            .ok()
+            .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok());
+        let Some(manifest) = manifest else {
+            continue;
+        };
+        if manifest.get("state").and_then(Value::as_str) == Some("failed") {
+            continue;
+        }
+        let artifact_count = manifest
+            .get("artifact_count")
+            .and_then(Value::as_u64)
+            .or_else(|| {
+                manifest
+                    .get("artifacts")
+                    .and_then(Value::as_array)
+                    .map(|artifacts| artifacts.len() as u64)
+            })
+            .unwrap_or(0);
+        if artifact_count == 0 {
+            continue;
+        }
+        hours.insert(hour);
+    }
+    if hours.is_empty() {
+        None
+    } else {
+        Some(hours.into_iter().collect())
+    }
+}
+
+fn archive_weather_root_from_run(run: &Value) -> Option<PathBuf> {
+    let store_path = Path::new(run.get("store_path").and_then(Value::as_str)?);
+    for ancestor in store_path.ancestors() {
+        if ancestor.file_name().and_then(|name| name.to_str()) == Some("pressure_volume") {
+            return ancestor.parent().map(Path::to_path_buf);
+        }
+    }
+    None
 }
 
 fn normalize_plot_lab_request(mut request: PlotLabRenderRequest) -> Result<PlotLabRenderRequest> {
@@ -4286,7 +4390,7 @@ const ARCHIVE_HTML: &str = r####"<!doctype html>
       const data = await fetchJson(`/v1/static-plots?${params.toString()}`);
       const cards = (data.manifests || [])
         .flatMap(manifest => (manifest.artifacts || [])
-          .filter(a => a.state === "complete" && a.exists !== false)
+          .filter(a => a.exists === true || (a.state === "complete" && a.exists !== false))
           .map(a => ({ manifest, artifact:a })))
         .sort((a, b) => staticPlotPriority(a) - staticPlotPriority(b)
           || String(a.manifest.domain || "").localeCompare(String(b.manifest.domain || ""))
