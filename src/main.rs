@@ -132,6 +132,8 @@ struct ServeArgs {
     #[arg(long)]
     static_plots_root: Option<PathBuf>,
     #[arg(long)]
+    satellite_tiles_root: Option<PathBuf>,
+    #[arg(long)]
     archive_root: Option<PathBuf>,
     #[arg(long, default_value = "127.0.0.1")]
     host: String,
@@ -144,6 +146,11 @@ fn infer_ops_root(args: &ServeArgs) -> PathBuf {
         .as_ref()
         .and_then(|path| path.parent())
         .or_else(|| args.spatial_root.as_ref().and_then(|path| path.parent()))
+        .or_else(|| {
+            args.satellite_tiles_root
+                .as_ref()
+                .and_then(|path| path.parent())
+        })
         .or_else(|| args.profile_store.as_ref().and_then(|path| path.parent()))
         .map(Path::to_path_buf)
         .unwrap_or_else(|| PathBuf::from("."))
@@ -315,6 +322,12 @@ async fn serve(args: ServeArgs) -> Result<()> {
             .map(|path| StaticPlotLane::open(path))
             .transpose()
             .map(|lane| lane.map(Arc::new))?,
+        satellite_tiles: args
+            .satellite_tiles_root
+            .as_ref()
+            .map(|path| SatelliteTileLane::open(path))
+            .transpose()
+            .map(|lane| lane.map(Arc::new))?,
         plot_lab: Arc::new(PlotLabLane::from_env(&ops_root)?),
         cross_sections: Arc::new(CrossSectionLane::from_env(&ops_root)?),
         soundings: Arc::new(SoundingLane::from_env(&ops_root)?),
@@ -326,6 +339,7 @@ async fn serve(args: ServeArgs) -> Result<()> {
     let app = Router::new()
         .route("/", get(index))
         .route("/plots", get(plots))
+        .route("/satellite", get(satellite_viewer))
         .route("/tools", get(weather_tools))
         .route("/meteograms", get(weather_tools))
         .route("/cross-sections", get(weather_tools))
@@ -343,6 +357,15 @@ async fn serve(args: ServeArgs) -> Result<()> {
         .route("/v1/products", get(products))
         .route("/v1/static-plots", get(static_plots))
         .route("/v1/static-plots/export-mp4", post(static_plots_export_mp4))
+        .route("/v1/satellite/layers", get(satellite_layers))
+        .route(
+            "/v1/satellite/layers/{layer_id}/frames.json",
+            get(satellite_frames),
+        )
+        .route(
+            "/v1/satellite/tiles/{layer_id}/frames/{frame_id}/{z}/{x}/{tile_file}",
+            get(satellite_tile),
+        )
         .route("/v1/plot-lab/config", get(plot_lab_config))
         .route("/v1/plot-lab/render", post(plot_lab_render))
         .route(
@@ -1268,6 +1291,7 @@ struct AppState {
     diagnostic: Option<Arc<DiagnosticLane>>,
     spatial: Option<Arc<SpatialLane>>,
     static_plots: Option<Arc<StaticPlotLane>>,
+    satellite_tiles: Option<Arc<SatelliteTileLane>>,
     plot_lab: Arc<PlotLabLane>,
     cross_sections: Arc<CrossSectionLane>,
     soundings: Arc<SoundingLane>,
@@ -1315,6 +1339,10 @@ struct CacheStats {
 struct StaticPlotLane {
     root: PathBuf,
     manifest_cache: RwLock<StaticPlotManifestCache>,
+}
+
+struct SatelliteTileLane {
+    root: PathBuf,
 }
 
 struct PlotLabLane {
@@ -2727,6 +2755,123 @@ struct StaticPlotMp4Export {
     version: Option<String>,
 }
 
+impl SatelliteTileLane {
+    fn open(root: &Path) -> Result<Self> {
+        if !root.is_dir() {
+            bail!("satellite tiles root does not exist: {}", root.display());
+        }
+        Ok(Self {
+            root: root.to_path_buf(),
+        })
+    }
+
+    fn layers_json(&self) -> Result<Value> {
+        let mut layers = Vec::new();
+        for entry in fs::read_dir(&self.root)
+            .with_context(|| format!("read satellite root {}", self.root.display()))?
+        {
+            let entry = entry?;
+            let path = entry.path();
+            if !path.is_dir() {
+                continue;
+            }
+            let Some(layer_id) = path.file_name().and_then(|name| name.to_str()) else {
+                continue;
+            };
+            let index_path = path.join("frames.json");
+            if !index_path.is_file() {
+                continue;
+            }
+            let frames = self.frames_json(layer_id).unwrap_or_else(|err| {
+                json!({
+                    "ok": false,
+                    "layer": layer_id,
+                    "error": err.to_string(),
+                    "frames": []
+                })
+            });
+            let frame_count = frames
+                .get("frames")
+                .and_then(Value::as_array)
+                .map(Vec::len)
+                .unwrap_or(0);
+            let latest = frames
+                .get("frames")
+                .and_then(Value::as_array)
+                .and_then(|items| items.last())
+                .cloned()
+                .unwrap_or_else(|| json!(null));
+            layers.push(json!({
+                "id": layer_id,
+                "frame_count": frame_count,
+                "latest": latest,
+                "frames_url": format!("/v1/satellite/layers/{layer_id}/frames.json")
+            }));
+        }
+        layers.sort_by(|a, b| {
+            a.get("id")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .cmp(b.get("id").and_then(Value::as_str).unwrap_or_default())
+        });
+        Ok(json!({
+            "schema": "wxstore.satellite.layers.v1",
+            "root": self.root,
+            "layers": layers
+        }))
+    }
+
+    fn frames_json(&self, layer_id: &str) -> Result<Value> {
+        validate_path_component("satellite layer", layer_id)?;
+        let path = self.root.join(layer_id).join("frames.json");
+        let bytes = fs::read(&path).with_context(|| format!("read {}", path.display()))?;
+        let mut value: Value =
+            serde_json::from_slice(&bytes).with_context(|| format!("parse {}", path.display()))?;
+        if let Some(frames) = value.get_mut("frames").and_then(Value::as_array_mut) {
+            for frame in frames {
+                if let Some(template) = frame.get("url_template").and_then(Value::as_str) {
+                    let normalized = template.trim_start_matches('/');
+                    frame["tile_url_template"] = json!(format!("/v1/satellite/tiles/{normalized}"));
+                }
+            }
+        }
+        value["frames_url"] = json!(format!("/v1/satellite/layers/{layer_id}/frames.json"));
+        Ok(value)
+    }
+
+    fn tile_path(&self, layer_id: &str, frame_id: &str, z: u8, x: u32, y: u32) -> Result<PathBuf> {
+        validate_path_component("satellite layer", layer_id)?;
+        validate_path_component("satellite frame", frame_id)?;
+        let path = self
+            .root
+            .join(layer_id)
+            .join("frames")
+            .join(frame_id)
+            .join(z.to_string())
+            .join(x.to_string())
+            .join(format!("{y}.png"));
+        let root = fs::canonicalize(&self.root)
+            .with_context(|| format!("canonicalize satellite root {}", self.root.display()))?;
+        let path = fs::canonicalize(&path)
+            .with_context(|| format!("satellite tile not found: {}", path.display()))?;
+        if !path.starts_with(&root) {
+            bail!("satellite tile escapes root: {}", path.display());
+        }
+        if !path.is_file() {
+            bail!("satellite tile is missing: {}", path.display());
+        }
+        Ok(path)
+    }
+}
+
+fn validate_path_component(label: &str, value: &str) -> Result<()> {
+    if safe_path_component(value) {
+        Ok(())
+    } else {
+        bail!("invalid {label} path component")
+    }
+}
+
 impl StaticPlotLane {
     fn open(root: &Path) -> Result<Self> {
         if !root.is_dir() {
@@ -3957,6 +4102,10 @@ async fn plots() -> impl IntoResponse {
     (no_store_headers(), Html(PLOTS_HTML))
 }
 
+async fn satellite_viewer() -> impl IntoResponse {
+    (no_store_headers(), Html(SATELLITE_HTML))
+}
+
 async fn weather_tools() -> impl IntoResponse {
     (no_store_headers(), Html(WEATHER_TOOLS_HTML))
 }
@@ -4487,6 +4636,7 @@ const WEATHER_TOOLS_HTML: &str = r####"<!doctype html>
   <header>
     <h1>WxStore Tools</h1>
     <nav>
+      <a class="secondary" href="/satellite">Satellite</a>
       <a class="secondary" href="/plots">Plots</a>
       <a class="secondary" href="/ops">Ops</a>
     </nav>
@@ -5704,6 +5854,7 @@ const INDEX_HTML: &str = r#"<!doctype html>
     <label>Max<input id="max" inputmode="decimal" /></label>
     <label>Compare<span class="check"><input id="compare" type="checkbox" /> side</span></label>
     <button id="apply">Apply</button>
+    <a class="nav-button" href="/satellite">Satellite</a>
     <a class="nav-button" href="/plots">Plots</a>
   </div>
   <div id="layerStackPanel" class="layer-stack-panel">
@@ -6879,6 +7030,299 @@ const INDEX_HTML: &str = r#"<!doctype html>
 </html>
 "#;
 
+const SATELLITE_HTML: &str = r####"<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>WxStore Satellite</title>
+  <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
+  <style>
+    * { box-sizing: border-box; }
+    html, body { height: 100%; margin: 0; }
+    body {
+      font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      background: #0f172a;
+      color: #111827;
+    }
+    #map { width: 100%; height: 100%; background: #111827; }
+    .panel {
+      position: absolute;
+      z-index: 1000;
+      left: 12px;
+      top: 12px;
+      width: min(430px, calc(100vw - 24px));
+      display: grid;
+      gap: 8px;
+      padding: 10px;
+      border-radius: 8px;
+      background: rgba(255,255,255,.95);
+      box-shadow: 0 10px 28px rgba(0,0,0,.24);
+    }
+    .topline {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 8px;
+    }
+    h1 { margin: 0; font-size: 17px; line-height: 1.2; }
+    .navs { display: flex; gap: 6px; }
+    a, button {
+      display: inline-grid;
+      place-items: center;
+      min-height: 32px;
+      border: 1px solid #111827;
+      border-radius: 6px;
+      background: #111827;
+      color: #fff;
+      padding: 0 9px;
+      font: inherit;
+      font-size: 12px;
+      font-weight: 800;
+      text-decoration: none;
+      cursor: pointer;
+    }
+    a.secondary, button.secondary { background: #fff; color: #111827; border-color: #cbd5e1; }
+    button:disabled { opacity: .55; cursor: default; }
+    label {
+      display: grid;
+      gap: 4px;
+      color: #475467;
+      font-size: 10px;
+      font-weight: 900;
+      text-transform: uppercase;
+    }
+    select, input {
+      width: 100%;
+      min-height: 34px;
+      border: 1px solid #cbd5e1;
+      border-radius: 6px;
+      background: #fff;
+      color: #111827;
+      padding: 0 8px;
+      font: inherit;
+      font-size: 13px;
+      text-transform: none;
+    }
+    input[type="range"] { padding: 0; }
+    .row { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
+    .buttons { display: grid; grid-template-columns: repeat(4, minmax(0,1fr)); gap: 6px; }
+    .status {
+      min-height: 34px;
+      padding: 8px;
+      border: 1px solid #e2e8f0;
+      border-radius: 7px;
+      background: #f8fafc;
+      color: #334155;
+      font-size: 12px;
+      line-height: 1.35;
+      overflow-wrap: anywhere;
+    }
+    .legend {
+      position: absolute;
+      z-index: 900;
+      right: 12px;
+      bottom: 12px;
+      max-width: min(460px, calc(100vw - 24px));
+      padding: 8px 10px;
+      border-radius: 7px;
+      background: rgba(15,23,42,.86);
+      color: #e5e7eb;
+      font-size: 12px;
+      line-height: 1.35;
+      overflow-wrap: anywhere;
+    }
+    @media (max-width: 720px) {
+      .panel { right: 10px; left: 10px; top: 10px; width: auto; max-height: 58dvh; overflow: auto; }
+      .topline { align-items: flex-start; flex-direction: column; }
+      .row, .buttons { grid-template-columns: 1fr 1fr; }
+      .legend { left: 10px; right: 10px; bottom: 10px; max-width: none; }
+    }
+  </style>
+</head>
+<body>
+  <div id="map"></div>
+  <div class="panel">
+    <div class="topline">
+      <h1>Satellite Tiles</h1>
+      <div class="navs">
+        <a class="secondary" href="/">Map</a>
+        <a class="secondary" href="/plots">Plots</a>
+        <a class="secondary" href="/ops">Ops</a>
+      </div>
+    </div>
+    <div class="row">
+      <label>Layer<select id="layer"></select></label>
+      <label>Frame<select id="frame"></select></label>
+    </div>
+    <div class="row">
+      <label>Basemap<select id="basemap">
+        <option value="osm">OpenStreetMap</option>
+        <option value="carto">Light</option>
+        <option value="dark">Dark</option>
+      </select></label>
+      <label>Opacity<input id="opacity" type="range" min="0" max="100" value="90" /></label>
+    </div>
+    <div class="buttons">
+      <button id="prev" class="secondary" type="button">Prev</button>
+      <button id="play" type="button">Play</button>
+      <button id="next" class="secondary" type="button">Next</button>
+      <button id="fit" class="secondary" type="button">Fit</button>
+    </div>
+    <div class="buttons">
+      <button id="refresh" class="secondary" type="button">Refresh</button>
+      <button id="latest" class="secondary" type="button">Latest</button>
+      <button id="hide" class="secondary" type="button">Hide</button>
+      <button id="show" class="secondary" type="button">Show</button>
+    </div>
+    <div id="status" class="status">Loading satellite layers...</div>
+  </div>
+  <div id="legend" class="legend">No satellite frame selected.</div>
+  <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+  <script>
+    const els = {
+      layer: document.getElementById("layer"),
+      frame: document.getElementById("frame"),
+      basemap: document.getElementById("basemap"),
+      opacity: document.getElementById("opacity"),
+      prev: document.getElementById("prev"),
+      play: document.getElementById("play"),
+      next: document.getElementById("next"),
+      fit: document.getElementById("fit"),
+      refresh: document.getElementById("refresh"),
+      latest: document.getElementById("latest"),
+      hide: document.getElementById("hide"),
+      show: document.getElementById("show"),
+      status: document.getElementById("status"),
+      legend: document.getElementById("legend"),
+    };
+    const baseDefs = {
+      osm: ["https://tile.openstreetmap.org/{z}/{x}/{y}.png", { maxZoom: 19, attribution: "&copy; OpenStreetMap" }],
+      carto: ["https://{s}.basemaps.cartocdn.com/light_all/{z}/{x}/{y}{r}.png", { maxZoom: 20, attribution: "&copy; OpenStreetMap &copy; CARTO" }],
+      dark: ["https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png", { maxZoom: 20, attribution: "&copy; OpenStreetMap &copy; CARTO" }],
+    };
+    let map = L.map("map", { preferCanvas: true, zoomControl: true }).setView([38, -97], 4);
+    let baseLayer = null;
+    let satLayer = null;
+    let layers = [];
+    let frames = [];
+    let playing = null;
+
+    function setStatus(text) { els.status.textContent = text; }
+    function esc(value) {
+      return String(value ?? "").replace(/[&<>"']/g, ch => ({ "&":"&amp;", "<":"&lt;", ">":"&gt;", '"':"&quot;", "'":"&#39;" }[ch]));
+    }
+    async function fetchJson(url) {
+      const res = await fetch(url, { cache: "no-store" });
+      if (!res.ok) throw new Error(`${res.status} ${await res.text()}`);
+      return res.json();
+    }
+    function setBase(name) {
+      if (baseLayer) map.removeLayer(baseLayer);
+      const [url, options] = baseDefs[name] || baseDefs.osm;
+      baseLayer = L.tileLayer(url, options).addTo(map);
+      if (satLayer) satLayer.bringToFront();
+    }
+    function frameBounds(frame) {
+      const b = frame && frame.bounds;
+      if (!Array.isArray(b) || b.length !== 4) return null;
+      return [[b[1], b[0]], [b[3], b[2]]];
+    }
+    function selectedFrameIndex() {
+      return Math.max(0, frames.findIndex(frame => frame.id === els.frame.value));
+    }
+    function renderFrame(index = selectedFrameIndex(), fit = false) {
+      if (!frames.length) {
+        if (satLayer) map.removeLayer(satLayer);
+        satLayer = null;
+        els.legend.textContent = "No satellite frames are available.";
+        return;
+      }
+      const frame = frames[Math.max(0, Math.min(index, frames.length - 1))];
+      els.frame.value = frame.id;
+      if (satLayer) map.removeLayer(satLayer);
+      const opacity = Number(els.opacity.value || 90) / 100;
+      satLayer = L.tileLayer(frame.tile_url_template, {
+        opacity,
+        minZoom: frame.minzoom || 0,
+        maxNativeZoom: frame.maxzoom || 9,
+        maxZoom: Math.max(12, frame.maxzoom || 9),
+        pane: "tilePane",
+      }).addTo(map);
+      satLayer.bringToFront();
+      const bounds = frameBounds(frame);
+      if (fit && bounds) map.fitBounds(bounds, { padding: [24, 24] });
+      els.legend.textContent = `${els.layer.value} | ${frame.scan_time_utc || frame.id} | z${frame.minzoom}-${frame.maxzoom} | ${frame.tile_count || 0} tiles | ${frame.size_mb || 0} MB`;
+      setStatus(`Loaded ${els.layer.value} frame ${frame.label || frame.id}.`);
+    }
+    async function loadLayers(preserve = true) {
+      const previous = preserve ? els.layer.value : "";
+      const data = await fetchJson("/v1/satellite/layers");
+      layers = data.layers || [];
+      els.layer.innerHTML = layers.map(layer => {
+        const latest = layer.latest && layer.latest.scan_time_utc ? ` ${layer.latest.scan_time_utc}` : "";
+        return `<option value="${esc(layer.id)}">${esc(layer.id)} (${layer.frame_count || 0})${esc(latest)}</option>`;
+      }).join("");
+      if (layers.some(layer => layer.id === previous)) els.layer.value = previous;
+      else if (layers.length) els.layer.value = layers[layers.length - 1].id;
+      if (!layers.length) {
+        setStatus("No satellite tile layers are published yet.");
+        els.legend.textContent = "Run rustwx-runner satellite-run-once or satellite-loop first.";
+        return;
+      }
+      await loadFrames(true);
+    }
+    async function loadFrames(fit = false) {
+      if (!els.layer.value) return;
+      const data = await fetchJson(`/v1/satellite/layers/${encodeURIComponent(els.layer.value)}/frames.json`);
+      frames = (data.frames || []).slice().sort((a, b) => String(a.scan_time_utc || a.id).localeCompare(String(b.scan_time_utc || b.id)));
+      els.frame.innerHTML = frames.map(frame => `<option value="${esc(frame.id)}">${esc(frame.label || frame.scan_time_utc || frame.id)}</option>`).join("");
+      if (frames.length) {
+        els.frame.value = frames[frames.length - 1].id;
+        renderFrame(frames.length - 1, fit);
+      } else {
+        renderFrame(0, false);
+      }
+    }
+    function step(delta) {
+      if (!frames.length) return;
+      const next = (selectedFrameIndex() + delta + frames.length) % frames.length;
+      renderFrame(next, false);
+    }
+    function stop() {
+      if (playing) clearInterval(playing);
+      playing = null;
+      els.play.textContent = "Play";
+    }
+    function togglePlay() {
+      if (playing) {
+        stop();
+        return;
+      }
+      els.play.textContent = "Pause";
+      playing = setInterval(() => step(1), 700);
+    }
+    setBase("osm");
+    els.basemap.addEventListener("change", () => setBase(els.basemap.value));
+    els.layer.addEventListener("change", () => { stop(); loadFrames(true).catch(err => setStatus(err.message)); });
+    els.frame.addEventListener("change", () => { stop(); renderFrame(selectedFrameIndex(), false); });
+    els.opacity.addEventListener("input", () => { if (satLayer) satLayer.setOpacity(Number(els.opacity.value || 90) / 100); });
+    els.prev.addEventListener("click", () => step(-1));
+    els.next.addEventListener("click", () => step(1));
+    els.play.addEventListener("click", togglePlay);
+    els.fit.addEventListener("click", () => renderFrame(selectedFrameIndex(), true));
+    els.latest.addEventListener("click", () => renderFrame(frames.length - 1, true));
+    els.hide.addEventListener("click", () => { if (satLayer) map.removeLayer(satLayer); satLayer = null; });
+    els.show.addEventListener("click", () => renderFrame(selectedFrameIndex(), false));
+    els.refresh.addEventListener("click", () => loadLayers(true).catch(err => setStatus(err.message)));
+    loadLayers(false).catch(err => {
+      setStatus(err.message);
+      els.legend.textContent = "Satellite tile root is not available to WxStore.";
+    });
+  </script>
+</body>
+</html>"####;
+
 const PLOTS_HTML: &str = r#"<!doctype html>
 <html lang="en">
 <head>
@@ -7155,6 +7599,7 @@ const PLOTS_HTML: &str = r#"<!doctype html>
     <h1>WxStore Plot Loop</h1>
     <div class="navs">
       <a class="nav secondary" href="/">Map</a>
+      <a class="nav secondary" href="/satellite">Satellite</a>
       <a class="nav secondary" href="/ops">Ops</a>
       <button id="refresh" type="button">Refresh</button>
     </div>
@@ -8375,7 +8820,7 @@ const OPS_HTML: &str = r#"<!doctype html>
 <body>
   <header>
     <h1>WxStore Ops</h1>
-    <nav><a href="/">Map</a><a href="/plots">Plots</a></nav>
+    <nav><a href="/">Map</a><a href="/satellite">Satellite</a><a href="/plots">Plots</a></nav>
   </header>
   <main>
     <section id="metrics" class="metrics"></section>
@@ -8952,6 +9397,51 @@ async fn static_plots(
         return Err(not_found("static plots root is not configured"));
     };
     Ok((no_store_headers(), Json(static_plots.catalog_json(&query))))
+}
+
+async fn satellite_layers(
+    State(state): State<Arc<AppState>>,
+) -> Result<impl IntoResponse, ApiError> {
+    let Some(lane) = state.satellite_tiles.as_deref() else {
+        return Err(not_found("satellite tiles root is not configured"));
+    };
+    Ok((
+        no_store_headers(),
+        Json(lane.layers_json().map_err(bad_anyhow)?),
+    ))
+}
+
+async fn satellite_frames(
+    State(state): State<Arc<AppState>>,
+    AxumPath(layer_id): AxumPath<String>,
+) -> Result<impl IntoResponse, ApiError> {
+    let Some(lane) = state.satellite_tiles.as_deref() else {
+        return Err(not_found("satellite tiles root is not configured"));
+    };
+    Ok((
+        no_store_headers(),
+        Json(lane.frames_json(&layer_id).map_err(bad_anyhow)?),
+    ))
+}
+
+async fn satellite_tile(
+    State(state): State<Arc<AppState>>,
+    AxumPath((layer_id, frame_id, z, x, tile_file)): AxumPath<(String, String, u8, u32, String)>,
+) -> Result<Response, ApiError> {
+    let Some(lane) = state.satellite_tiles.as_deref() else {
+        return Err(not_found("satellite tiles root is not configured"));
+    };
+    let y = tile_file
+        .strip_suffix(".png")
+        .unwrap_or(tile_file.as_str())
+        .parse::<u32>()
+        .map_err(|_| bad_request("invalid satellite tile y"))?;
+    let tile = lane
+        .tile_path(&layer_id, &frame_id, z, x, y)
+        .map_err(bad_anyhow)?;
+    let bytes = fs::read(&tile)
+        .map_err(|err| internal_error(format!("read satellite tile {}: {err}", tile.display())))?;
+    Ok(bytes_response(Bytes::from(bytes), "image/png", false, true))
 }
 
 async fn static_plots_export_mp4(
