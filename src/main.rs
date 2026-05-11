@@ -55,6 +55,7 @@ const RADAR_POLAR_SIDECAR_SCHEMA: &str = "rustwx.radar.polar_sidecar.v2";
 const RADAR_POLAR_SIDECAR_MANIFEST_FILE: &str = "polar_sidecar_manifest.json";
 const RADAR_POLAR_VALUES_FILE: &str = "polar_values_f32le.bin";
 const RADAR_POLAR_GATE_FLAGS_FILE: &str = "polar_gate_flags_u8.bin";
+const RADAR_SIDECAR_CACHE_MAX_ENTRIES: usize = 24;
 const RADAR_GATE_FLAG_VALID: u8 = 0b0000_0001;
 const RADAR_GATE_FLAG_MISSING: u8 = 0b0000_0010;
 const RADAR_GATE_FLAG_RANGE_FOLDED: u8 = 0b0000_0100;
@@ -1395,6 +1396,62 @@ struct SatelliteTileLane {
 
 struct RadarTileLane {
     root: PathBuf,
+    sidecar_cache: RwLock<RadarSidecarCache>,
+}
+
+#[derive(Default)]
+struct RadarSidecarCache {
+    entries: HashMap<PathBuf, RadarSidecarCacheEntry>,
+    order: VecDeque<PathBuf>,
+}
+
+struct RadarSidecarCacheEntry {
+    fingerprint: RadarSidecarFingerprint,
+    data: Arc<RadarPolarSidecarData>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RadarSidecarFingerprint {
+    manifest: RadarFileFingerprint,
+    values: RadarFileFingerprint,
+    gate_flags: RadarFileFingerprint,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct RadarFileFingerprint {
+    len: u64,
+    modified: Option<SystemTime>,
+}
+
+impl RadarSidecarCache {
+    fn insert(
+        &mut self,
+        path: PathBuf,
+        fingerprint: RadarSidecarFingerprint,
+        data: Arc<RadarPolarSidecarData>,
+    ) {
+        self.entries
+            .insert(path.clone(), RadarSidecarCacheEntry { fingerprint, data });
+        self.touch(&path);
+        while self.entries.len() > RADAR_SIDECAR_CACHE_MAX_ENTRIES {
+            let Some(oldest) = self.order.pop_front() else {
+                break;
+            };
+            if oldest != path {
+                self.entries.remove(&oldest);
+            }
+        }
+    }
+
+    fn touch(&mut self, path: &Path) {
+        self.order.retain(|entry| entry != path);
+        self.order.push_back(path.to_path_buf());
+    }
+
+    fn remove(&mut self, path: &Path) {
+        self.entries.remove(path);
+        self.order.retain(|entry| entry != path);
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -3043,6 +3100,7 @@ impl RadarTileLane {
         }
         Ok(Self {
             root: root.to_path_buf(),
+            sidecar_cache: RwLock::new(RadarSidecarCache::default()),
         })
     }
 
@@ -3233,6 +3291,53 @@ impl RadarTileLane {
         Ok(path)
     }
 
+    fn open_cached_sidecar(&self, manifest_path: &Path) -> Result<Arc<RadarPolarSidecarData>> {
+        let manifest_path = fs::canonicalize(manifest_path)
+            .with_context(|| format!("canonicalize radar sidecar {}", manifest_path.display()))?;
+        if let Some(data) = self.cached_sidecar(&manifest_path) {
+            return Ok(data);
+        }
+
+        let data = Arc::new(RadarPolarSidecarData::open(&manifest_path)?);
+        let fingerprint = radar_sidecar_fingerprint(&manifest_path, &data.manifest)?;
+        if let Ok(mut cache) = self.sidecar_cache.write() {
+            cache.insert(manifest_path, fingerprint, Arc::clone(&data));
+        }
+        Ok(data)
+    }
+
+    fn cached_sidecar(&self, manifest_path: &Path) -> Option<Arc<RadarPolarSidecarData>> {
+        let cached = {
+            let Ok(cache) = self.sidecar_cache.read() else {
+                return None;
+            };
+            let entry = cache.entries.get(manifest_path)?;
+            let fresh = radar_sidecar_fingerprint(manifest_path, &entry.data.manifest).ok()?
+                == entry.fingerprint;
+            fresh.then(|| Arc::clone(&entry.data))
+        };
+
+        if let Some(data) = cached {
+            if let Ok(mut cache) = self.sidecar_cache.write() {
+                cache.touch(manifest_path);
+            }
+            Some(data)
+        } else {
+            if let Ok(mut cache) = self.sidecar_cache.write() {
+                cache.remove(manifest_path);
+            }
+            None
+        }
+    }
+
+    #[cfg(test)]
+    fn cached_sidecar_count(&self) -> usize {
+        self.sidecar_cache
+            .read()
+            .map(|cache| cache.entries.len())
+            .unwrap_or(0)
+    }
+
     fn sample_json(&self, query: &RadarSampleQuery) -> Result<Value> {
         if !query.lat.is_finite()
             || !query.lon.is_finite()
@@ -3250,7 +3355,7 @@ impl RadarTileLane {
             query.tilt.as_deref(),
             RADAR_POLAR_SIDECAR_MANIFEST_FILE,
         )?;
-        let sidecar = RadarPolarSidecarData::open(&sidecar_path)?;
+        let sidecar = self.open_cached_sidecar(&sidecar_path)?;
         if let Some(product) = query.product.as_deref().map(str::trim) {
             if !product.is_empty() && !product.eq_ignore_ascii_case(&sidecar.manifest.product) {
                 bail!(
@@ -3652,6 +3757,28 @@ fn radar_sidecar_content_type(file_name: &str) -> &'static str {
     } else {
         "application/octet-stream"
     }
+}
+
+fn radar_sidecar_fingerprint(
+    manifest_path: &Path,
+    manifest: &RadarPolarSidecarManifest,
+) -> Result<RadarSidecarFingerprint> {
+    let root = manifest_path.parent().unwrap_or_else(|| Path::new("."));
+    let values_path = radar_sidecar_data_path(root, &manifest.values_path, "values")?;
+    let gate_flags_path = radar_sidecar_data_path(root, &manifest.gate_flags_path, "gate flags")?;
+    Ok(RadarSidecarFingerprint {
+        manifest: radar_file_fingerprint(manifest_path)?,
+        values: radar_file_fingerprint(&values_path)?,
+        gate_flags: radar_file_fingerprint(&gate_flags_path)?,
+    })
+}
+
+fn radar_file_fingerprint(path: &Path) -> Result<RadarFileFingerprint> {
+    let metadata = fs::metadata(path).with_context(|| format!("stat {}", path.display()))?;
+    Ok(RadarFileFingerprint {
+        len: metadata.len(),
+        modified: metadata.modified().ok(),
+    })
 }
 
 fn radar_sidecar_data_path(root: &Path, value: &str, label: &str) -> Result<PathBuf> {
@@ -19196,6 +19323,7 @@ mod tests {
         .expect("write flags");
 
         let lane = RadarTileLane::open(&root).expect("open radar lane");
+        assert_eq!(lane.cached_sidecar_count(), 0);
         let query = RadarSampleQuery {
             layer: layer_id.to_string(),
             frame: frame_id.to_string(),
@@ -19207,6 +19335,7 @@ mod tests {
         };
         let sample = lane.sample_json(&query).expect("sample sidecar");
 
+        assert_eq!(lane.cached_sidecar_count(), 1);
         assert_eq!(sample["value"].as_f64(), Some(4.0));
         assert_eq!(sample["units"].as_str(), Some("dBZ"));
         assert_eq!(sample["product"].as_str(), Some("ref"));
@@ -19227,6 +19356,10 @@ mod tests {
         assert_eq!(sample["site"]["feedhorn_height_m"].as_f64(), Some(20.0));
         assert_eq!(sample["site"]["antenna_elevation_m"].as_f64(), Some(390.0));
         assert!((sample["range_m"].as_f64().unwrap() - 750.0).abs() < 1e-6);
+
+        let cached_sample = lane.sample_json(&query).expect("sample cached sidecar");
+        assert_eq!(cached_sample["value"].as_f64(), Some(4.0));
+        assert_eq!(lane.cached_sidecar_count(), 1);
 
         fs::remove_dir_all(root).ok();
     }
