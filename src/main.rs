@@ -8612,6 +8612,7 @@ const RADAR_HTML: &str = r####"<!doctype html>
       const asset = currentAsset();
       const sidecar = asset.numeric_sidecar || state.frame.numeric_sidecar || null;
       const sidecarState = sidecar ? `${sidecar.schema || "sidecar"} / ${sidecar.processing_state || "--"}` : "none";
+      const clipToBounds = asset.clip_to_bounds ?? state.frame.clip_to_bounds ?? false;
       els.frameMeta.innerHTML = [
         row("Layer", state.layer?.id),
         row("Site", state.frame.site),
@@ -8623,6 +8624,7 @@ const RADAR_HTML: &str = r####"<!doctype html>
         row("Zoom", `${asset.minzoom ?? state.frame.minzoom ?? "--"}-${asset.maxzoom ?? state.frame.maxzoom ?? "--"}`),
         row("Native gate", state.frame.native_gate_size_m == null ? "--" : `${fmt(state.frame.native_gate_size_m, 0)} m`),
         row("Az spacing", state.frame.native_azimuth_spacing_deg == null ? "--" : `${fmt(state.frame.native_azimuth_spacing_deg, 4)} deg`),
+        row("Bounds clip", clipToBounds ? "on" : "off"),
         row("Color table", asset.color_table || state.frame.color_table),
         row("Sidecar", sidecarState)
       ].join("");
@@ -18906,6 +18908,7 @@ mod tests {
         assert!(RADAR_HTML.contains("/v1/radar/layers"));
         assert!(RADAR_HTML.contains("/v1/radar/sample"));
         assert!(RADAR_HTML.contains("numeric_sidecar"));
+        assert!(RADAR_HTML.contains("Bounds clip"));
         assert!(RADAR_HTML.contains("contextmenu"));
         assert!(RADAR_HTML.contains(r#"<input id="hoverSample" type="checkbox" />"#));
         assert!(!RADAR_HTML.contains("/v1/satellite"));
@@ -18932,6 +18935,8 @@ mod tests {
                         "scan_time_utc": "2026-05-11T01:21:34Z",
                         "url_template": format!("{layer_id}/frames/{frame_id}/{{z}}/{{x}}/{{y}}.png"),
                         "bounds": [-101.7, 30.3, -99.1, 32.2],
+                        "clip_to_bounds": false,
+                        "sampling_bounds": [-105.3, 27.2, -95.6, 35.5],
                         "minzoom": 8,
                         "maxzoom": 9,
                         "tile_count": 27,
@@ -18962,6 +18967,8 @@ mod tests {
                                 "elevation_deg": 0.43945312,
                                 "url_template": format!("{layer_id}/frames/{frame_id}/sweep00_el0p44/{{z}}/{{x}}/{{y}}.png"),
                                 "bounds": [-101.7, 30.3, -99.1, 32.2],
+                                "clip_to_bounds": false,
+                                "sampling_bounds": [-105.3, 27.2, -95.6, 35.5],
                                 "minzoom": 8,
                                 "maxzoom": 9,
                                 "tile_count": 27,
@@ -19007,7 +19014,11 @@ mod tests {
             frame["maxzoom_site_meters_per_pixel"].as_f64(),
             Some(261.0518623255104)
         );
+        assert_eq!(frame["clip_to_bounds"].as_bool(), Some(false));
+        assert_eq!(frame["sampling_bounds"][0].as_f64(), Some(-105.3));
         assert_eq!(tilt["native_gate_size_m"].as_u64(), Some(250));
+        assert_eq!(tilt["clip_to_bounds"].as_bool(), Some(false));
+        assert_eq!(tilt["sampling_bounds"][2].as_f64(), Some(-95.6));
         assert_eq!(frame["velocity_quality_filter"].as_bool(), Some(true));
         assert_eq!(
             frame["velocity_quality_qc"]["masked_gate_count"].as_u64(),
