@@ -19361,6 +19361,34 @@ mod tests {
         assert_eq!(cached_sample["value"].as_f64(), Some(4.0));
         assert_eq!(lane.cached_sidecar_count(), 1);
 
+        let updated_values_file = "polar_values_updated_f32le.bin";
+        write_test_f32_le(
+            &sidecar_dir.join(updated_values_file),
+            &[1.0, 2.0, 3.0, 5.5, 10.0, 20.0, 30.0, 40.0],
+        );
+        let manifest_path = sidecar_dir.join(RADAR_POLAR_SIDECAR_MANIFEST_FILE);
+        let mut manifest: Value =
+            serde_json::from_slice(&fs::read(&manifest_path).expect("read sidecar manifest"))
+                .expect("parse sidecar manifest");
+        manifest["values_path"] = json!(updated_values_file);
+        manifest["processing_state"] = json!("raw_filtered");
+        fs::write(
+            &manifest_path,
+            serde_json::to_vec_pretty(&manifest).expect("serialize updated sidecar manifest"),
+        )
+        .expect("write updated sidecar manifest");
+
+        let refreshed_sample = lane
+            .sample_json(&query)
+            .expect("sample refreshed sidecar after manifest update");
+        assert_eq!(refreshed_sample["value"].as_f64(), Some(5.5));
+        assert_eq!(
+            refreshed_sample["processing_state"].as_str(),
+            Some("raw_filtered")
+        );
+        assert_eq!(refreshed_sample["filtered"].as_bool(), Some(true));
+        assert_eq!(lane.cached_sidecar_count(), 1);
+
         fs::remove_dir_all(root).ok();
     }
 
