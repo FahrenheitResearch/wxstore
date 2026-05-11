@@ -63,6 +63,14 @@ const RADAR_GATE_FLAG_RANGE_FOLDED: u8 = 0b0000_0100;
 const RADAR_GATE_FLAG_FILTERED: u8 = 0b0000_1000;
 const RADAR_GATE_FLAG_DERIVED: u8 = 0b0001_0000;
 const RADAR_GATE_FLAG_DEALIASED: u8 = 0b0010_0000;
+const RADAR_REQUIRED_GATE_FLAG_MEANINGS: &[(&str, u8)] = &[
+    ("valid", RADAR_GATE_FLAG_VALID),
+    ("missing", RADAR_GATE_FLAG_MISSING),
+    ("range_folded", RADAR_GATE_FLAG_RANGE_FOLDED),
+    ("filtered", RADAR_GATE_FLAG_FILTERED),
+    ("derived", RADAR_GATE_FLAG_DERIVED),
+    ("dealiased", RADAR_GATE_FLAG_DEALIASED),
+];
 
 const SOUNDING_CORE: &[&str] = &["TMP", "SPFH", "UGRD", "VGRD", "HGT"];
 const BASIC_DIAGNOSTICS: &[&str] = &[
@@ -1491,9 +1499,19 @@ struct RadarPolarSidecarManifest {
     values_encoding: String,
     gate_flags_path: String,
     gate_flags_encoding: String,
+    #[serde(default)]
+    gate_flag_meanings: Vec<RadarPolarGateFlagMeaning>,
     radials: Vec<RadarPolarRadialMeta>,
     #[serde(default)]
     qc: Value,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+struct RadarPolarGateFlagMeaning {
+    bit: u8,
+    mask: u8,
+    name: String,
+    description: String,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -1541,6 +1559,18 @@ enum RadarPolarSampleMethod {
 struct RadarRelativePolar {
     azimuth_deg: f32,
     ground_range_m: f64,
+}
+
+fn validate_radar_gate_flag_meanings(manifest: &RadarPolarSidecarManifest) -> Result<()> {
+    for (name, mask) in RADAR_REQUIRED_GATE_FLAG_MEANINGS {
+        let present = manifest.gate_flag_meanings.iter().any(|meaning| {
+            meaning.name == *name && meaning.mask == *mask && !meaning.description.trim().is_empty()
+        });
+        if !present {
+            bail!("radar sidecar gate_flag_meanings missing {name} mask {mask}");
+        }
+    }
+    Ok(())
 }
 
 struct PlotLabLane {
@@ -3433,6 +3463,7 @@ impl RadarPolarSidecarData {
         if !manifest.ok {
             bail!("radar sidecar manifest is not ok");
         }
+        validate_radar_gate_flag_meanings(&manifest)?;
         if manifest.radials.len() != manifest.radial_count {
             bail!(
                 "radar sidecar radial metadata mismatch: got {}, expected {}",
@@ -19314,6 +19345,14 @@ mod tests {
                 "values_encoding": "f32_le_row_major_radial_gate_nan_missing",
                 "gate_flags_path": RADAR_POLAR_GATE_FLAGS_FILE,
                 "gate_flags_encoding": "u8_bitmask_row_major_radial_gate",
+                "gate_flag_meanings": [
+                    {"bit": 0, "mask": RADAR_GATE_FLAG_VALID, "name": "valid", "description": "finite value"},
+                    {"bit": 1, "mask": RADAR_GATE_FLAG_MISSING, "name": "missing", "description": "missing value"},
+                    {"bit": 2, "mask": RADAR_GATE_FLAG_RANGE_FOLDED, "name": "range_folded", "description": "range folded"},
+                    {"bit": 3, "mask": RADAR_GATE_FLAG_FILTERED, "name": "filtered", "description": "filtered by QC"},
+                    {"bit": 4, "mask": RADAR_GATE_FLAG_DERIVED, "name": "derived", "description": "derived product"},
+                    {"bit": 5, "mask": RADAR_GATE_FLAG_DEALIASED, "name": "dealiased", "description": "dealiased velocity"}
+                ],
                 "radials": [
                     {
                         "radial_index": 0,
