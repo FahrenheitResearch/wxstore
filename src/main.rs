@@ -1,3 +1,5 @@
+#![recursion_limit = "256"]
+
 use std::{
     cmp::Ordering,
     collections::{BTreeMap, BTreeSet, HashMap, VecDeque},
@@ -49,6 +51,16 @@ const STATIC_PLOT_MANIFEST_CACHE_TTL_DEFAULT_SECS: u64 = 5;
 const STATIC_PLOT_DEFAULT_MANIFEST_LIMIT: usize = 500;
 const STATIC_PLOT_MAX_MANIFEST_LIMIT: usize = 20_000;
 const STATIC_PLOT_EXPORT_MAX_FRAMES: usize = 1000;
+const RADAR_POLAR_SIDECAR_SCHEMA: &str = "rustwx.radar.polar_sidecar.v2";
+const RADAR_POLAR_SIDECAR_MANIFEST_FILE: &str = "polar_sidecar_manifest.json";
+const RADAR_POLAR_VALUES_FILE: &str = "polar_values_f32le.bin";
+const RADAR_POLAR_GATE_FLAGS_FILE: &str = "polar_gate_flags_u8.bin";
+const RADAR_GATE_FLAG_VALID: u8 = 0b0000_0001;
+const RADAR_GATE_FLAG_MISSING: u8 = 0b0000_0010;
+const RADAR_GATE_FLAG_RANGE_FOLDED: u8 = 0b0000_0100;
+const RADAR_GATE_FLAG_FILTERED: u8 = 0b0000_1000;
+const RADAR_GATE_FLAG_DERIVED: u8 = 0b0001_0000;
+const RADAR_GATE_FLAG_DEALIASED: u8 = 0b0010_0000;
 
 const SOUNDING_CORE: &[&str] = &["TMP", "SPFH", "UGRD", "VGRD", "HGT"];
 const BASIC_DIAGNOSTICS: &[&str] = &[
@@ -134,6 +146,8 @@ struct ServeArgs {
     #[arg(long)]
     satellite_tiles_root: Option<PathBuf>,
     #[arg(long)]
+    radar_tiles_root: Option<PathBuf>,
+    #[arg(long)]
     archive_root: Option<PathBuf>,
     #[arg(long, default_value = "127.0.0.1")]
     host: String,
@@ -148,6 +162,11 @@ fn infer_ops_root(args: &ServeArgs) -> PathBuf {
         .or_else(|| args.spatial_root.as_ref().and_then(|path| path.parent()))
         .or_else(|| {
             args.satellite_tiles_root
+                .as_ref()
+                .and_then(|path| path.parent())
+        })
+        .or_else(|| {
+            args.radar_tiles_root
                 .as_ref()
                 .and_then(|path| path.parent())
         })
@@ -263,6 +282,8 @@ async fn main() -> Result<()> {
                     static_plots.as_ref(),
                     None,
                     None,
+                    None,
+                    None,
                 ))?
             );
             Ok(())
@@ -328,6 +349,12 @@ async fn serve(args: ServeArgs) -> Result<()> {
             .map(|path| SatelliteTileLane::open(path))
             .transpose()
             .map(|lane| lane.map(Arc::new))?,
+        radar_tiles: args
+            .radar_tiles_root
+            .as_ref()
+            .map(|path| RadarTileLane::open(path))
+            .transpose()
+            .map(|lane| lane.map(Arc::new))?,
         plot_lab: Arc::new(PlotLabLane::from_env(&ops_root)?),
         cross_sections: Arc::new(CrossSectionLane::from_env(&ops_root)?),
         soundings: Arc::new(SoundingLane::from_env(&ops_root)?),
@@ -340,6 +367,7 @@ async fn serve(args: ServeArgs) -> Result<()> {
         .route("/", get(index))
         .route("/plots", get(plots))
         .route("/satellite", get(satellite_viewer))
+        .route("/radar", get(radar_viewer))
         .route("/tools", get(weather_tools))
         .route("/meteograms", get(weather_tools))
         .route("/cross-sections", get(weather_tools))
@@ -365,6 +393,25 @@ async fn serve(args: ServeArgs) -> Result<()> {
         .route(
             "/v1/satellite/tiles/{layer_id}/frames/{frame_id}/{z}/{x}/{tile_file}",
             get(satellite_tile),
+        )
+        .route("/v1/radar/layers", get(radar_layers))
+        .route("/v1/radar/layers/{layer_id}/frames.json", get(radar_frames))
+        .route(
+            "/v1/radar/sidecars/{layer_id}/frames/{frame_id}/{sidecar_file}",
+            get(radar_sidecar),
+        )
+        .route(
+            "/v1/radar/sidecars/{layer_id}/frames/{frame_id}/{tilt_id}/{sidecar_file}",
+            get(radar_tilt_sidecar),
+        )
+        .route("/v1/radar/sample", get(radar_sample))
+        .route(
+            "/v1/radar/tiles/{layer_id}/frames/{frame_id}/{z}/{x}/{tile_file}",
+            get(radar_tile),
+        )
+        .route(
+            "/v1/radar/tiles/{layer_id}/frames/{frame_id}/{tilt_id}/{z}/{x}/{tile_file}",
+            get(radar_tilt_tile),
         )
         .route("/v1/plot-lab/config", get(plot_lab_config))
         .route("/v1/plot-lab/render", post(plot_lab_render))
@@ -1292,6 +1339,7 @@ struct AppState {
     spatial: Option<Arc<SpatialLane>>,
     static_plots: Option<Arc<StaticPlotLane>>,
     satellite_tiles: Option<Arc<SatelliteTileLane>>,
+    radar_tiles: Option<Arc<RadarTileLane>>,
     plot_lab: Arc<PlotLabLane>,
     cross_sections: Arc<CrossSectionLane>,
     soundings: Arc<SoundingLane>,
@@ -1343,6 +1391,98 @@ struct StaticPlotLane {
 
 struct SatelliteTileLane {
     root: PathBuf,
+}
+
+struct RadarTileLane {
+    root: PathBuf,
+}
+
+#[derive(Debug, Deserialize)]
+struct RadarSampleQuery {
+    layer: String,
+    frame: String,
+    product: Option<String>,
+    tilt: Option<String>,
+    lat: f64,
+    lon: f64,
+    method: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+struct RadarPolarSidecarManifest {
+    schema: String,
+    sidecar_version: u8,
+    ok: bool,
+    name: String,
+    site: RadarPolarSidecarSite,
+    product: String,
+    product_name: String,
+    units: String,
+    #[serde(default)]
+    product_provenance: Value,
+    source_key_or_url: Option<String>,
+    scan_time_utc: String,
+    sweep_index: usize,
+    elevation_deg: f32,
+    nyquist_velocity_ms: Option<f32>,
+    processing_state: String,
+    radial_count: usize,
+    max_gate_count: usize,
+    gate_count: usize,
+    values_path: String,
+    values_encoding: String,
+    gate_flags_path: String,
+    gate_flags_encoding: String,
+    radials: Vec<RadarPolarRadialMeta>,
+    #[serde(default)]
+    qc: Value,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+struct RadarPolarSidecarSite {
+    id: String,
+    name: String,
+    state: String,
+    lat: f64,
+    lon: f64,
+    elevation_m: Option<f64>,
+    #[serde(default)]
+    feedhorn_height_m: Option<f64>,
+    #[serde(default)]
+    antenna_elevation_m: Option<f64>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+struct RadarPolarRadialMeta {
+    radial_index: usize,
+    azimuth_deg: f32,
+    elevation_deg: f32,
+    azimuth_spacing_deg: f32,
+    gate_count: usize,
+    first_gate_range_m: u16,
+    gate_spacing_m: u16,
+    nyquist_velocity_ms: Option<f32>,
+    data_word_size_bits: Option<u16>,
+    scale: Option<f32>,
+    offset: Option<f32>,
+}
+
+struct RadarPolarSidecarData {
+    manifest: RadarPolarSidecarManifest,
+    values: Vec<f32>,
+    gate_flags: Vec<u8>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RadarPolarSampleMethod {
+    Nearest,
+    Interpolated,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct RadarRelativePolar {
+    azimuth_deg: f32,
+    ground_range_m: f64,
 }
 
 struct PlotLabLane {
@@ -2803,9 +2943,11 @@ impl SatelliteTileLane {
                 .unwrap_or_else(|| json!(null));
             layers.push(json!({
                 "id": layer_id,
+                "kind": "satellite_tiles",
                 "frame_count": frame_count,
                 "latest": latest,
-                "frames_url": format!("/v1/satellite/layers/{layer_id}/frames.json")
+                "frames_url": format!("/v1/satellite/layers/{layer_id}/frames.json"),
+                "tile_url_template": format!("/v1/satellite/tiles/{layer_id}/frames/{{frame_id}}/{{z}}/{{x}}/{{y}}.png")
             }));
         }
         layers.sort_by(|a, b| {
@@ -2819,6 +2961,36 @@ impl SatelliteTileLane {
             "root": self.root,
             "layers": layers
         }))
+    }
+
+    fn lane_manifest_json(&self) -> Value {
+        let layers = self.layers_json().unwrap_or_else(|err| {
+            json!({
+                "schema": "wxstore.satellite.layers.v1",
+                "root": self.root,
+                "error": err.to_string(),
+                "layers": []
+            })
+        });
+        let layer_count = layers
+            .get("layers")
+            .and_then(Value::as_array)
+            .map(Vec::len)
+            .unwrap_or(0);
+        json!({
+            "schema": "wxstore.lane.v1",
+            "id": "satellite_tiles",
+            "status": if layer_count > 0 { "ready" } else { "empty" },
+            "role": "published_temporal_xyz_tile_lane",
+            "root": self.root,
+            "layer_count": layer_count,
+            "api": {
+                "layers": "/v1/satellite/layers",
+                "frames": "/v1/satellite/layers/{layer_id}/frames.json",
+                "tiles": "/v1/satellite/tiles/{layer_id}/frames/{frame_id}/{z}/{x}/{y}.png",
+                "viewer": "/satellite"
+            }
+        })
     }
 
     fn frames_json(&self, layer_id: &str) -> Result<Value> {
@@ -2862,6 +3034,735 @@ impl SatelliteTileLane {
         }
         Ok(path)
     }
+}
+
+impl RadarTileLane {
+    fn open(root: &Path) -> Result<Self> {
+        if !root.is_dir() {
+            bail!("radar tiles root does not exist: {}", root.display());
+        }
+        Ok(Self {
+            root: root.to_path_buf(),
+        })
+    }
+
+    fn layers_json(&self) -> Result<Value> {
+        let mut layers = Vec::new();
+        for entry in fs::read_dir(&self.root)
+            .with_context(|| format!("read radar root {}", self.root.display()))?
+        {
+            let entry = entry?;
+            let path = entry.path();
+            if !path.is_dir() {
+                continue;
+            }
+            let Some(layer_id) = path.file_name().and_then(|name| name.to_str()) else {
+                continue;
+            };
+            let index_path = path.join("frames.json");
+            if !index_path.is_file() {
+                continue;
+            }
+            let frames = self.frames_json(layer_id).unwrap_or_else(|err| {
+                json!({
+                    "ok": false,
+                    "layer": layer_id,
+                    "error": err.to_string(),
+                    "frames": []
+                })
+            });
+            let frame_count = frames
+                .get("frames")
+                .and_then(Value::as_array)
+                .map(Vec::len)
+                .unwrap_or(0);
+            let latest = frames
+                .get("frames")
+                .and_then(Value::as_array)
+                .and_then(|items| items.last())
+                .cloned()
+                .unwrap_or_else(|| json!(null));
+            layers.push(json!({
+                "id": layer_id,
+                "kind": "nexrad_level2_tiles",
+                "capabilities": ["png_xyz_tiles", "polar_numeric_sidecars", "latlon_gate_sampling"],
+                "frame_count": frame_count,
+                "latest": latest,
+                "frames_url": format!("/v1/radar/layers/{layer_id}/frames.json"),
+                "tile_url_template": format!("/v1/radar/tiles/{layer_id}/frames/{{frame_id}}/{{z}}/{{x}}/{{y}}.png"),
+                "sidecar_url_template": format!("/v1/radar/sidecars/{layer_id}/frames/{{frame_id}}/polar_sidecar_manifest.json"),
+                "tilt_sidecar_url_template": format!("/v1/radar/sidecars/{layer_id}/frames/{{frame_id}}/{{tilt_id}}/polar_sidecar_manifest.json"),
+                "sample_url": "/v1/radar/sample?layer={layer_id}&frame={frame_id}&product={product}&tilt={tilt_id}&lat={lat}&lon={lon}"
+            }));
+        }
+        layers.sort_by(|a, b| {
+            a.get("id")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .cmp(b.get("id").and_then(Value::as_str).unwrap_or_default())
+        });
+        Ok(json!({
+            "schema": "wxstore.radar.layers.v1",
+            "root": self.root,
+            "layers": layers
+        }))
+    }
+
+    fn lane_manifest_json(&self) -> Value {
+        let layers = self.layers_json().unwrap_or_else(|err| {
+            json!({
+                "schema": "wxstore.radar.layers.v1",
+                "root": self.root,
+                "error": err.to_string(),
+                "layers": []
+            })
+        });
+        let layer_count = layers
+            .get("layers")
+            .and_then(Value::as_array)
+            .map(Vec::len)
+            .unwrap_or(0);
+        let latest = layers
+            .get("layers")
+            .and_then(Value::as_array)
+            .and_then(|items| items.iter().filter_map(|item| item.get("latest")).last())
+            .cloned()
+            .unwrap_or_else(|| json!(null));
+        json!({
+            "schema": "wxstore.lane.v1",
+            "id": "radar_tiles",
+            "status": if layer_count > 0 { "ready" } else { "empty" },
+            "role": "published_nexrad_level2_xyz_tile_lane",
+            "root": self.root,
+            "layer_count": layer_count,
+            "latest": latest,
+            "agent_notes": {
+                "source": "rustwx-radar first-party Rust Level-II parser and tile renderer",
+                "products": "Layer latest frames include site, product, scan_time_utc, bounds, tile_count, source_key_or_url, QC, and native-resolution metadata",
+                "site_scope": "Runner supports explicit sites or sites = [\"all\"]"
+            },
+            "api": {
+                "layers": "/v1/radar/layers",
+                "frames": "/v1/radar/layers/{layer_id}/frames.json",
+                "tiles": "/v1/radar/tiles/{layer_id}/frames/{frame_id}/{z}/{x}/{y}.png",
+                "tilt_tiles": "/v1/radar/tiles/{layer_id}/frames/{frame_id}/{tilt_id}/{z}/{x}/{y}.png",
+                "sidecars": "/v1/radar/sidecars/{layer_id}/frames/{frame_id}/polar_sidecar_manifest.json",
+                "tilt_sidecars": "/v1/radar/sidecars/{layer_id}/frames/{frame_id}/{tilt_id}/polar_sidecar_manifest.json",
+                "sample": "/v1/radar/sample?layer={layer_id}&frame={frame_id}&product={product}&tilt={tilt_id}&lat={lat}&lon={lon}",
+                "viewer": "/radar"
+            }
+        })
+    }
+
+    fn frames_json(&self, layer_id: &str) -> Result<Value> {
+        validate_path_component("radar layer", layer_id)?;
+        let path = self.root.join(layer_id).join("frames.json");
+        let bytes = fs::read(&path).with_context(|| format!("read {}", path.display()))?;
+        let mut value: Value =
+            serde_json::from_slice(&bytes).with_context(|| format!("parse {}", path.display()))?;
+        if let Some(frames) = value.get_mut("frames").and_then(Value::as_array_mut) {
+            for frame in frames {
+                let frame_id = frame.get("id").and_then(Value::as_str).map(str::to_string);
+                if let Some(template) = frame.get("url_template").and_then(Value::as_str) {
+                    let normalized = template.trim_start_matches('/');
+                    frame["tile_url_template"] = json!(format!("/v1/radar/tiles/{normalized}"));
+                }
+                if radar_value_present(frame.get("numeric_sidecar")) {
+                    if let Some(frame_id) = frame_id.as_deref() {
+                        frame["numeric_sidecar_url"] =
+                            json!(radar_sidecar_manifest_url(layer_id, frame_id, None));
+                    }
+                }
+                if let Some(tilts) = frame.get_mut("tilts").and_then(Value::as_array_mut) {
+                    for tilt in tilts {
+                        let tilt_id = tilt.get("id").and_then(Value::as_str).map(str::to_string);
+                        if let Some(template) = tilt.get("url_template").and_then(Value::as_str) {
+                            let normalized = template.trim_start_matches('/');
+                            tilt["tile_url_template"] =
+                                json!(format!("/v1/radar/tiles/{normalized}"));
+                        }
+                        if radar_value_present(tilt.get("numeric_sidecar")) {
+                            if let (Some(frame_id), Some(tilt_id)) =
+                                (frame_id.as_deref(), tilt_id.as_deref())
+                            {
+                                tilt["numeric_sidecar_url"] = json!(radar_sidecar_manifest_url(
+                                    layer_id,
+                                    frame_id,
+                                    Some(tilt_id)
+                                ));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        value["frames_url"] = json!(format!("/v1/radar/layers/{layer_id}/frames.json"));
+        Ok(value)
+    }
+
+    fn sidecar_path(
+        &self,
+        layer_id: &str,
+        frame_id: &str,
+        tilt_id: Option<&str>,
+        sidecar_file: &str,
+    ) -> Result<PathBuf> {
+        validate_path_component("radar layer", layer_id)?;
+        validate_path_component("radar frame", frame_id)?;
+        if let Some(tilt_id) = tilt_id {
+            validate_path_component("radar tilt", tilt_id)?;
+        }
+        if !radar_sidecar_file_allowed(sidecar_file) {
+            bail!("invalid radar sidecar file");
+        }
+        let mut path = self.root.join(layer_id).join("frames").join(frame_id);
+        if let Some(tilt_id) = tilt_id {
+            path = path.join(tilt_id);
+        }
+        let path = path.join(sidecar_file);
+        let root = fs::canonicalize(&self.root)
+            .with_context(|| format!("canonicalize radar root {}", self.root.display()))?;
+        let path = fs::canonicalize(&path)
+            .with_context(|| format!("radar sidecar not found: {}", path.display()))?;
+        if !path.starts_with(&root) {
+            bail!("radar sidecar escapes root: {}", path.display());
+        }
+        if !path.is_file() {
+            bail!("radar sidecar is missing: {}", path.display());
+        }
+        Ok(path)
+    }
+
+    fn sample_json(&self, query: &RadarSampleQuery) -> Result<Value> {
+        if !query.lat.is_finite()
+            || !query.lon.is_finite()
+            || query.lat < -90.0
+            || query.lat > 90.0
+            || query.lon < -180.0
+            || query.lon > 180.0
+        {
+            bail!("lat/lon must be finite geographic coordinates");
+        }
+        let method = radar_sample_method(query.method.as_deref())?;
+        let sidecar_path = self.sidecar_path(
+            &query.layer,
+            &query.frame,
+            query.tilt.as_deref(),
+            RADAR_POLAR_SIDECAR_MANIFEST_FILE,
+        )?;
+        let sidecar = RadarPolarSidecarData::open(&sidecar_path)?;
+        if let Some(product) = query.product.as_deref().map(str::trim) {
+            if !product.is_empty() && !product.eq_ignore_ascii_case(&sidecar.manifest.product) {
+                bail!(
+                    "requested product {product} does not match sidecar product {}",
+                    sidecar.manifest.product
+                );
+            }
+        }
+        sidecar
+            .sample_lat_lon(query.lat, query.lon, method)
+            .ok_or_else(|| anyhow!("lat/lon is outside the sidecar sweep coverage"))
+    }
+
+    fn tile_path(
+        &self,
+        layer_id: &str,
+        frame_id: &str,
+        tilt_id: Option<&str>,
+        z: u8,
+        x: u32,
+        y: u32,
+    ) -> Result<PathBuf> {
+        validate_path_component("radar layer", layer_id)?;
+        validate_path_component("radar frame", frame_id)?;
+        if let Some(tilt_id) = tilt_id {
+            validate_path_component("radar tilt", tilt_id)?;
+        }
+        let mut path = self.root.join(layer_id).join("frames").join(frame_id);
+        if let Some(tilt_id) = tilt_id {
+            path = path.join(tilt_id);
+        }
+        let path = path
+            .join(z.to_string())
+            .join(x.to_string())
+            .join(format!("{y}.png"));
+        let root = fs::canonicalize(&self.root)
+            .with_context(|| format!("canonicalize radar root {}", self.root.display()))?;
+        let path = fs::canonicalize(&path)
+            .with_context(|| format!("radar tile not found: {}", path.display()))?;
+        if !path.starts_with(&root) {
+            bail!("radar tile escapes root: {}", path.display());
+        }
+        if !path.is_file() {
+            bail!("radar tile is missing: {}", path.display());
+        }
+        Ok(path)
+    }
+}
+
+impl RadarPolarSampleMethod {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Nearest => "nearest",
+            Self::Interpolated => "interpolated",
+        }
+    }
+}
+
+impl RadarPolarSidecarData {
+    fn open(manifest_path: &Path) -> Result<Self> {
+        let bytes =
+            fs::read(manifest_path).with_context(|| format!("read {}", manifest_path.display()))?;
+        let manifest: RadarPolarSidecarManifest = serde_json::from_slice(&bytes)
+            .with_context(|| format!("parse {}", manifest_path.display()))?;
+        if manifest.schema != RADAR_POLAR_SIDECAR_SCHEMA {
+            bail!("unsupported radar sidecar schema {}", manifest.schema);
+        }
+        if manifest.sidecar_version != 2 {
+            bail!(
+                "unsupported radar sidecar version {}",
+                manifest.sidecar_version
+            );
+        }
+        if !manifest.ok {
+            bail!("radar sidecar manifest is not ok");
+        }
+        if manifest.radials.len() != manifest.radial_count {
+            bail!(
+                "radar sidecar radial metadata mismatch: got {}, expected {}",
+                manifest.radials.len(),
+                manifest.radial_count
+            );
+        }
+        let manifest_root = manifest_path.parent().unwrap_or_else(|| Path::new("."));
+        let values_path = radar_sidecar_data_path(manifest_root, &manifest.values_path, "values")?;
+        let gate_flags_path =
+            radar_sidecar_data_path(manifest_root, &manifest.gate_flags_path, "gate flags")?;
+        let values = read_radar_f32_le(&values_path)?;
+        let gate_flags = fs::read(&gate_flags_path)
+            .with_context(|| format!("read {}", gate_flags_path.display()))?;
+        let expected = manifest.radial_count * manifest.max_gate_count;
+        if values.len() != expected {
+            bail!(
+                "radar sidecar value count mismatch: got {}, expected {}",
+                values.len(),
+                expected
+            );
+        }
+        if gate_flags.len() != expected {
+            bail!(
+                "radar sidecar gate flag count mismatch: got {}, expected {}",
+                gate_flags.len(),
+                expected
+            );
+        }
+        Ok(Self {
+            manifest,
+            values,
+            gate_flags,
+        })
+    }
+
+    fn sample_lat_lon(&self, lat: f64, lon: f64, method: RadarPolarSampleMethod) -> Option<Value> {
+        let polar =
+            radar_lat_lon_to_polar(self.manifest.site.lat, self.manifest.site.lon, lat, lon);
+        let cos_elev = f64::from(self.manifest.elevation_deg)
+            .to_radians()
+            .cos()
+            .max(0.1);
+        let slant_range_m = polar.ground_range_m / cos_elev;
+        match method {
+            RadarPolarSampleMethod::Nearest => {
+                self.sample_nearest(lat, lon, polar, slant_range_m, method)
+            }
+            RadarPolarSampleMethod::Interpolated => self
+                .sample_interpolated(lat, lon, polar, slant_range_m)
+                .or_else(|| self.sample_nearest(lat, lon, polar, slant_range_m, method)),
+        }
+    }
+
+    fn sample_nearest(
+        &self,
+        lat: f64,
+        lon: f64,
+        polar: RadarRelativePolar,
+        slant_range_m: f64,
+        method: RadarPolarSampleMethod,
+    ) -> Option<Value> {
+        let row = self.nearest_radial_row(polar.azimuth_deg)?;
+        let radial = self.manifest.radials.get(row)?;
+        let gate_f = radar_gate_fraction(radial, slant_range_m)?;
+        let gate_index = gate_f.round() as usize;
+        if gate_index >= radial.gate_count {
+            return None;
+        }
+        let value = self
+            .value_at(row, gate_index)
+            .filter(|value| value.is_finite());
+        let flags = self.flags_at(row, gate_index);
+        Some(self.sample_response(
+            method,
+            value,
+            lat,
+            lon,
+            polar,
+            slant_range_m,
+            radial,
+            gate_index,
+            gate_f,
+            flags,
+        ))
+    }
+
+    fn sample_interpolated(
+        &self,
+        lat: f64,
+        lon: f64,
+        polar: RadarRelativePolar,
+        slant_range_m: f64,
+    ) -> Option<Value> {
+        let (lo_row, hi_row, az_t) = self.bracketing_radial_rows(polar.azimuth_deg)?;
+        let lo = self.sample_radial_range(lo_row, slant_range_m);
+        let hi = self.sample_radial_range(hi_row, slant_range_m);
+        let value = match (lo, hi) {
+            (Some(a), Some(b)) => Some(a + (b - a) * az_t as f32),
+            (Some(value), None) | (None, Some(value)) => Some(value),
+            (None, None) => None,
+        }?;
+        let row = self.nearest_radial_row(polar.azimuth_deg)?;
+        let radial = self.manifest.radials.get(row)?;
+        if radial.gate_count == 0 {
+            return None;
+        }
+        let gate_f = radar_gate_fraction(radial, slant_range_m)?;
+        let gate_index = gate_f.round().clamp(0.0, (radial.gate_count - 1) as f64) as usize;
+        let flags = self.flags_at(row, gate_index);
+        Some(self.sample_response(
+            RadarPolarSampleMethod::Interpolated,
+            value.is_finite().then_some(value),
+            lat,
+            lon,
+            polar,
+            slant_range_m,
+            radial,
+            gate_index,
+            gate_f,
+            flags,
+        ))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn sample_response(
+        &self,
+        method: RadarPolarSampleMethod,
+        value: Option<f32>,
+        lat: f64,
+        lon: f64,
+        polar: RadarRelativePolar,
+        slant_range_m: f64,
+        radial: &RadarPolarRadialMeta,
+        gate_index: usize,
+        gate_fraction: f64,
+        flag_bits: u8,
+    ) -> Value {
+        let gate_flags = radar_gate_flag_names(flag_bits);
+        let processing_state = self.manifest.processing_state.to_ascii_lowercase();
+        let raw = processing_state.contains("raw");
+        let dealiased =
+            processing_state.contains("dealiased") || flag_bits & RADAR_GATE_FLAG_DEALIASED != 0;
+        let filtered =
+            processing_state.contains("filtered") || flag_bits & RADAR_GATE_FLAG_FILTERED != 0;
+        let derived =
+            processing_state.contains("derived") || flag_bits & RADAR_GATE_FLAG_DERIVED != 0;
+        let product_provenance = self.manifest.product_provenance.clone();
+        json!({
+            "schema": "wxstore.radar.sample.v1",
+            "sidecar_schema": self.manifest.schema.as_str(),
+            "method": method.as_str(),
+            "lat": lat,
+            "lon": lon,
+            "value": value,
+            "units": self.manifest.units.as_str(),
+            "product": self.manifest.product.as_str(),
+            "product_name": self.manifest.product_name.as_str(),
+            "sweep_index": self.manifest.sweep_index,
+            "elevation_deg": self.manifest.elevation_deg,
+            "nyquist_velocity_ms": self.manifest.nyquist_velocity_ms,
+            "azimuth_deg": polar.azimuth_deg,
+            "radial_index": radial.radial_index,
+            "radial_azimuth_deg": radial.azimuth_deg,
+            "radial_elevation_deg": radial.elevation_deg,
+            "azimuth_spacing_deg": radial.azimuth_spacing_deg,
+            "range_m": slant_range_m,
+            "ground_range_m": polar.ground_range_m,
+            "gate_index": gate_index,
+            "gate_fraction": gate_fraction,
+            "first_gate_range_m": radial.first_gate_range_m,
+            "gate_spacing_m": radial.gate_spacing_m,
+            "gate_flags": gate_flags,
+            "gate_flag_bits": flag_bits,
+            "processing_state": self.manifest.processing_state,
+            "raw": raw,
+            "dealiased": dealiased,
+            "filtered": filtered,
+            "derived": derived,
+            "product_provenance": product_provenance.clone(),
+            "provenance": {
+                "product": product_provenance,
+                "source_key_or_url": self.manifest.source_key_or_url.as_deref(),
+                "sidecar_name": self.manifest.name.as_str()
+            },
+            "qc": self.manifest.qc.clone(),
+            "scan_time_utc": self.manifest.scan_time_utc.as_str(),
+            "site": self.manifest.site.clone()
+        })
+    }
+
+    fn nearest_radial_row(&self, azimuth_deg: f32) -> Option<usize> {
+        self.manifest
+            .radials
+            .iter()
+            .enumerate()
+            .min_by(|(_, a), (_, b)| {
+                radar_azimuth_diff(a.azimuth_deg, azimuth_deg)
+                    .partial_cmp(&radar_azimuth_diff(b.azimuth_deg, azimuth_deg))
+                    .unwrap_or(Ordering::Equal)
+            })
+            .map(|(row, _)| row)
+    }
+
+    fn bracketing_radial_rows(&self, azimuth_deg: f32) -> Option<(usize, usize, f64)> {
+        if self.manifest.radials.len() < 2 {
+            return None;
+        }
+        let azimuth = radar_normalize_azimuth(azimuth_deg);
+        let mut sorted = self
+            .manifest
+            .radials
+            .iter()
+            .enumerate()
+            .map(|(row, radial)| (row, radar_normalize_azimuth(radial.azimuth_deg)))
+            .collect::<Vec<_>>();
+        sorted.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(Ordering::Equal));
+        let insert_pos = match sorted.binary_search_by(|(_, candidate)| {
+            candidate.partial_cmp(&azimuth).unwrap_or(Ordering::Equal)
+        }) {
+            Ok(index) => index,
+            Err(index) => index,
+        };
+        let lo = if insert_pos == 0 {
+            sorted.len() - 1
+        } else {
+            insert_pos - 1
+        };
+        let hi = if insert_pos >= sorted.len() {
+            0
+        } else {
+            insert_pos
+        };
+        let lo_az = sorted[lo].1;
+        let hi_az = sorted[hi].1;
+        let span = radar_azimuth_span(lo_az, hi_az);
+        if span <= 0.001 || span > 10.0 {
+            return None;
+        }
+        let offset = radar_azimuth_span(lo_az, azimuth);
+        Some((
+            sorted[lo].0,
+            sorted[hi].0,
+            (offset / span).clamp(0.0, 1.0) as f64,
+        ))
+    }
+
+    fn sample_radial_range(&self, row: usize, slant_range_m: f64) -> Option<f32> {
+        let radial = self.manifest.radials.get(row)?;
+        let gate_f = radar_gate_fraction(radial, slant_range_m)?;
+        let gate_lo = gate_f.floor() as usize;
+        if gate_lo >= radial.gate_count {
+            return None;
+        }
+        let v0 = self.value_at(row, gate_lo)?;
+        if !v0.is_finite() {
+            return None;
+        }
+        let gate_hi = gate_lo + 1;
+        if gate_hi < radial.gate_count {
+            if let Some(v1) = self.value_at(row, gate_hi) {
+                if v1.is_finite() {
+                    let t = (gate_f - gate_lo as f64) as f32;
+                    return Some(v0 + (v1 - v0) * t);
+                }
+            }
+        }
+        Some(v0)
+    }
+
+    fn value_at(&self, row: usize, gate: usize) -> Option<f32> {
+        self.values
+            .get(row * self.manifest.max_gate_count + gate)
+            .copied()
+    }
+
+    fn flags_at(&self, row: usize, gate: usize) -> u8 {
+        self.gate_flags
+            .get(row * self.manifest.max_gate_count + gate)
+            .copied()
+            .unwrap_or(RADAR_GATE_FLAG_MISSING)
+    }
+}
+
+fn radar_sidecar_file_allowed(file_name: &str) -> bool {
+    matches!(
+        file_name,
+        RADAR_POLAR_SIDECAR_MANIFEST_FILE | RADAR_POLAR_VALUES_FILE | RADAR_POLAR_GATE_FLAGS_FILE
+    )
+}
+
+fn radar_sidecar_manifest_url(layer_id: &str, frame_id: &str, tilt_id: Option<&str>) -> String {
+    match tilt_id {
+        Some(tilt_id) => format!(
+            "/v1/radar/sidecars/{layer_id}/frames/{frame_id}/{tilt_id}/{RADAR_POLAR_SIDECAR_MANIFEST_FILE}"
+        ),
+        None => {
+            format!("/v1/radar/sidecars/{layer_id}/frames/{frame_id}/{RADAR_POLAR_SIDECAR_MANIFEST_FILE}")
+        }
+    }
+}
+
+fn radar_value_present(value: Option<&Value>) -> bool {
+    value.is_some_and(|value| !value.is_null())
+}
+
+fn radar_sample_method(method: Option<&str>) -> Result<RadarPolarSampleMethod> {
+    match method
+        .unwrap_or("nearest")
+        .trim()
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "" | "nearest" => Ok(RadarPolarSampleMethod::Nearest),
+        "interpolated" | "interpolate" | "linear" => Ok(RadarPolarSampleMethod::Interpolated),
+        other => bail!("unsupported radar sample method {other}"),
+    }
+}
+
+fn radar_sidecar_content_type(file_name: &str) -> &'static str {
+    if file_name.ends_with(".json") {
+        "application/json"
+    } else {
+        "application/octet-stream"
+    }
+}
+
+fn radar_sidecar_data_path(root: &Path, value: &str, label: &str) -> Result<PathBuf> {
+    let root = fs::canonicalize(root)
+        .with_context(|| format!("canonicalize sidecar root {}", root.display()))?;
+    let value_path = Path::new(value);
+    let candidate = if value_path.is_absolute() {
+        value_path.to_path_buf()
+    } else {
+        root.join(value_path)
+    };
+    let path = fs::canonicalize(&candidate)
+        .with_context(|| format!("radar sidecar {label} not found: {}", candidate.display()))?;
+    if !path.starts_with(&root) {
+        bail!(
+            "radar sidecar {label} path escapes sidecar root: {}",
+            path.display()
+        );
+    }
+    if !path.is_file() {
+        bail!("radar sidecar {label} path is missing: {}", path.display());
+    }
+    Ok(path)
+}
+
+fn read_radar_f32_le(path: &Path) -> Result<Vec<f32>> {
+    let bytes = fs::read(path).with_context(|| format!("read {}", path.display()))?;
+    if bytes.len() % 4 != 0 {
+        bail!("{} is not a whole f32 little-endian array", path.display());
+    }
+    Ok(bytes
+        .chunks_exact(4)
+        .map(|chunk| f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]))
+        .collect())
+}
+
+fn radar_lat_lon_to_polar(site_lat: f64, site_lon: f64, lat: f64, lon: f64) -> RadarRelativePolar {
+    let dy_km = (lat - site_lat) * 111.139;
+    let dx_km = radar_normalized_lon_delta(lon - site_lon) * 111.139 * site_lat.to_radians().cos();
+    let mut azimuth = dx_km.atan2(dy_km).to_degrees();
+    if azimuth < 0.0 {
+        azimuth += 360.0;
+    }
+    RadarRelativePolar {
+        azimuth_deg: azimuth as f32,
+        ground_range_m: dx_km.hypot(dy_km) * 1000.0,
+    }
+}
+
+fn radar_gate_fraction(radial: &RadarPolarRadialMeta, slant_range_m: f64) -> Option<f64> {
+    if radial.gate_spacing_m == 0 {
+        return None;
+    }
+    let gate_f =
+        (slant_range_m - f64::from(radial.first_gate_range_m)) / f64::from(radial.gate_spacing_m);
+    (gate_f >= 0.0).then_some(gate_f)
+}
+
+fn radar_gate_flag_names(flags: u8) -> Vec<String> {
+    let mut out = Vec::new();
+    if flags & RADAR_GATE_FLAG_VALID != 0 {
+        out.push("valid".to_string());
+    }
+    if flags & RADAR_GATE_FLAG_MISSING != 0 {
+        out.push("missing".to_string());
+    }
+    if flags & RADAR_GATE_FLAG_RANGE_FOLDED != 0 {
+        out.push("range_folded".to_string());
+    }
+    if flags & RADAR_GATE_FLAG_FILTERED != 0 {
+        out.push("filtered".to_string());
+    }
+    if flags & RADAR_GATE_FLAG_DERIVED != 0 {
+        out.push("derived".to_string());
+    }
+    if flags & RADAR_GATE_FLAG_DEALIASED != 0 {
+        out.push("dealiased".to_string());
+    }
+    out
+}
+
+fn radar_normalize_azimuth(value: f32) -> f32 {
+    let mut value = value % 360.0;
+    if value < 0.0 {
+        value += 360.0;
+    }
+    value
+}
+
+fn radar_azimuth_diff(a: f32, b: f32) -> f32 {
+    let diff = (radar_normalize_azimuth(a) - radar_normalize_azimuth(b)).abs();
+    diff.min(360.0 - diff)
+}
+
+fn radar_azimuth_span(lo: f32, hi: f32) -> f32 {
+    let mut span = radar_normalize_azimuth(hi) - radar_normalize_azimuth(lo);
+    if span < 0.0 {
+        span += 360.0;
+    }
+    span
+}
+
+fn radar_normalized_lon_delta(delta: f64) -> f64 {
+    let mut delta = delta;
+    while delta > 180.0 {
+        delta -= 360.0;
+    }
+    while delta < -180.0 {
+        delta += 360.0;
+    }
+    delta
 }
 
 fn validate_path_component(label: &str, value: &str) -> Result<()> {
@@ -4104,6 +5005,10 @@ async fn plots() -> impl IntoResponse {
 
 async fn satellite_viewer() -> impl IntoResponse {
     (no_store_headers(), Html(SATELLITE_HTML))
+}
+
+async fn radar_viewer() -> impl IntoResponse {
+    (no_store_headers(), Html(RADAR_HTML))
 }
 
 async fn weather_tools() -> impl IntoResponse {
@@ -7030,6 +7935,934 @@ const INDEX_HTML: &str = r#"<!doctype html>
 </html>
 "#;
 
+const RADAR_HTML: &str = r####"<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Radar QC</title>
+  <link rel="preconnect" href="https://unpkg.com" />
+  <link rel="preconnect" href="https://tile.openstreetmap.org" />
+  <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
+  <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+  <script src="https://unpkg.com/lucide@0.468.0/dist/umd/lucide.min.js"></script>
+  <style>
+    :root {
+      color-scheme: dark;
+      --bg: #101312;
+      --panel: #171b1d;
+      --panel-2: #202528;
+      --line: #31383b;
+      --line-soft: #252b2d;
+      --text: #e7ede8;
+      --muted: #9fa9a3;
+      --accent: #77c857;
+      --warn: #d99b39;
+      --bad: #d85d54;
+      --focus: #8fc7ff;
+    }
+    * {
+      box-sizing: border-box;
+    }
+    html,
+    body {
+      height: 100%;
+      margin: 0;
+      background: var(--bg);
+      color: var(--text);
+      font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      font-size: 14px;
+    }
+    button,
+    input,
+    select {
+      font: inherit;
+    }
+    a {
+      color: var(--focus);
+      text-decoration: none;
+    }
+    a:hover {
+      text-decoration: underline;
+    }
+    .app {
+      min-height: 100%;
+      display: grid;
+      grid-template-rows: auto minmax(0, 1fr);
+    }
+    .topbar {
+      display: grid;
+      grid-template-columns: auto minmax(220px, 1.1fr) minmax(180px, 0.8fr) minmax(160px, 0.7fr) auto auto;
+      gap: 10px;
+      align-items: end;
+      padding: 10px 12px;
+      border-bottom: 1px solid var(--line);
+      background: #151817;
+    }
+    .brand {
+      display: flex;
+      flex-direction: column;
+      gap: 2px;
+      min-width: 118px;
+    }
+    .brand strong {
+      font-size: 16px;
+      line-height: 1.1;
+    }
+    .brand span {
+      color: var(--muted);
+      font-size: 12px;
+    }
+    .field {
+      display: flex;
+      flex-direction: column;
+      gap: 5px;
+      min-width: 0;
+    }
+    .field label,
+    .control-label {
+      color: var(--muted);
+      font-size: 12px;
+      line-height: 1.1;
+    }
+    select,
+    input[type="range"] {
+      width: 100%;
+    }
+    select {
+      height: 34px;
+      color: var(--text);
+      background: var(--panel-2);
+      border: 1px solid var(--line);
+      border-radius: 6px;
+      padding: 0 30px 0 10px;
+      overflow: hidden;
+      text-overflow: ellipsis;
+    }
+    select:focus,
+    button:focus-visible,
+    input:focus-visible {
+      outline: 2px solid var(--focus);
+      outline-offset: 1px;
+    }
+    button {
+      min-height: 34px;
+      border: 1px solid var(--line);
+      border-radius: 6px;
+      background: var(--panel-2);
+      color: var(--text);
+      padding: 0 10px;
+      cursor: pointer;
+    }
+    button:hover {
+      border-color: #4a5558;
+    }
+    button:disabled,
+    select:disabled {
+      opacity: 0.48;
+      cursor: not-allowed;
+    }
+    .icon-button {
+      width: 38px;
+      padding: 0;
+      display: inline-grid;
+      place-items: center;
+    }
+    .icon-button svg {
+      width: 17px;
+      height: 17px;
+    }
+    .segmented {
+      height: 34px;
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      border: 1px solid var(--line);
+      border-radius: 6px;
+      overflow: hidden;
+      background: var(--panel-2);
+    }
+    .segmented button {
+      min-height: 32px;
+      border: 0;
+      border-radius: 0;
+      background: transparent;
+      padding: 0 9px;
+      color: var(--muted);
+    }
+    .segmented button.active {
+      background: #2e3d31;
+      color: var(--text);
+    }
+    .toggle {
+      height: 34px;
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      padding: 0 10px;
+      border: 1px solid var(--line);
+      border-radius: 6px;
+      background: var(--panel-2);
+      color: var(--muted);
+      white-space: nowrap;
+    }
+    .toggle input {
+      width: 16px;
+      height: 16px;
+      accent-color: var(--accent);
+    }
+    .shell {
+      min-height: 0;
+      display: grid;
+      grid-template-columns: minmax(0, 1fr) 340px;
+    }
+    .map-wrap {
+      position: relative;
+      min-height: 0;
+      background: #0c0f0e;
+    }
+    #map {
+      position: absolute;
+      inset: 0;
+    }
+    .map-status {
+      position: absolute;
+      left: 12px;
+      right: 12px;
+      bottom: 12px;
+      z-index: 500;
+      display: flex;
+      gap: 8px;
+      align-items: center;
+      pointer-events: none;
+    }
+    .status-pill,
+    .coord-pill {
+      min-height: 30px;
+      max-width: 100%;
+      padding: 6px 9px;
+      border: 1px solid rgba(220, 232, 222, 0.18);
+      border-radius: 6px;
+      background: rgba(16, 19, 18, 0.86);
+      color: var(--muted);
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+    .coord-pill {
+      margin-left: auto;
+      color: var(--text);
+    }
+    .panel {
+      min-width: 0;
+      min-height: 0;
+      overflow: auto;
+      border-left: 1px solid var(--line);
+      background: var(--panel);
+    }
+    .panel-section {
+      padding: 13px 14px;
+      border-bottom: 1px solid var(--line-soft);
+    }
+    .panel-section h2 {
+      margin: 0 0 10px;
+      font-size: 14px;
+      line-height: 1.2;
+    }
+    .sample-value {
+      display: grid;
+      grid-template-columns: minmax(0, 1fr) auto;
+      gap: 8px;
+      align-items: baseline;
+      margin-bottom: 10px;
+    }
+    .sample-value strong {
+      font-size: 30px;
+      line-height: 1;
+      overflow-wrap: anywhere;
+    }
+    .sample-value span {
+      color: var(--muted);
+    }
+    .kv {
+      display: grid;
+      grid-template-columns: minmax(108px, 0.46fr) minmax(0, 1fr);
+      gap: 6px 10px;
+      align-items: start;
+    }
+    .kv div:nth-child(odd) {
+      color: var(--muted);
+    }
+    .kv div:nth-child(even) {
+      min-width: 0;
+      overflow-wrap: anywhere;
+    }
+    .badges {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 6px;
+      margin-top: 10px;
+    }
+    .badge {
+      border: 1px solid var(--line);
+      border-radius: 999px;
+      padding: 3px 8px;
+      color: var(--muted);
+      background: #151817;
+      font-size: 12px;
+      line-height: 1.4;
+    }
+    .badge.good {
+      color: #bdf1ad;
+      border-color: rgba(119, 200, 87, 0.48);
+      background: rgba(119, 200, 87, 0.12);
+    }
+    .badge.warn {
+      color: #f2c57d;
+      border-color: rgba(217, 155, 57, 0.52);
+      background: rgba(217, 155, 57, 0.13);
+    }
+    .badge.bad {
+      color: #f5a19b;
+      border-color: rgba(216, 93, 84, 0.52);
+      background: rgba(216, 93, 84, 0.12);
+    }
+    .qc-grid {
+      display: grid;
+      gap: 8px;
+    }
+    .qc-card {
+      border: 1px solid var(--line);
+      border-radius: 6px;
+      padding: 10px;
+      background: #141817;
+    }
+    .qc-card strong {
+      display: block;
+      margin-bottom: 6px;
+      font-size: 13px;
+    }
+    .qc-card .kv {
+      grid-template-columns: minmax(100px, 0.48fr) minmax(0, 1fr);
+      font-size: 13px;
+    }
+    .raw-json {
+      margin: 0;
+      max-height: 210px;
+      overflow: auto;
+      white-space: pre-wrap;
+      color: #c9d1cc;
+      font-family: ui-monospace, SFMono-Regular, Consolas, "Liberation Mono", monospace;
+      font-size: 12px;
+      line-height: 1.45;
+    }
+    .leaflet-container {
+      background: #0c0f0e;
+      font: inherit;
+    }
+    .leaflet-control-attribution {
+      background: rgba(16, 19, 18, 0.72);
+      color: var(--muted);
+    }
+    .leaflet-control-attribution a {
+      color: var(--focus);
+    }
+    @media (max-width: 1000px) {
+      .topbar {
+        grid-template-columns: 1fr 1fr;
+      }
+      .brand {
+        grid-column: 1 / -1;
+      }
+      .shell {
+        grid-template-columns: 1fr;
+        grid-template-rows: minmax(420px, 56vh) minmax(320px, 1fr);
+      }
+      .panel {
+        border-left: 0;
+        border-top: 1px solid var(--line);
+      }
+    }
+    @media (max-width: 620px) {
+      .topbar {
+        grid-template-columns: 1fr;
+      }
+      .map-status {
+        flex-direction: column;
+        align-items: stretch;
+      }
+      .coord-pill {
+        margin-left: 0;
+      }
+    }
+  </style>
+</head>
+<body>
+  <div class="app">
+    <header class="topbar">
+      <div class="brand">
+        <strong>Radar QC</strong>
+        <span>Level-II PNG + sidecar</span>
+      </div>
+      <div class="field">
+        <label for="layerSelect">Layer</label>
+        <select id="layerSelect"></select>
+      </div>
+      <div class="field">
+        <label for="frameSelect">Frame</label>
+        <select id="frameSelect"></select>
+      </div>
+      <div class="field">
+        <label for="tiltSelect">Tilt</label>
+        <select id="tiltSelect"></select>
+      </div>
+      <div class="field">
+        <span class="control-label">Sample</span>
+        <div class="segmented" role="group" aria-label="Sample method">
+          <button type="button" class="active" data-method="nearest">Nearest</button>
+          <button type="button" data-method="interpolated">Interp</button>
+        </div>
+      </div>
+      <div class="field">
+        <span class="control-label">Tiles</span>
+        <div style="display:flex;gap:8px;align-items:center;">
+          <label class="toggle" title="Enable cursor sampling"><input id="hoverSample" type="checkbox" /> Hover</label>
+          <input id="opacity" title="Radar tile opacity" type="range" min="0" max="1" step="0.05" value="0.88" />
+          <button id="reload" type="button" class="icon-button" title="Reload radar layers" aria-label="Reload radar layers"><i data-lucide="refresh-cw"></i></button>
+        </div>
+      </div>
+    </header>
+    <main class="shell">
+      <section class="map-wrap">
+        <div id="map"></div>
+        <div class="map-status">
+          <div id="status" class="status-pill">loading</div>
+          <div id="coords" class="coord-pill">--</div>
+        </div>
+      </section>
+      <aside class="panel">
+        <section class="panel-section">
+          <h2>Sample</h2>
+          <div id="samplePanel">
+            <div class="sample-value"><strong>--</strong><span></span></div>
+            <div class="kv"><div>Status</div><div>No sample</div></div>
+          </div>
+        </section>
+        <section class="panel-section">
+          <h2>Frame</h2>
+          <div id="frameMeta" class="kv"></div>
+        </section>
+        <section class="panel-section">
+          <h2>QC</h2>
+          <div id="qcPanel" class="qc-grid"></div>
+        </section>
+        <section class="panel-section">
+          <h2>Provenance</h2>
+          <div id="provenancePanel" class="kv"></div>
+        </section>
+        <section class="panel-section">
+          <h2>Raw Sample</h2>
+          <pre id="rawSample" class="raw-json">{}</pre>
+        </section>
+      </aside>
+    </main>
+  </div>
+  <script>
+    const els = {};
+    const state = {
+      layers: [],
+      frames: [],
+      layer: null,
+      frame: null,
+      method: "nearest",
+      map: null,
+      baseLayer: null,
+      radarLayer: null,
+      sampleMarker: null,
+      sampleTimer: 0,
+      sampleSeq: 0
+    };
+
+    function el(id) {
+      return document.getElementById(id);
+    }
+
+    function esc(value) {
+      return String(value ?? "").replace(/[&<>"']/g, ch => ({
+        "&": "&amp;",
+        "<": "&lt;",
+        ">": "&gt;",
+        '"': "&quot;",
+        "'": "&#39;"
+      })[ch]);
+    }
+
+    function fmt(value, digits = 2) {
+      const number = Number(value);
+      if (!Number.isFinite(number)) return "--";
+      return number.toLocaleString(undefined, { maximumFractionDigits: digits });
+    }
+
+    function fmtTime(value) {
+      if (!value) return "--";
+      const date = new Date(value);
+      if (Number.isNaN(date.getTime())) return String(value);
+      return date.toISOString().replace(".000Z", "Z");
+    }
+
+    function setStatus(message) {
+      els.status.textContent = message || "";
+    }
+
+    function setCoords(latlng) {
+      els.coords.textContent = `${fmt(latlng.lat, 5)}, ${fmt(latlng.lng, 5)}`;
+    }
+
+    async function fetchJson(url) {
+      const response = await fetch(url, { cache: "no-store" });
+      const text = await response.text();
+      let data = {};
+      if (text) {
+        try {
+          data = JSON.parse(text);
+        } catch (err) {
+          throw new Error(`Invalid JSON from ${url}`);
+        }
+      }
+      if (!response.ok) {
+        throw new Error(data.message || data.reason || data.error || `${response.status} ${response.statusText}`);
+      }
+      return data;
+    }
+
+    function layerLabel(layer) {
+      const latest = layer.latest || {};
+      const bits = [latest.site, latest.product, layer.id].filter(Boolean);
+      return bits.length ? bits.join(" / ") : layer.id;
+    }
+
+    function frameLabel(frame) {
+      return frame.label || [frame.site, (frame.product || "").toUpperCase(), fmtTime(frame.scan_time_utc)].filter(Boolean).join(" ");
+    }
+
+    function tiltLabel(tilt) {
+      const elevation = tilt.elevation_deg == null ? "" : `${fmt(tilt.elevation_deg, 2)} deg`;
+      return [tilt.id, elevation].filter(Boolean).join(" / ");
+    }
+
+    function hasSidecar(item) {
+      return Boolean(item && (item.numeric_sidecar || item.numeric_sidecar_url));
+    }
+
+    function currentTilt() {
+      const tiltId = els.tiltSelect.value;
+      if (!tiltId || !state.frame) return null;
+      return (state.frame.tilts || []).find(tilt => tilt.id === tiltId) || null;
+    }
+
+    function currentAsset() {
+      return currentTilt() || state.frame || {};
+    }
+
+    function templateFrom(item) {
+      if (!item) return "";
+      const template = item.tile_url_template || item.url_template || "";
+      if (!template) return "";
+      if (template.startsWith("/v1/radar/tiles/")) return template;
+      return `/v1/radar/tiles/${template.replace(/^\/+/, "")}`;
+    }
+
+    function populateSelect(select, items, selectedValue, labeler) {
+      select.innerHTML = "";
+      for (const item of items) {
+        const option = document.createElement("option");
+        option.value = item.id;
+        option.textContent = labeler(item);
+        select.appendChild(option);
+      }
+      if (items.some(item => item.id === selectedValue)) {
+        select.value = selectedValue;
+      } else {
+        select.value = "";
+      }
+    }
+
+    async function loadLayers(preserve = true) {
+      const previous = preserve ? els.layerSelect.value : "";
+      setStatus("loading layers");
+      const data = await fetchJson("/v1/radar/layers");
+      state.layers = data.layers || [];
+      populateSelect(els.layerSelect, state.layers, previous, layerLabel);
+      if (!state.layers.length) {
+        state.layer = null;
+        state.frame = null;
+        setStatus("no radar layers");
+        renderEmpty();
+        return;
+      }
+      if (!els.layerSelect.value) {
+        const preferred = state.layers.find(layer => /ktlx.*vel|vel.*ktlx/i.test(layer.id) && hasSidecar(layer.latest))
+          || state.layers.find(layer => /ktlx/i.test(layer.id) && hasSidecar(layer.latest))
+          || state.layers.find(layer => /vel/i.test(layer.id) && hasSidecar(layer.latest))
+          || state.layers.find(layer => hasSidecar(layer.latest))
+          || state.layers[state.layers.length - 1];
+        els.layerSelect.value = preferred.id;
+      }
+      await selectLayer(true);
+    }
+
+    async function selectLayer(preserveFrame = false) {
+      state.layer = state.layers.find(layer => layer.id === els.layerSelect.value) || null;
+      state.frames = [];
+      state.frame = null;
+      if (!state.layer) return;
+      setStatus("loading frames");
+      const framesUrl = state.layer.frames_url || `/v1/radar/layers/${encodeURIComponent(state.layer.id)}/frames.json`;
+      const data = await fetchJson(framesUrl);
+      state.frames = data.frames || [];
+      const previous = preserveFrame ? els.frameSelect.value : "";
+      populateSelect(els.frameSelect, state.frames, previous, frameLabel);
+      if (!els.frameSelect.value && state.frames.length) {
+        els.frameSelect.value = state.frames[state.frames.length - 1].id;
+      }
+      selectFrame();
+    }
+
+    function selectFrame() {
+      state.frame = state.frames.find(frame => frame.id === els.frameSelect.value) || null;
+      const tilts = (state.frame && state.frame.tilts) || [];
+      els.tiltSelect.innerHTML = "";
+      const baseOption = document.createElement("option");
+      baseOption.value = "";
+      baseOption.textContent = "Frame";
+      els.tiltSelect.appendChild(baseOption);
+      for (const tilt of tilts) {
+        const option = document.createElement("option");
+        option.value = tilt.id;
+        option.textContent = tiltLabel(tilt);
+        els.tiltSelect.appendChild(option);
+      }
+      els.tiltSelect.disabled = tilts.length === 0;
+      if (tilts.length) {
+        const sidecarTilt = tilts.find(hasSidecar) || tilts[0];
+        els.tiltSelect.value = sidecarTilt.id;
+      }
+      updateRadarLayer();
+      renderAll();
+    }
+
+    function updateRadarLayer() {
+      if (!state.map) return;
+      if (state.radarLayer) {
+        state.map.removeLayer(state.radarLayer);
+        state.radarLayer = null;
+      }
+      const asset = currentAsset();
+      const template = templateFrom(asset);
+      if (!template) {
+        setStatus("no tile template");
+        return;
+      }
+      const opacity = Number(els.opacity.value || 0.88);
+      const nativeMinZoom = Number(asset.minzoom ?? state.frame?.minzoom ?? 0);
+      const nativeMaxZoom = Number(asset.maxzoom ?? state.frame?.maxzoom ?? 12);
+      state.radarLayer = L.tileLayer(template, {
+        minZoom: 0,
+        maxZoom: 19,
+        minNativeZoom: nativeMinZoom,
+        maxNativeZoom: nativeMaxZoom,
+        tileSize: 256,
+        opacity,
+        pane: "radarPane"
+      }).addTo(state.map);
+      const bounds = asset.bounds || state.frame?.bounds;
+      if (Array.isArray(bounds) && bounds.length === 4) {
+        const leafletBounds = [[bounds[1], bounds[0]], [bounds[3], bounds[2]]];
+        state.map.fitBounds(leafletBounds, {
+          padding: [18, 18],
+          maxZoom: nativeMaxZoom
+        });
+      }
+      setStatus("ready");
+    }
+
+    function renderAll() {
+      renderMeta();
+      renderQc();
+      renderProvenance();
+      try {
+        if (window.lucide) window.lucide.createIcons();
+      } catch (err) {}
+    }
+
+    function renderEmpty() {
+      els.frameMeta.innerHTML = "<div>Status</div><div>No configured radar tile root</div>";
+      els.qcPanel.innerHTML = "";
+      els.provenancePanel.innerHTML = "";
+    }
+
+    function row(label, value) {
+      return `<div>${esc(label)}</div><div>${esc(value ?? "--")}</div>`;
+    }
+
+    function renderMeta() {
+      if (!state.frame) {
+        renderEmpty();
+        return;
+      }
+      const asset = currentAsset();
+      const sidecar = asset.numeric_sidecar || state.frame.numeric_sidecar || null;
+      const sidecarState = sidecar ? `${sidecar.schema || "sidecar"} / ${sidecar.processing_state || "--"}` : "none";
+      els.frameMeta.innerHTML = [
+        row("Layer", state.layer?.id),
+        row("Site", state.frame.site),
+        row("Product", state.frame.product),
+        row("Scan", fmtTime(state.frame.scan_time_utc)),
+        row("Sweep", asset.sweep_index ?? state.frame.sweep_index),
+        row("Elevation", asset.elevation_deg == null ? "--" : `${fmt(asset.elevation_deg, 2)} deg`),
+        row("Tiles", asset.tile_count ?? state.frame.tile_count),
+        row("Zoom", `${asset.minzoom ?? state.frame.minzoom ?? "--"}-${asset.maxzoom ?? state.frame.maxzoom ?? "--"}`),
+        row("Native gate", state.frame.native_gate_size_m == null ? "--" : `${fmt(state.frame.native_gate_size_m, 0)} m`),
+        row("Az spacing", state.frame.native_azimuth_spacing_deg == null ? "--" : `${fmt(state.frame.native_azimuth_spacing_deg, 4)} deg`),
+        row("Color table", asset.color_table || state.frame.color_table),
+        row("Sidecar", sidecarState)
+      ].join("");
+    }
+
+    function qcCard(title, rows, tone = "") {
+      if (!rows.length) return "";
+      const className = tone ? `qc-card ${tone}` : "qc-card";
+      return `<div class="${className}"><strong>${esc(title)}</strong><div class="kv">${rows.join("")}</div></div>`;
+    }
+
+    function renderQc() {
+      if (!state.frame) {
+        els.qcPanel.innerHTML = "";
+        return;
+      }
+      const asset = currentAsset();
+      const cards = [];
+      const productQc = asset.product_qc || state.frame.product_qc;
+      if (productQc) {
+        cards.push(qcCard("Product", [
+          row("finite gates", productQc.finite_gate_count),
+          row("min", fmt(productQc.min_value, 2)),
+          row("max", fmt(productQc.max_value, 2)),
+          row("mean", fmt(productQc.mean_value, 2))
+        ]));
+      }
+      const dealias = asset.dealias_qc || state.frame.dealias_qc;
+      if (dealias) {
+        cards.push(qcCard("Dealias", [
+          row("decision", dealias.decision),
+          row("nyquist", dealias.nyquist_ms == null ? "--" : `${fmt(dealias.nyquist_ms, 2)} m/s`),
+          row("changed gates", dealias.changed_gate_count),
+          row("original severe", dealias.original_score?.severe_jumps ?? dealias.original_severe_jumps),
+          row("candidate severe", dealias.candidate_score?.severe_jumps ?? dealias.candidate_severe_jumps)
+        ], dealias.accepted === false ? "bad" : ""));
+      }
+      const velocityQc = asset.velocity_qc || state.frame.velocity_qc;
+      if (velocityQc) {
+        const severe = Number(velocityQc.severe_jump_count || 0);
+        cards.push(qcCard("Velocity", [
+          row("finite gates", velocityQc.finite_gate_count),
+          row("fold jumps", velocityQc.fold_like_jump_count),
+          row("fold fraction", fmt(velocityQc.fold_like_jump_fraction, 5)),
+          row("severe jumps", velocityQc.severe_jump_count),
+          row("max jump", velocityQc.max_abs_jump_ms == null ? "--" : `${fmt(velocityQc.max_abs_jump_ms, 2)} m/s`)
+        ], severe > 200 ? "warn" : ""));
+      }
+      const velocityFilter = asset.velocity_quality_qc || state.frame.velocity_quality_qc;
+      if (velocityFilter) {
+        cards.push(qcCard("Velocity Filter", [
+          row("finite gates", velocityFilter.finite_gate_count),
+          row("masked gates", velocityFilter.masked_gate_count),
+          row("masked fraction", fmt(velocityFilter.masked_gate_fraction, 5))
+        ]));
+      }
+      const reflectivity = asset.reflectivity_qc || state.frame.reflectivity_qc;
+      if (reflectivity) {
+        cards.push(qcCard("Reflectivity", Object.entries(reflectivity).map(([key, value]) => row(key, typeof value === "object" ? JSON.stringify(value) : value))));
+      }
+      els.qcPanel.innerHTML = cards.join("") || "<div class=\"kv\"><div>Status</div><div>No QC block</div></div>";
+    }
+
+    function renderProvenance() {
+      if (!state.frame) {
+        els.provenancePanel.innerHTML = "";
+        return;
+      }
+      const asset = currentAsset();
+      const provenance = asset.product_provenance || state.frame.product_provenance || {};
+      const source = asset.source_key_or_url || state.frame.source_key_or_url;
+      const sidecarUrl = asset.numeric_sidecar_url || state.frame.numeric_sidecar_url;
+      const sidecarLink = sidecarUrl ? `<a href="${esc(sidecarUrl)}" target="_blank" rel="noopener">manifest</a>` : "--";
+      els.provenancePanel.innerHTML = [
+        row("Source", source),
+        row("Product source", provenance.source),
+        row("Derived", provenance.derived == null ? "--" : provenance.derived),
+        row("Inputs", Array.isArray(provenance.inputs) ? provenance.inputs.join(", ") : provenance.inputs),
+        row("Method", provenance.method),
+        `<div>Sidecar</div><div>${sidecarLink}</div>`
+      ].join("");
+    }
+
+    function renderSample(sample) {
+      const valueText = sample.value == null ? "missing" : fmt(sample.value, 2);
+      const unitText = sample.units || "";
+      const stateBadges = ["raw", "dealiased", "filtered", "derived"]
+        .filter(key => sample[key])
+        .map(key => `<span class="badge good">${esc(key)}</span>`);
+      const flagBadges = (sample.gate_flags || []).map(flag => {
+        const tone = flag === "valid" ? "good" : flag === "missing" ? "bad" : "warn";
+        return `<span class="badge ${tone}">${esc(flag)}</span>`;
+      });
+      els.samplePanel.innerHTML = `
+        <div class="sample-value"><strong>${esc(valueText)}</strong><span>${esc(unitText)}</span></div>
+        <div class="kv">
+          ${row("Product", `${sample.product || "--"} / ${sample.product_name || "--"}`)}
+          ${row("Scan", fmtTime(sample.scan_time_utc))}
+          ${row("Sweep", `${sample.sweep_index ?? "--"} / ${fmt(sample.elevation_deg, 2)} deg`)}
+          ${row("Azimuth", `${fmt(sample.azimuth_deg, 2)} deg`)}
+          ${row("Range", `${fmt(sample.range_m, 0)} m`)}
+          ${row("Gate", `${sample.gate_index ?? "--"} (${fmt(sample.gate_fraction, 2)})`)}
+          ${row("Radial", `${sample.radial_index ?? "--"} / ${fmt(sample.radial_azimuth_deg, 2)} deg`)}
+          ${row("Spacing", `${fmt(sample.gate_spacing_m, 0)} m / ${fmt(sample.azimuth_spacing_deg, 3)} deg`)}
+          ${row("Nyquist", sample.nyquist_velocity_ms == null ? "--" : `${fmt(sample.nyquist_velocity_ms, 2)} m/s`)}
+          ${row("Method", sample.method)}
+          ${row("Site", `${sample.site?.id || "--"} ${fmt(sample.site?.lat, 4)}, ${fmt(sample.site?.lon, 4)}`)}
+        </div>
+        <div class="badges">${stateBadges.concat(flagBadges).join("")}</div>
+      `;
+      els.rawSample.textContent = JSON.stringify(sample, null, 2);
+    }
+
+    function renderSampleError(message) {
+      els.samplePanel.innerHTML = `
+        <div class="sample-value"><strong>--</strong><span></span></div>
+        <div class="kv">${row("Status", message)}</div>
+      `;
+    }
+
+    async function sampleAt(latlng, source) {
+      if (!state.layer || !state.frame) return;
+      const seq = ++state.sampleSeq;
+      setCoords(latlng);
+      const params = new URLSearchParams({
+        layer: state.layer.id,
+        frame: state.frame.id,
+        lat: String(latlng.lat),
+        lon: String(latlng.lng),
+        method: state.method
+      });
+      if (state.frame.product) params.set("product", state.frame.product);
+      const tilt = currentTilt();
+      if (tilt) params.set("tilt", tilt.id);
+      try {
+        const sample = await fetchJson(`/v1/radar/sample?${params.toString()}`);
+        if (seq !== state.sampleSeq) return;
+        renderSample(sample);
+        if (!state.sampleMarker) {
+          state.sampleMarker = L.circleMarker(latlng, {
+            radius: 5,
+            color: "#ffffff",
+            weight: 2,
+            fillColor: "#77c857",
+            fillOpacity: 0.85,
+            pane: "markerPane"
+          }).addTo(state.map);
+        } else {
+          state.sampleMarker.setLatLng(latlng);
+        }
+        setStatus(`${source} sample`);
+      } catch (err) {
+        if (seq !== state.sampleSeq) return;
+        setStatus(err.message || String(err));
+        if (source !== "hover") renderSampleError(err.message || String(err));
+      }
+    }
+
+    function initMap() {
+      if (!window.L) {
+        setStatus("Leaflet failed to load");
+        return;
+      }
+      state.map = L.map("map", {
+        preferCanvas: true,
+        zoomControl: false
+      }).setView([35.33, -97.28], 7);
+      state.map.createPane("radarPane");
+      state.map.getPane("radarPane").style.zIndex = 420;
+      L.control.zoom({ position: "bottomright" }).addTo(state.map);
+      state.baseLayer = L.tileLayer("https://tile.openstreetmap.org/{z}/{x}/{y}.png", {
+        maxZoom: 19,
+        attribution: "&copy; OpenStreetMap"
+      }).addTo(state.map);
+      state.map.on("mousemove", event => {
+        setCoords(event.latlng);
+        if (!els.hoverSample.checked) return;
+        window.clearTimeout(state.sampleTimer);
+        state.sampleTimer = window.setTimeout(() => sampleAt(event.latlng, "hover"), 140);
+      });
+      state.map.on("contextmenu", event => {
+        if (event.originalEvent) event.originalEvent.preventDefault();
+        sampleAt(event.latlng, "right-click");
+      });
+    }
+
+    function bindEvents() {
+      els.layerSelect.addEventListener("change", () => selectLayer(false).catch(handleFatal));
+      els.frameSelect.addEventListener("change", selectFrame);
+      els.tiltSelect.addEventListener("change", () => {
+        updateRadarLayer();
+        renderAll();
+      });
+      els.opacity.addEventListener("input", () => {
+        if (state.radarLayer) state.radarLayer.setOpacity(Number(els.opacity.value || 0.88));
+      });
+      els.reload.addEventListener("click", () => loadLayers(true).catch(handleFatal));
+      document.querySelectorAll("[data-method]").forEach(button => {
+        button.addEventListener("click", () => {
+          state.method = button.dataset.method;
+          document.querySelectorAll("[data-method]").forEach(other => other.classList.toggle("active", other === button));
+        });
+      });
+    }
+
+    function handleFatal(err) {
+      setStatus(err.message || String(err));
+      renderSampleError(err.message || String(err));
+    }
+
+    async function init() {
+      Object.assign(els, {
+        layerSelect: el("layerSelect"),
+        frameSelect: el("frameSelect"),
+        tiltSelect: el("tiltSelect"),
+        opacity: el("opacity"),
+        reload: el("reload"),
+        hoverSample: el("hoverSample"),
+        status: el("status"),
+        coords: el("coords"),
+        samplePanel: el("samplePanel"),
+        frameMeta: el("frameMeta"),
+        qcPanel: el("qcPanel"),
+        provenancePanel: el("provenancePanel"),
+        rawSample: el("rawSample")
+      });
+      bindEvents();
+      initMap();
+      try {
+        if (window.lucide) window.lucide.createIcons();
+      } catch (err) {}
+      await loadLayers(false);
+    }
+
+    init().catch(handleFatal);
+  </script>
+</body>
+</html>
+"####;
+
 const SATELLITE_HTML: &str = r####"<!doctype html>
 <html lang="en">
 <head>
@@ -7155,6 +8988,9 @@ const SATELLITE_HTML: &str = r####"<!doctype html>
       <label>Layer<select id="layer"></select></label>
       <label>Frame<select id="frame"></select></label>
     </div>
+    <div class="row" id="tiltRow" style="display:none">
+      <label>Tilt<select id="tilt"></select></label>
+    </div>
     <div class="row">
       <label>Basemap<select id="basemap">
         <option value="osm">OpenStreetMap</option>
@@ -7183,6 +9019,8 @@ const SATELLITE_HTML: &str = r####"<!doctype html>
     const els = {
       layer: document.getElementById("layer"),
       frame: document.getElementById("frame"),
+      tiltRow: document.getElementById("tiltRow"),
+      tilt: document.getElementById("tilt"),
       basemap: document.getElementById("basemap"),
       opacity: document.getElementById("opacity"),
       prev: document.getElementById("prev"),
@@ -7231,28 +9069,67 @@ const SATELLITE_HTML: &str = r####"<!doctype html>
     function selectedFrameIndex() {
       return Math.max(0, frames.findIndex(frame => frame.id === els.frame.value));
     }
+    function frameTilts(frame) {
+      return Array.isArray(frame && frame.tilts) ? frame.tilts : [];
+    }
+    function velocityQualityText(source, frame) {
+      const enabled = source.velocity_quality_filter ?? frame.velocity_quality_filter;
+      if (!enabled) return "";
+      const qc = source.velocity_quality_qc || frame.velocity_quality_qc;
+      const fraction = qc && Number(qc.masked_gate_fraction);
+      if (Number.isFinite(fraction)) return ` | velocity QC ${(fraction * 100).toFixed(1)}% masked`;
+      return " | velocity QC";
+    }
+    function syncTiltOptions(frame) {
+      const tilts = frameTilts(frame);
+      if (!tilts.length) {
+        els.tiltRow.style.display = "none";
+        els.tilt.innerHTML = "";
+        return null;
+      }
+      const previous = els.tilt.value;
+      els.tiltRow.style.display = "";
+      els.tilt.innerHTML = tilts.map(tilt => {
+        const label = tilt.name || `sweep ${tilt.sweep_index ?? ""}`;
+        const elevation = Number.isFinite(Number(tilt.elevation_deg)) ? ` ${Number(tilt.elevation_deg).toFixed(2)} deg` : "";
+        return `<option value="${esc(tilt.id)}">${esc(label)}${esc(elevation)}</option>`;
+      }).join("");
+      if (tilts.some(tilt => tilt.id === previous)) els.tilt.value = previous;
+      else els.tilt.value = tilts[0].id;
+      return tilts.find(tilt => tilt.id === els.tilt.value) || tilts[0];
+    }
     function renderFrame(index = selectedFrameIndex(), fit = false) {
       if (!frames.length) {
         if (satLayer) map.removeLayer(satLayer);
         satLayer = null;
+        els.tiltRow.style.display = "none";
         els.legend.textContent = "No satellite frames are available.";
         return;
       }
       const frame = frames[Math.max(0, Math.min(index, frames.length - 1))];
       els.frame.value = frame.id;
+      const tilt = syncTiltOptions(frame);
+      const source = tilt || frame;
       if (satLayer) map.removeLayer(satLayer);
       const opacity = Number(els.opacity.value || 90) / 100;
-      satLayer = L.tileLayer(frame.tile_url_template, {
+      satLayer = L.tileLayer(source.tile_url_template || frame.tile_url_template, {
         opacity,
-        minZoom: frame.minzoom || 0,
-        maxNativeZoom: frame.maxzoom || 9,
-        maxZoom: Math.max(12, frame.maxzoom || 9),
+        minZoom: source.minzoom || frame.minzoom || 0,
+        maxNativeZoom: source.maxzoom || frame.maxzoom || 9,
+        maxZoom: Math.max(12, source.maxzoom || frame.maxzoom || 9),
         pane: "tilePane",
       }).addTo(map);
       satLayer.bringToFront();
-      const bounds = frameBounds(frame);
+      const bounds = frameBounds(source) || frameBounds(frame);
       if (fit && bounds) map.fitBounds(bounds, { padding: [24, 24] });
-      els.legend.textContent = `${els.layer.value} | ${frame.scan_time_utc || frame.id} | z${frame.minzoom}-${frame.maxzoom} | ${frame.tile_count || 0} tiles | ${frame.size_mb || 0} MB`;
+      const nativeParts = [];
+      if (source.native_gate_size_m) nativeParts.push(`${Number(source.native_gate_size_m).toFixed(0)} m gates`);
+      if (source.native_azimuth_spacing_deg) nativeParts.push(`${Number(source.native_azimuth_spacing_deg).toFixed(2)} deg az`);
+      if (source.maxzoom_site_meters_per_pixel) nativeParts.push(`${Number(source.maxzoom_site_meters_per_pixel).toFixed(0)} m/px @ z${source.maxzoom || frame.maxzoom || "?"}`);
+      const nativeText = nativeParts.length ? ` | native ${nativeParts.join(", ")}` : "";
+      const velocityText = velocityQualityText(source, frame);
+      const tiltText = tilt ? ` | ${tilt.name || tilt.id}` : "";
+      els.legend.textContent = `${els.layer.value} | ${frame.scan_time_utc || frame.id}${tiltText} | z${source.minzoom || frame.minzoom}-${source.maxzoom || frame.maxzoom} | ${source.tile_count || frame.tile_count || 0} tiles | ${frame.size_mb || 0} MB${nativeText}${velocityText}`;
       setStatus(`Loaded ${els.layer.value} frame ${frame.label || frame.id}.`);
     }
     async function loadLayers(preserve = true) {
@@ -7306,6 +9183,7 @@ const SATELLITE_HTML: &str = r####"<!doctype html>
     els.basemap.addEventListener("change", () => setBase(els.basemap.value));
     els.layer.addEventListener("change", () => { stop(); loadFrames(true).catch(err => setStatus(err.message)); });
     els.frame.addEventListener("change", () => { stop(); renderFrame(selectedFrameIndex(), false); });
+    els.tilt.addEventListener("change", () => { stop(); renderFrame(selectedFrameIndex(), false); });
     els.opacity.addEventListener("input", () => { if (satLayer) satLayer.setOpacity(Number(els.opacity.value || 90) / 100); });
     els.prev.addEventListener("click", () => step(-1));
     els.next.addEventListener("click", () => step(1));
@@ -9217,6 +11095,8 @@ async fn readyz(State(state): State<Arc<AppState>>) -> (StatusCode, Json<Value>)
         state.diagnostic.as_deref(),
         state.spatial.as_deref(),
         state.static_plots.as_deref(),
+        state.satellite_tiles.as_deref(),
+        state.radar_tiles.as_deref(),
     );
     let ok = status.get("ok").and_then(Value::as_bool).unwrap_or(false);
     (
@@ -9235,6 +11115,8 @@ async fn status(State(state): State<Arc<AppState>>) -> Json<Value> {
         state.diagnostic.as_deref(),
         state.spatial.as_deref(),
         state.static_plots.as_deref(),
+        state.satellite_tiles.as_deref(),
+        state.radar_tiles.as_deref(),
         Some(state.cache_stats()),
         state.archive.as_deref(),
     ))
@@ -9441,6 +11323,136 @@ async fn satellite_tile(
         .map_err(bad_anyhow)?;
     let bytes = fs::read(&tile)
         .map_err(|err| internal_error(format!("read satellite tile {}: {err}", tile.display())))?;
+    Ok(bytes_response(Bytes::from(bytes), "image/png", false, true))
+}
+
+async fn radar_layers(State(state): State<Arc<AppState>>) -> Result<impl IntoResponse, ApiError> {
+    let Some(lane) = state.radar_tiles.as_deref() else {
+        return Err(not_found("radar tiles root is not configured"));
+    };
+    Ok((
+        no_store_headers(),
+        Json(lane.layers_json().map_err(bad_anyhow)?),
+    ))
+}
+
+async fn radar_frames(
+    State(state): State<Arc<AppState>>,
+    AxumPath(layer_id): AxumPath<String>,
+) -> Result<impl IntoResponse, ApiError> {
+    let Some(lane) = state.radar_tiles.as_deref() else {
+        return Err(not_found("radar tiles root is not configured"));
+    };
+    Ok((
+        no_store_headers(),
+        Json(lane.frames_json(&layer_id).map_err(bad_anyhow)?),
+    ))
+}
+
+async fn radar_sidecar(
+    State(state): State<Arc<AppState>>,
+    AxumPath((layer_id, frame_id, sidecar_file)): AxumPath<(String, String, String)>,
+) -> Result<Response, ApiError> {
+    let Some(lane) = state.radar_tiles.as_deref() else {
+        return Err(not_found("radar tiles root is not configured"));
+    };
+    let sidecar = lane
+        .sidecar_path(&layer_id, &frame_id, None, &sidecar_file)
+        .map_err(bad_anyhow)?;
+    let bytes = fs::read(&sidecar).map_err(|err| {
+        internal_error(format!("read radar sidecar {}: {err}", sidecar.display()))
+    })?;
+    Ok(bytes_response(
+        Bytes::from(bytes),
+        radar_sidecar_content_type(&sidecar_file),
+        false,
+        true,
+    ))
+}
+
+async fn radar_tilt_sidecar(
+    State(state): State<Arc<AppState>>,
+    AxumPath((layer_id, frame_id, tilt_id, sidecar_file)): AxumPath<(
+        String,
+        String,
+        String,
+        String,
+    )>,
+) -> Result<Response, ApiError> {
+    let Some(lane) = state.radar_tiles.as_deref() else {
+        return Err(not_found("radar tiles root is not configured"));
+    };
+    let sidecar = lane
+        .sidecar_path(&layer_id, &frame_id, Some(&tilt_id), &sidecar_file)
+        .map_err(bad_anyhow)?;
+    let bytes = fs::read(&sidecar).map_err(|err| {
+        internal_error(format!("read radar sidecar {}: {err}", sidecar.display()))
+    })?;
+    Ok(bytes_response(
+        Bytes::from(bytes),
+        radar_sidecar_content_type(&sidecar_file),
+        false,
+        true,
+    ))
+}
+
+async fn radar_sample(
+    State(state): State<Arc<AppState>>,
+    Query(query): Query<RadarSampleQuery>,
+) -> Result<impl IntoResponse, ApiError> {
+    let Some(lane) = state.radar_tiles.as_deref() else {
+        return Err(not_found("radar tiles root is not configured"));
+    };
+    Ok((
+        no_store_headers(),
+        Json(lane.sample_json(&query).map_err(bad_anyhow)?),
+    ))
+}
+
+async fn radar_tile(
+    State(state): State<Arc<AppState>>,
+    AxumPath((layer_id, frame_id, z, x, tile_file)): AxumPath<(String, String, u8, u32, String)>,
+) -> Result<Response, ApiError> {
+    let Some(lane) = state.radar_tiles.as_deref() else {
+        return Err(not_found("radar tiles root is not configured"));
+    };
+    let y = tile_file
+        .strip_suffix(".png")
+        .unwrap_or(tile_file.as_str())
+        .parse::<u32>()
+        .map_err(|_| bad_request("invalid radar tile y"))?;
+    let tile = lane
+        .tile_path(&layer_id, &frame_id, None, z, x, y)
+        .map_err(bad_anyhow)?;
+    let bytes = fs::read(&tile)
+        .map_err(|err| internal_error(format!("read radar tile {}: {err}", tile.display())))?;
+    Ok(bytes_response(Bytes::from(bytes), "image/png", false, true))
+}
+
+async fn radar_tilt_tile(
+    State(state): State<Arc<AppState>>,
+    AxumPath((layer_id, frame_id, tilt_id, z, x, tile_file)): AxumPath<(
+        String,
+        String,
+        String,
+        u8,
+        u32,
+        String,
+    )>,
+) -> Result<Response, ApiError> {
+    let Some(lane) = state.radar_tiles.as_deref() else {
+        return Err(not_found("radar tiles root is not configured"));
+    };
+    let y = tile_file
+        .strip_suffix(".png")
+        .unwrap_or(tile_file.as_str())
+        .parse::<u32>()
+        .map_err(|_| bad_request("invalid radar tile y"))?;
+    let tile = lane
+        .tile_path(&layer_id, &frame_id, Some(&tilt_id), z, x, y)
+        .map_err(bad_anyhow)?;
+    let bytes = fs::read(&tile)
+        .map_err(|err| internal_error(format!("read radar tile {}: {err}", tile.display())))?;
     Ok(bytes_response(Bytes::from(bytes), "image/png", false, true))
 }
 
@@ -11340,6 +13352,8 @@ fn store_status(
     diagnostic: Option<&DiagnosticLane>,
     spatial: Option<&SpatialLane>,
     static_plots: Option<&StaticPlotLane>,
+    satellite_tiles: Option<&SatelliteTileLane>,
+    radar_tiles: Option<&RadarTileLane>,
     cache: Option<CacheStats>,
     archive: Option<&ArchiveLane>,
 ) -> Value {
@@ -11353,10 +13367,14 @@ fn store_status(
         .unwrap_or(false);
     let spatial_ready = spatial.map(|_| !spatial_models.is_empty()).unwrap_or(true);
     let static_plots_ready = static_plots.is_some();
+    let satellite_ready = satellite_tiles.is_some();
+    let radar_ready = radar_tiles.is_some();
     let ok = if spatial.is_some() {
         spatial_ready
     } else if static_plots.is_some() {
         static_plots_ready
+    } else if satellite_tiles.is_some() || radar_tiles.is_some() {
+        satellite_ready || radar_ready
     } else {
         profile_ready
     };
@@ -11373,6 +13391,9 @@ fn store_status(
             } else {
                 "unavailable"
             },
+            "static_plots": if static_plots_ready { "ready" } else { "unavailable" },
+            "satellite_tiles": if satellite_ready { "ready" } else { "unavailable" },
+            "radar_tiles": if radar_ready { "ready" } else { "unavailable" },
             "spatial_models": spatial_models
         },
         "loaded_run": profile
@@ -11383,6 +13404,8 @@ fn store_status(
             "diag_scalar_basic": diagnostic.map(DiagnosticLane::lane_manifest_json).unwrap_or_else(|| json!({"status": "unavailable"})),
             "surface_spatial": spatial.map(SpatialLane::lane_manifest_json).unwrap_or_else(|| json!({"status": "unavailable"})),
             "static_plots": static_plots.map(StaticPlotLane::lane_manifest_json).unwrap_or_else(|| json!({"status": "unavailable"})),
+            "satellite_tiles": satellite_tiles.map(SatelliteTileLane::lane_manifest_json).unwrap_or_else(|| json!({"status": "unavailable"})),
+            "radar_tiles": radar_tiles.map(RadarTileLane::lane_manifest_json).unwrap_or_else(|| json!({"status": "unavailable"})),
             "archive": archive.map(ArchiveLane::status_json).unwrap_or_else(|| json!({"status": "unavailable"}))
         },
         "monitoring": monitoring_status(profile, diagnostic, spatial, static_plots, &cache_stats),
@@ -11395,6 +13418,8 @@ fn readiness_status(
     diagnostic: Option<&DiagnosticLane>,
     spatial: Option<&SpatialLane>,
     static_plots: Option<&StaticPlotLane>,
+    satellite_tiles: Option<&SatelliteTileLane>,
+    radar_tiles: Option<&RadarTileLane>,
 ) -> Value {
     let spatial_models = spatial.map(SpatialLane::model_ids).unwrap_or_default();
     let profile_ready = profile
@@ -11405,10 +13430,14 @@ fn readiness_status(
         })
         .unwrap_or(false);
     let spatial_ready = spatial.map(|_| !spatial_models.is_empty()).unwrap_or(true);
+    let satellite_ready = satellite_tiles.is_some();
+    let radar_ready = radar_tiles.is_some();
     let ok = if spatial.is_some() {
         spatial_ready
     } else if static_plots.is_some() {
         true
+    } else if satellite_tiles.is_some() || radar_tiles.is_some() {
+        satellite_ready || radar_ready
     } else {
         profile_ready
     };
@@ -11425,6 +13454,9 @@ fn readiness_status(
             } else {
                 "unavailable"
             },
+            "static_plots": if static_plots.is_some() { "ready" } else { "unavailable" },
+            "satellite_tiles": if satellite_ready { "ready" } else { "unavailable" },
+            "radar_tiles": if radar_ready { "ready" } else { "unavailable" },
             "spatial_models": spatial_models
         }
     })
@@ -16748,6 +18780,14 @@ mod tests {
         path
     }
 
+    fn write_test_f32_le(path: &Path, values: &[f32]) {
+        let mut bytes = Vec::with_capacity(values.len() * 4);
+        for value in values {
+            bytes.extend_from_slice(&value.to_le_bytes());
+        }
+        fs::write(path, bytes).expect("write f32 values");
+    }
+
     fn static_plot_test_manifest(run_label: &str) -> StaticPlotRunManifest {
         StaticPlotRunManifest {
             run_kind: "hrrr_non_ecape_hour".to_string(),
@@ -16857,6 +18897,325 @@ mod tests {
             read_latest_pointer_run(&root, model).as_deref(),
             Some(newer)
         );
+
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn radar_viewer_uses_dedicated_qc_app() {
+        assert!(RADAR_HTML.contains("/v1/radar/layers"));
+        assert!(RADAR_HTML.contains("/v1/radar/sample"));
+        assert!(RADAR_HTML.contains("numeric_sidecar"));
+        assert!(RADAR_HTML.contains("contextmenu"));
+        assert!(RADAR_HTML.contains(r#"<input id="hoverSample" type="checkbox" />"#));
+        assert!(!RADAR_HTML.contains("/v1/satellite"));
+    }
+
+    #[test]
+    fn radar_frames_json_preserves_native_resolution_metadata() {
+        let root = temp_test_root("radar_native_metadata");
+        let layer_id = "nexrad_level2_ksjt_ref";
+        let frame_id = "20260511T012134Z";
+        let layer_root = root.join(layer_id);
+        fs::create_dir_all(&layer_root).expect("create radar layer root");
+        fs::write(
+            layer_root.join("frames.json"),
+            serde_json::to_vec_pretty(&json!({
+                "ok": true,
+                "layer": layer_id,
+                "frames": [
+                    {
+                        "id": frame_id,
+                        "layer": layer_id,
+                        "site": "KSJT",
+                        "product": "ref",
+                        "scan_time_utc": "2026-05-11T01:21:34Z",
+                        "url_template": format!("{layer_id}/frames/{frame_id}/{{z}}/{{x}}/{{y}}.png"),
+                        "bounds": [-101.7, 30.3, -99.1, 32.2],
+                        "minzoom": 8,
+                        "maxzoom": 9,
+                        "tile_count": 27,
+                        "native_gate_size_m": 250,
+                        "native_azimuth_spacing_deg": 0.4998779296875_f64,
+                        "maxzoom_site_meters_per_pixel": 261.0518623255104_f64,
+                        "velocity_quality_filter": true,
+                        "velocity_quality_qc": {
+                            "finite_gate_count": 264580,
+                            "masked_gate_count": 13613,
+                            "masked_gate_fraction": 0.05145135686748809_f64
+                        },
+                        "numeric_sidecar": {
+                            "schema": "rustwx.radar.polar_sidecar.v2",
+                            "manifest_path": "staging/polar_sidecar_manifest.json",
+                            "values_path": "staging/polar_values_f32le.bin",
+                            "gate_flags_path": "staging/polar_gate_flags_u8.bin",
+                            "radial_count": 360,
+                            "max_gate_count": 1000,
+                            "gate_count": 360000,
+                            "processing_state": "raw"
+                        },
+                        "tilts": [
+                            {
+                                "id": "sweep00_el0p44",
+                                "name": "sweep00_el0p44",
+                                "sweep_index": 0,
+                                "elevation_deg": 0.43945312,
+                                "url_template": format!("{layer_id}/frames/{frame_id}/sweep00_el0p44/{{z}}/{{x}}/{{y}}.png"),
+                                "bounds": [-101.7, 30.3, -99.1, 32.2],
+                                "minzoom": 8,
+                                "maxzoom": 9,
+                                "tile_count": 27,
+                                "native_gate_size_m": 250,
+                                "native_azimuth_spacing_deg": 0.4998779296875_f64,
+                                "maxzoom_site_meters_per_pixel": 261.0518623255104_f64,
+                                "velocity_quality_filter": true,
+                                "velocity_quality_qc": {
+                                    "finite_gate_count": 264580,
+                                    "masked_gate_count": 13613,
+                                    "masked_gate_fraction": 0.05145135686748809_f64
+                                },
+                                "numeric_sidecar": {
+                                    "schema": "rustwx.radar.polar_sidecar.v2",
+                                    "manifest_path": "staging/sweep00_el0p44/polar_sidecar_manifest.json",
+                                    "values_path": "staging/sweep00_el0p44/polar_values_f32le.bin",
+                                    "gate_flags_path": "staging/sweep00_el0p44/polar_gate_flags_u8.bin",
+                                    "radial_count": 360,
+                                    "max_gate_count": 1000,
+                                    "gate_count": 360000,
+                                    "processing_state": "raw"
+                                }
+                            }
+                        ]
+                    }
+                ]
+            }))
+            .unwrap(),
+        )
+        .expect("write radar frames index");
+
+        let lane = RadarTileLane::open(&root).expect("open radar lane");
+        let value = lane.frames_json(layer_id).expect("read radar frames");
+        let frame = &value["frames"][0];
+        let tilt = &frame["tilts"][0];
+
+        assert_eq!(frame["native_gate_size_m"].as_u64(), Some(250));
+        assert_eq!(
+            frame["native_azimuth_spacing_deg"].as_f64(),
+            Some(0.4998779296875)
+        );
+        assert_eq!(
+            frame["maxzoom_site_meters_per_pixel"].as_f64(),
+            Some(261.0518623255104)
+        );
+        assert_eq!(tilt["native_gate_size_m"].as_u64(), Some(250));
+        assert_eq!(frame["velocity_quality_filter"].as_bool(), Some(true));
+        assert_eq!(
+            frame["velocity_quality_qc"]["masked_gate_count"].as_u64(),
+            Some(13613)
+        );
+        assert_eq!(tilt["velocity_quality_filter"].as_bool(), Some(true));
+        assert_eq!(
+            tilt["velocity_quality_qc"]["masked_gate_fraction"].as_f64(),
+            Some(0.05145135686748809)
+        );
+        assert_eq!(
+            frame["tile_url_template"].as_str(),
+            Some("/v1/radar/tiles/nexrad_level2_ksjt_ref/frames/20260511T012134Z/{z}/{x}/{y}.png")
+        );
+        assert_eq!(
+            tilt["tile_url_template"].as_str(),
+            Some("/v1/radar/tiles/nexrad_level2_ksjt_ref/frames/20260511T012134Z/sweep00_el0p44/{z}/{x}/{y}.png")
+        );
+        assert_eq!(
+            frame["numeric_sidecar_url"].as_str(),
+            Some("/v1/radar/sidecars/nexrad_level2_ksjt_ref/frames/20260511T012134Z/polar_sidecar_manifest.json")
+        );
+        assert_eq!(
+            tilt["numeric_sidecar_url"].as_str(),
+            Some("/v1/radar/sidecars/nexrad_level2_ksjt_ref/frames/20260511T012134Z/sweep00_el0p44/polar_sidecar_manifest.json")
+        );
+
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn radar_frames_json_preserves_product_provenance() {
+        let root = temp_test_root("radar_product_provenance");
+        let layer_id = "nexrad_level2_ksjt_kdp";
+        let frame_id = "20260511T043240Z";
+        let layer_root = root.join(layer_id);
+        fs::create_dir_all(&layer_root).expect("create radar layer root");
+        let product_provenance = json!({
+            "source": "derived",
+            "derived": true,
+            "inputs": ["phi"],
+            "method": "centered_phi_range_derivative"
+        });
+        fs::write(
+            layer_root.join("frames.json"),
+            serde_json::to_vec_pretty(&json!({
+                "ok": true,
+                "layer": layer_id,
+                "frames": [{
+                    "id": frame_id,
+                    "url_template": format!("{layer_id}/frames/{frame_id}/{{z}}/{{x}}/{{y}}.png"),
+                    "product_provenance": product_provenance.clone(),
+                    "tilts": [{
+                        "id": "sweep00_el0p31",
+                        "url_template": format!("{layer_id}/frames/{frame_id}/sweep00_el0p31/{{z}}/{{x}}/{{y}}.png"),
+                        "product_provenance": product_provenance
+                    }]
+                }]
+            }))
+            .unwrap(),
+        )
+        .expect("write radar frames index");
+
+        let lane = RadarTileLane::open(&root).expect("open radar lane");
+        let value = lane.frames_json(layer_id).expect("read radar frames");
+        let frame = &value["frames"][0];
+        let tilt = &frame["tilts"][0];
+
+        assert_eq!(
+            frame["product_provenance"]["method"].as_str(),
+            Some("centered_phi_range_derivative")
+        );
+        assert_eq!(
+            tilt["product_provenance"]["inputs"][0].as_str(),
+            Some("phi")
+        );
+
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn radar_sample_reads_numeric_sidecar_gate_values() {
+        let root = temp_test_root("radar_numeric_sidecar_sample");
+        let layer_id = "nexrad_level2_ktlx_ref";
+        let frame_id = "20260511T010000Z";
+        let tilt_id = "sweep00_el0p00";
+        let sidecar_dir = root
+            .join(layer_id)
+            .join("frames")
+            .join(frame_id)
+            .join(tilt_id);
+        fs::create_dir_all(&sidecar_dir).expect("create sidecar dir");
+        fs::write(
+            sidecar_dir.join(RADAR_POLAR_SIDECAR_MANIFEST_FILE),
+            serde_json::to_vec_pretty(&json!({
+                "schema": RADAR_POLAR_SIDECAR_SCHEMA,
+                "sidecar_version": 2,
+                "ok": true,
+                "name": "ktlx_ref_sweep00_el0p00",
+                "site": {
+                    "id": "KTLX",
+                    "name": "Oklahoma City",
+                    "state": "OK",
+                    "lat": 35.0,
+                    "lon": -97.0,
+                    "elevation_m": 370.0,
+                    "feedhorn_height_m": 20.0,
+                    "antenna_elevation_m": 390.0
+                },
+                "product": "ref",
+                "product_name": "Reflectivity",
+                "units": "dBZ",
+                "product_provenance": {
+                    "source": "native",
+                    "derived": false
+                },
+                "source_key_or_url": "s3://noaa-nexrad-level2/2026/05/11/KTLX/KTLX20260511_010000_V06",
+                "scan_time_utc": "2026-05-11T01:00:00Z",
+                "sweep_index": 0,
+                "elevation_deg": 0.0,
+                "nyquist_velocity_ms": null,
+                "processing_state": "raw",
+                "radial_count": 2,
+                "max_gate_count": 4,
+                "gate_count": 8,
+                "values_path": RADAR_POLAR_VALUES_FILE,
+                "values_encoding": "f32_le_row_major_radial_gate_nan_missing",
+                "gate_flags_path": RADAR_POLAR_GATE_FLAGS_FILE,
+                "gate_flags_encoding": "u8_bitmask_row_major_radial_gate",
+                "radials": [
+                    {
+                        "radial_index": 0,
+                        "azimuth_deg": 0.0,
+                        "elevation_deg": 0.0,
+                        "azimuth_spacing_deg": 1.0,
+                        "gate_count": 4,
+                        "first_gate_range_m": 0,
+                        "gate_spacing_m": 250,
+                        "nyquist_velocity_ms": null,
+                        "data_word_size_bits": 8,
+                        "scale": 2.0,
+                        "offset": 66.0
+                    },
+                    {
+                        "radial_index": 1,
+                        "azimuth_deg": 90.0,
+                        "elevation_deg": 0.0,
+                        "azimuth_spacing_deg": 1.0,
+                        "gate_count": 4,
+                        "first_gate_range_m": 0,
+                        "gate_spacing_m": 250,
+                        "nyquist_velocity_ms": null,
+                        "data_word_size_bits": 8,
+                        "scale": 2.0,
+                        "offset": 66.0
+                    }
+                ],
+                "qc": {
+                    "reflectivity_qc": {
+                        "despeckle_applied": false
+                    }
+                }
+            }))
+            .unwrap(),
+        )
+        .expect("write sidecar manifest");
+        write_test_f32_le(
+            &sidecar_dir.join(RADAR_POLAR_VALUES_FILE),
+            &[1.0, 2.0, 3.0, 4.0, 10.0, 20.0, 30.0, 40.0],
+        );
+        fs::write(
+            sidecar_dir.join(RADAR_POLAR_GATE_FLAGS_FILE),
+            vec![RADAR_GATE_FLAG_VALID; 8],
+        )
+        .expect("write flags");
+
+        let lane = RadarTileLane::open(&root).expect("open radar lane");
+        let query = RadarSampleQuery {
+            layer: layer_id.to_string(),
+            frame: frame_id.to_string(),
+            product: Some("ref".to_string()),
+            tilt: Some(tilt_id.to_string()),
+            lat: 35.0 + 750.0 / 111_139.0,
+            lon: -97.0,
+            method: Some("nearest".to_string()),
+        };
+        let sample = lane.sample_json(&query).expect("sample sidecar");
+
+        assert_eq!(sample["value"].as_f64(), Some(4.0));
+        assert_eq!(sample["units"].as_str(), Some("dBZ"));
+        assert_eq!(sample["product"].as_str(), Some("ref"));
+        assert_eq!(sample["sweep_index"].as_u64(), Some(0));
+        assert_eq!(sample["radial_index"].as_u64(), Some(0));
+        assert_eq!(sample["gate_index"].as_u64(), Some(3));
+        assert_eq!(sample["processing_state"].as_str(), Some("raw"));
+        assert_eq!(sample["raw"].as_bool(), Some(true));
+        assert_eq!(sample["derived"].as_bool(), Some(false));
+        assert_eq!(
+            sample["provenance"]["source_key_or_url"].as_str(),
+            Some("s3://noaa-nexrad-level2/2026/05/11/KTLX/KTLX20260511_010000_V06")
+        );
+        assert_eq!(
+            sample["qc"]["reflectivity_qc"]["despeckle_applied"].as_bool(),
+            Some(false)
+        );
+        assert_eq!(sample["site"]["feedhorn_height_m"].as_f64(), Some(20.0));
+        assert_eq!(sample["site"]["antenna_elevation_m"].as_f64(), Some(390.0));
+        assert!((sample["range_m"].as_f64().unwrap() - 750.0).abs() < 1e-6);
 
         fs::remove_dir_all(root).ok();
     }
