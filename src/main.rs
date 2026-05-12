@@ -8522,7 +8522,6 @@ const RADAR_HTML: &str = r####"<!doctype html>
       <div class="field">
         <span class="control-label">Tiles</span>
         <div style="display:flex;gap:8px;align-items:center;">
-          <label class="toggle" title="Enable cursor sampling"><input id="hoverSample" type="checkbox" /> Hover</label>
           <input id="opacity" title="Radar tile opacity" type="range" min="0" max="1" step="0.05" value="0.88" />
           <button id="reload" type="button" class="icon-button" title="Reload radar layers" aria-label="Reload radar layers"><i data-lucide="refresh-cw"></i></button>
         </div>
@@ -8575,7 +8574,6 @@ const RADAR_HTML: &str = r####"<!doctype html>
       baseLayer: null,
       radarLayer: null,
       sampleMarker: null,
-      sampleTimer: 0,
       sampleSeq: 0
     };
 
@@ -8976,7 +8974,7 @@ const RADAR_HTML: &str = r####"<!doctype html>
       } catch (err) {
         if (seq !== state.sampleSeq) return;
         setStatus(err.message || String(err));
-        if (source !== "hover") renderSampleError(err.message || String(err));
+        renderSampleError(err.message || String(err));
       }
     }
 
@@ -8998,9 +8996,6 @@ const RADAR_HTML: &str = r####"<!doctype html>
       }).addTo(state.map);
       state.map.on("mousemove", event => {
         setCoords(event.latlng);
-        if (!els.hoverSample.checked) return;
-        window.clearTimeout(state.sampleTimer);
-        state.sampleTimer = window.setTimeout(() => sampleAt(event.latlng, "hover"), 140);
       });
       state.map.on("contextmenu", event => {
         if (event.originalEvent) event.originalEvent.preventDefault();
@@ -9039,7 +9034,6 @@ const RADAR_HTML: &str = r####"<!doctype html>
         tiltSelect: el("tiltSelect"),
         opacity: el("opacity"),
         reload: el("reload"),
-        hoverSample: el("hoverSample"),
         status: el("status"),
         coords: el("coords"),
         samplePanel: el("samplePanel"),
@@ -19107,7 +19101,8 @@ mod tests {
         assert!(RADAR_HTML.contains("numeric_sidecar"));
         assert!(RADAR_HTML.contains("Bounds clip"));
         assert!(RADAR_HTML.contains("contextmenu"));
-        assert!(RADAR_HTML.contains(r#"<input id="hoverSample" type="checkbox" />"#));
+        assert!(!RADAR_HTML.contains("hoverSample"));
+        assert!(!RADAR_HTML.contains(r#"sampleAt(event.latlng, "hover")"#));
         assert!(!RADAR_HTML.contains("/v1/satellite"));
     }
 
