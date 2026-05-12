@@ -1485,6 +1485,8 @@ struct RadarPolarSidecarManifest {
     product_name: String,
     units: String,
     #[serde(default)]
+    value_meanings: Vec<RadarPolarValueMeaning>,
+    #[serde(default)]
     product_provenance: Value,
     source_key_or_url: Option<String>,
     scan_time_utc: String,
@@ -1511,6 +1513,14 @@ struct RadarPolarGateFlagMeaning {
     bit: u8,
     mask: u8,
     name: String,
+    description: String,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+struct RadarPolarValueMeaning {
+    value: f32,
+    name: String,
+    label: String,
     description: String,
 }
 
@@ -3512,9 +3522,16 @@ impl RadarPolarSidecarData {
             RadarPolarSampleMethod::Nearest => {
                 self.sample_nearest(lat, lon, polar, slant_range_m, method)
             }
-            RadarPolarSampleMethod::Interpolated => self
+            RadarPolarSampleMethod::Interpolated if self.manifest.value_meanings.is_empty() => self
                 .sample_interpolated(lat, lon, polar, slant_range_m)
                 .or_else(|| self.sample_nearest(lat, lon, polar, slant_range_m, method)),
+            RadarPolarSampleMethod::Interpolated => self.sample_nearest(
+                lat,
+                lon,
+                polar,
+                slant_range_m,
+                RadarPolarSampleMethod::Nearest,
+            ),
         }
     }
 
@@ -3612,6 +3629,7 @@ impl RadarPolarSidecarData {
         let derived =
             processing_state.contains("derived") || flag_bits & RADAR_GATE_FLAG_DERIVED != 0;
         let product_provenance = self.manifest.product_provenance.clone();
+        let value_label = value.and_then(|value| self.value_label(value));
         json!({
             "schema": "wxstore.radar.sample.v1",
             "sidecar_schema": self.manifest.schema.as_str(),
@@ -3619,6 +3637,7 @@ impl RadarPolarSidecarData {
             "lat": lat,
             "lon": lon,
             "value": value,
+            "value_label": value_label,
             "units": self.manifest.units.as_str(),
             "product": self.manifest.product.as_str(),
             "product_name": self.manifest.product_name.as_str(),
@@ -3653,6 +3672,14 @@ impl RadarPolarSidecarData {
             "scan_time_utc": self.manifest.scan_time_utc.as_str(),
             "site": self.manifest.site.clone()
         })
+    }
+
+    fn value_label(&self, value: f32) -> Option<String> {
+        self.manifest
+            .value_meanings
+            .iter()
+            .find(|meaning| (value - meaning.value).abs() <= 0.001)
+            .map(|meaning| meaning.label.clone())
     }
 
     fn nearest_radial_row(&self, azimuth_deg: f32) -> Option<usize> {
@@ -8916,6 +8943,7 @@ const RADAR_HTML: &str = r####"<!doctype html>
       els.samplePanel.innerHTML = `
         <div class="sample-value"><strong>${esc(valueText)}</strong><span>${esc(unitText)}</span></div>
         <div class="kv">
+          ${sample.value_label ? row("Class", sample.value_label) : ""}
           ${row("Product", `${sample.product || "--"} / ${sample.product_name || "--"}`)}
           ${row("Scan", fmtTime(sample.scan_time_utc))}
           ${row("Sweep", `${sample.sweep_index ?? "--"} / ${fmt(sample.elevation_deg, 2)} deg`)}
@@ -19462,6 +19490,111 @@ mod tests {
         );
         assert_eq!(refreshed_sample["filtered"].as_bool(), Some(true));
         assert_eq!(lane.cached_sidecar_count(), 1);
+
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn radar_sample_labels_categorical_sidecar_values() {
+        let root = temp_test_root("radar_categorical_sidecar_sample");
+        let layer_id = "nexrad_level2_ktlx_hca";
+        let frame_id = "20260511T010000Z";
+        let tilt_id = "sweep00_el0p00";
+        let sidecar_dir = root
+            .join(layer_id)
+            .join("frames")
+            .join(frame_id)
+            .join(tilt_id);
+        fs::create_dir_all(&sidecar_dir).expect("create sidecar dir");
+        fs::write(
+            sidecar_dir.join(RADAR_POLAR_SIDECAR_MANIFEST_FILE),
+            serde_json::to_vec_pretty(&json!({
+                "schema": RADAR_POLAR_SIDECAR_SCHEMA,
+                "sidecar_version": 2,
+                "ok": true,
+                "name": "ktlx_hca_sweep00_el0p00",
+                "site": {
+                    "id": "KTLX",
+                    "name": "Oklahoma City",
+                    "state": "OK",
+                    "lat": 35.0,
+                    "lon": -97.0,
+                    "elevation_m": 370.0
+                },
+                "product": "hhc",
+                "product_name": "Hydrometeor Class (HHC)",
+                "units": "category",
+                "value_meanings": [
+                    {"value": 7.0, "name": "heavy_rain", "label": "Heavy Rain", "description": "high-reflectivity rain"}
+                ],
+                "product_provenance": {
+                    "source": "derived",
+                    "derived": true,
+                    "inputs": ["ref", "zdr", "cc", "phi"],
+                    "method": "dual_pol_rule_hca_v1"
+                },
+                "source_key_or_url": "s3://noaa-nexrad-level2/2026/05/11/KTLX/KTLX20260511_010000_V06",
+                "scan_time_utc": "2026-05-11T01:00:00Z",
+                "sweep_index": 0,
+                "elevation_deg": 0.0,
+                "nyquist_velocity_ms": null,
+                "processing_state": "derived",
+                "radial_count": 1,
+                "max_gate_count": 1,
+                "gate_count": 1,
+                "values_path": RADAR_POLAR_VALUES_FILE,
+                "values_encoding": "f32_le_row_major_radial_gate_nan_missing",
+                "gate_flags_path": RADAR_POLAR_GATE_FLAGS_FILE,
+                "gate_flags_encoding": "u8_bitmask_row_major_radial_gate",
+                "gate_flag_meanings": [
+                    {"bit": 0, "mask": RADAR_GATE_FLAG_VALID, "name": "valid", "description": "finite value"},
+                    {"bit": 1, "mask": RADAR_GATE_FLAG_MISSING, "name": "missing", "description": "missing value"},
+                    {"bit": 2, "mask": RADAR_GATE_FLAG_RANGE_FOLDED, "name": "range_folded", "description": "range folded"},
+                    {"bit": 3, "mask": RADAR_GATE_FLAG_FILTERED, "name": "filtered", "description": "filtered by QC"},
+                    {"bit": 4, "mask": RADAR_GATE_FLAG_DERIVED, "name": "derived", "description": "derived product"},
+                    {"bit": 5, "mask": RADAR_GATE_FLAG_DEALIASED, "name": "dealiased", "description": "dealiased velocity"}
+                ],
+                "radials": [{
+                    "radial_index": 0,
+                    "azimuth_deg": 0.0,
+                    "elevation_deg": 0.0,
+                    "azimuth_spacing_deg": 1.0,
+                    "gate_count": 1,
+                    "first_gate_range_m": 0,
+                    "gate_spacing_m": 250,
+                    "nyquist_velocity_ms": null,
+                    "data_word_size_bits": null,
+                    "scale": null,
+                    "offset": null
+                }],
+                "qc": {}
+            }))
+            .unwrap(),
+        )
+        .expect("write sidecar manifest");
+        write_test_f32_le(&sidecar_dir.join(RADAR_POLAR_VALUES_FILE), &[7.0]);
+        fs::write(
+            sidecar_dir.join(RADAR_POLAR_GATE_FLAGS_FILE),
+            vec![RADAR_GATE_FLAG_VALID | RADAR_GATE_FLAG_DERIVED],
+        )
+        .expect("write flags");
+
+        let lane = RadarTileLane::open(&root).expect("open radar lane");
+        let query = RadarSampleQuery {
+            layer: layer_id.to_string(),
+            frame: frame_id.to_string(),
+            product: Some("hhc".to_string()),
+            tilt: Some(tilt_id.to_string()),
+            lat: 35.0,
+            lon: -97.0,
+            method: Some("interpolated".to_string()),
+        };
+        let sample = lane.sample_json(&query).expect("sample sidecar");
+
+        assert_eq!(sample["value"].as_f64(), Some(7.0));
+        assert_eq!(sample["value_label"].as_str(), Some("Heavy Rain"));
+        assert_eq!(sample["method"].as_str(), Some("nearest"));
+        assert_eq!(sample["derived"].as_bool(), Some(true));
 
         fs::remove_dir_all(root).ok();
     }
