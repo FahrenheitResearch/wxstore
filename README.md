@@ -15,6 +15,7 @@ C:\Users\drew\wxstore\target\release\wxstore.exe serve `
   --profile-store C:\Users\drew\orwx-wx-profile-nvme\hrrr_20260429_06z_f000_f048_core_chunk8 `
   --diagnostic-store C:\Users\drew\rustwx\proof\aether_temporal_profile_mvp\diagnostic_conus_20260429_06z_f000_f048 `
   --spatial-root C:\Users\drew\open-rust-wx\data\spatial `
+  --mesoanalysis-innovation-index-root C:\Users\drew\rustwx\target\surface_mesoanalysis_calibration\innovation_wxstore_index_smoke `
   --host 127.0.0.1 `
   --port 8897
 ```
@@ -33,11 +34,53 @@ C:\Users\drew\wxstore\target\release\wxstore.exe serve `
 - `GET /v1/mapbox/tiles/hrrr/20260405_18z/vpd_2m/f000/{z}/{x}/{y}?palette=magma&range=0,5`
 - `GET /v1/mapbox/tiles/hrrr/hrrr_20260429_060000/500mb_temperature/f000/{z}/{x}/{y}?palette=temperature&range=-40,20`
 - `GET /v1/latest/{model}/{domain}`
+- `GET /v1/objects?kind=surface_observation&q=WISCONET:HNCK`
+- `GET /v1/objects?kind=surface_observation&q=AZMET:AZ01`
+- `GET /v1/objects?kind=surface_observation&bbox=-103,33,-94,37`
+- `GET /v1/objects?kind=surface_observation&lat=35.18&lon=-97.44&radius_km=50`
+- `GET /v1/objects?kind=coastal_meteorology_observation&category=ocean&network=CO-OPS_MET&parameter=wind&max_age_minutes=90`
+- `GET /v1/objects?kind=marine_observation&category=ocean&network=NDBC&parameter=wave_height`
+- `GET /v1/objects?kind=air_quality_observation&category=air_quality&network=AIRNOW&parameter=pm25`
+- `GET /v1/objects?category=ocean&quality_tier=1&parameter=wind`
+- `GET /v1/objects?kind=surface_observation&quality_tier=2&parameter=wind`
+- `GET /v1/objects?kind=flash_flood_observation&quality_tier=3&parameter=precipitation`
+- `GET /v1/objects?kind=marine_observation&q=NDBC:46029`
+- `GET /v1/objects?kind=hydro_observation&q=07148400`
+- `GET /v1/objects?kind=hydro_observation&source=noaa_ahps_river_gauges&q=AHPS:DCBN8`
+- `GET /v1/objects?kind=hydro_forecast_observation&source=noaa_nwps_river_forecasts&q=NWPS:ABBG1`
+- `GET /v1/objects?kind=flash_flood_observation&source=maricopa_fcd_alert&q=Humboldt`
+- `GET /v1/objects?kind=coastal_water_observation&q=9414290`
+- `GET /v1/objects?kind=coastal_meteorology_observation&source=noaa_coops_meteorology&q=Nawiliwili`
+- `GET /v1/objects?kind=air_quality_observation&q=AIRNOW:010270001`
+- `GET /v1/observations/sources`
+- `GET /v1/mesoanalysis/innovation/status`
+- `GET /v1/mesoanalysis/innovation/query?station=KP69&variable=temperature_c`
+- `GET /v1/mesoanalysis/innovation/query?kind=source&source=aviation_weather_metar_conus&variable=wind_speed_ms`
+- `GET /v1/mesoanalysis/innovation/watchlist?kind=station&top=20`
 - `GET /v1/resolve?lat=35.22&lon=-97.44`
 - `GET /v1/temporal-sounding?lat=35.22&lon=-97.44&hours=0-48&diagnostics=basic`
 - `GET /v1/point.bin?lat=35.22&lon=-97.44&hours=0-48&diagnostics=basic`
 - `GET /v1/runs/{model}/{domain}/{run}/grid/{x}/{y}/temporal-sounding?hours=0-48`
 - `GET /v1/runs/{model}/{domain}/{run}/grid/{x}/{y}/temporal-sounding.bin?hours=0-48`
+
+Direct-observation station and source objects returned by `/v1/objects` include
+a `parameters` array such as `wind`, `wave_height`, `pm25`,
+`water_temperature`, or `streamflow`, using the same strict taxonomy as the
+`parameter=` filter. Source objects also include `station_count` so agents can
+discover capable lanes before paging through station objects.
+They also include `quality_tier`: 1 primary official/national operational,
+2 established mesonet/agency, 3 local/utility/infrastructure specialty,
+4 derived/daily secondary, 5 unknown.
+Direct-observation weather objects are materialized through an in-process cache
+keyed by the runner observation index and per-source latest artifact
+fingerprints, so repeated object queries avoid reparsing all station files while
+still refreshing when runner publishes new observation artifacts.
+
+The mesoanalysis innovation lane serves the RustWX OI/kriging calibration index
+as machine-readable WxStore JSON. It is intentionally model-agnostic: HRRR, RAP,
+RRFS, GFS, and other model backgrounds remain providers, while the lane exposes
+station/source innovation history, ranked watchlists, and source reliability
+signals for agent packet builders.
 
 ## Loaded Model Runs
 

@@ -51,6 +51,8 @@ const STATIC_PLOT_MANIFEST_CACHE_TTL_DEFAULT_SECS: u64 = 5;
 const STATIC_PLOT_DEFAULT_MANIFEST_LIMIT: usize = 500;
 const STATIC_PLOT_MAX_MANIFEST_LIMIT: usize = 20_000;
 const STATIC_PLOT_EXPORT_MAX_FRAMES: usize = 1000;
+const MESO_INNOVATION_DEFAULT_TOP: usize = 50;
+const MESO_INNOVATION_MAX_TOP: usize = 500;
 const RADAR_POLAR_SIDECAR_SCHEMA: &str = "rustwx.radar.polar_sidecar.v2";
 const RADAR_POLAR_SIDECAR_MANIFEST_FILE: &str = "polar_sidecar_manifest.json";
 const RADAR_POLAR_VALUES_FILE: &str = "polar_values_f32le.bin";
@@ -154,6 +156,12 @@ struct ServeArgs {
     #[arg(long)]
     static_plots_root: Option<PathBuf>,
     #[arg(long)]
+    evidence_root: Option<PathBuf>,
+    #[arg(long)]
+    observations_root: Option<PathBuf>,
+    #[arg(long)]
+    mesoanalysis_innovation_index_root: Option<PathBuf>,
+    #[arg(long)]
     satellite_tiles_root: Option<PathBuf>,
     #[arg(long)]
     radar_tiles_root: Option<PathBuf>,
@@ -180,6 +188,17 @@ fn infer_ops_root(args: &ServeArgs) -> PathBuf {
                 .as_ref()
                 .and_then(|path| path.parent())
         })
+        .or_else(|| {
+            args.observations_root
+                .as_ref()
+                .and_then(|path| path.parent())
+        })
+        .or_else(|| {
+            args.mesoanalysis_innovation_index_root
+                .as_ref()
+                .and_then(|path| path.parent())
+        })
+        .or_else(|| args.evidence_root.as_ref().and_then(|path| path.parent()))
         .or_else(|| args.profile_store.as_ref().and_then(|path| path.parent()))
         .map(Path::to_path_buf)
         .unwrap_or_else(|| PathBuf::from("."))
@@ -188,13 +207,19 @@ fn infer_ops_root(args: &ServeArgs) -> PathBuf {
 #[derive(Parser, Clone)]
 struct InspectArgs {
     #[arg(long)]
-    profile_store: PathBuf,
+    profile_store: Option<PathBuf>,
     #[arg(long)]
     diagnostic_store: Option<PathBuf>,
     #[arg(long)]
     spatial_root: Option<PathBuf>,
     #[arg(long)]
     static_plots_root: Option<PathBuf>,
+    #[arg(long)]
+    evidence_root: Option<PathBuf>,
+    #[arg(long)]
+    observations_root: Option<PathBuf>,
+    #[arg(long)]
+    mesoanalysis_innovation_index_root: Option<PathBuf>,
 }
 
 #[derive(Parser, Clone)]
@@ -267,7 +292,12 @@ async fn main() -> Result<()> {
     match Cli::parse().command {
         Command::Serve(args) => serve(args).await,
         Command::Inspect(args) => {
-            let profile = Arc::new(ProfileLane::open(&args.profile_store)?);
+            let profile = args
+                .profile_store
+                .as_ref()
+                .map(|path| ProfileLane::open(path))
+                .transpose()?
+                .map(Arc::new);
             let diagnostic = args
                 .diagnostic_store
                 .as_ref()
@@ -283,13 +313,31 @@ async fn main() -> Result<()> {
                 .as_ref()
                 .map(|path| StaticPlotLane::open(path))
                 .transpose()?;
+            let evidence = args
+                .evidence_root
+                .as_ref()
+                .map(|path| EvidenceBundleLane::open(path))
+                .transpose()?;
+            let observations = args
+                .observations_root
+                .as_ref()
+                .map(|path| ObservationLane::open(path))
+                .transpose()?;
+            let mesoanalysis_innovation = args
+                .mesoanalysis_innovation_index_root
+                .as_ref()
+                .map(|path| MesoanalysisInnovationLane::open(path))
+                .transpose()?;
             println!(
                 "{}",
                 serde_json::to_string_pretty(&store_status(
-                    Some(profile.as_ref()),
+                    profile.as_deref(),
                     diagnostic.as_ref(),
                     spatial.as_ref(),
                     static_plots.as_ref(),
+                    evidence.as_ref(),
+                    observations.as_ref(),
+                    mesoanalysis_innovation.as_ref(),
                     None,
                     None,
                     None,
@@ -353,6 +401,24 @@ async fn serve(args: ServeArgs) -> Result<()> {
             .map(|path| StaticPlotLane::open(path))
             .transpose()
             .map(|lane| lane.map(Arc::new))?,
+        evidence: args
+            .evidence_root
+            .as_ref()
+            .map(|path| EvidenceBundleLane::open(path))
+            .transpose()
+            .map(|lane| lane.map(Arc::new))?,
+        observations: args
+            .observations_root
+            .as_ref()
+            .map(|path| ObservationLane::open(path))
+            .transpose()
+            .map(|lane| lane.map(Arc::new))?,
+        mesoanalysis_innovation: args
+            .mesoanalysis_innovation_index_root
+            .as_ref()
+            .map(|path| MesoanalysisInnovationLane::open(path))
+            .transpose()
+            .map(|lane| lane.map(Arc::new))?,
         satellite_tiles: args
             .satellite_tiles_root
             .as_ref()
@@ -391,10 +457,30 @@ async fn serve(args: ServeArgs) -> Result<()> {
         .route("/v1/status", get(status))
         .route("/api/status", get(status))
         .route("/v1/models", get(models))
+        .route("/v1/objects", get(weather_objects))
         .route("/v1/variables", get(variables))
         .route("/v1/products", get(products))
         .route("/v1/static-plots", get(static_plots))
         .route("/v1/static-plots/export-mp4", post(static_plots_export_mp4))
+        .route("/v1/evidence/bundles", get(evidence_bundles))
+        .route("/v1/evidence/bundles/{bundle_id}", get(evidence_bundle))
+        .route("/v1/observations/sources", get(observation_sources))
+        .route(
+            "/v1/observations/sources/{source_id}",
+            get(observation_source),
+        )
+        .route(
+            "/v1/mesoanalysis/innovation/status",
+            get(mesoanalysis_innovation_status),
+        )
+        .route(
+            "/v1/mesoanalysis/innovation/query",
+            get(mesoanalysis_innovation_query),
+        )
+        .route(
+            "/v1/mesoanalysis/innovation/watchlist",
+            get(mesoanalysis_innovation_watchlist),
+        )
         .route("/v1/satellite/layers", get(satellite_layers))
         .route(
             "/v1/satellite/layers/{layer_id}/frames.json",
@@ -1348,6 +1434,9 @@ struct AppState {
     diagnostic: Option<Arc<DiagnosticLane>>,
     spatial: Option<Arc<SpatialLane>>,
     static_plots: Option<Arc<StaticPlotLane>>,
+    evidence: Option<Arc<EvidenceBundleLane>>,
+    observations: Option<Arc<ObservationLane>>,
+    mesoanalysis_innovation: Option<Arc<MesoanalysisInnovationLane>>,
     satellite_tiles: Option<Arc<SatelliteTileLane>>,
     radar_tiles: Option<Arc<RadarTileLane>>,
     plot_lab: Arc<PlotLabLane>,
@@ -1397,6 +1486,31 @@ struct CacheStats {
 struct StaticPlotLane {
     root: PathBuf,
     manifest_cache: RwLock<StaticPlotManifestCache>,
+}
+
+struct EvidenceBundleLane {
+    root: PathBuf,
+}
+
+struct ObservationLane {
+    root: PathBuf,
+    object_cache: RwLock<ObservationObjectCache>,
+}
+
+#[derive(Default)]
+struct ObservationObjectCache {
+    fingerprint: String,
+    objects: Vec<Value>,
+    errors: Vec<Value>,
+}
+
+struct ObservationObjectSnapshot {
+    objects: Vec<Value>,
+    errors: Vec<Value>,
+}
+
+struct MesoanalysisInnovationLane {
+    root: PathBuf,
 }
 
 struct SatelliteTileLane {
@@ -2954,6 +3068,50 @@ struct StaticPlotCatalogQuery {
 }
 
 #[derive(Debug, Clone, Deserialize, Default)]
+struct WeatherObjectQuery {
+    kind: Option<String>,
+    lane: Option<String>,
+    category: Option<String>,
+    model: Option<String>,
+    run: Option<String>,
+    product: Option<String>,
+    member: Option<String>,
+    forecast_hour: Option<u32>,
+    valid_time: Option<String>,
+    frame: Option<String>,
+    tilt: Option<String>,
+    threshold: Option<String>,
+    #[serde(alias = "ensemble_statistic")]
+    ensemble_stat: Option<String>,
+    source: Option<String>,
+    source_kind: Option<String>,
+    network: Option<String>,
+    parameter: Option<String>,
+    quality_tier: Option<u8>,
+    max_age_minutes: Option<f64>,
+    q: Option<String>,
+    bbox: Option<String>,
+    lat: Option<f64>,
+    lon: Option<f64>,
+    radius_km: Option<f64>,
+    limit: Option<usize>,
+    offset: Option<usize>,
+}
+
+#[derive(Debug, Clone, Deserialize, Default)]
+struct MesoanalysisInnovationQuery {
+    kind: Option<String>,
+    station: Option<String>,
+    station_key: Option<String>,
+    station_id: Option<String>,
+    source: Option<String>,
+    variable: Option<String>,
+    min_case_count: Option<u64>,
+    q: Option<String>,
+    top: Option<usize>,
+}
+
+#[derive(Debug, Clone, Deserialize, Default)]
 struct StaticPlotArtifactQuery {
     path: Option<String>,
     v: Option<String>,
@@ -2991,6 +3149,700 @@ struct StaticPlotMp4Export {
     forecast_hours: Vec<u16>,
     rebuilt: bool,
     version: Option<String>,
+}
+
+impl EvidenceBundleLane {
+    fn open(root: &Path) -> Result<Self> {
+        if !root.is_dir() {
+            bail!("evidence root does not exist: {}", root.display());
+        }
+        Ok(Self {
+            root: root.to_path_buf(),
+        })
+    }
+
+    fn bundle_dir(&self) -> PathBuf {
+        self.root.join("bundles")
+    }
+
+    fn lane_manifest_json(&self) -> Value {
+        let summary = self.summary_json();
+        json!({
+            "schema": "wxstore.lane.v1",
+            "id": "evidence_bundles",
+            "status": summary.get("status").cloned().unwrap_or_else(|| json!("unavailable")),
+            "role": "meteorologist_evidence_bundle_lane",
+            "root": self.root,
+            "bundle_count": summary.get("bundle_count").cloned().unwrap_or_else(|| json!(0)),
+        })
+    }
+
+    fn summary_json(&self) -> Value {
+        match self.bundle_records() {
+            Ok(records) => json!({
+                "schema": "wxstore.evidence.summary.v1",
+                "status": if records.is_empty() { "empty" } else { "ready" },
+                "root": self.root,
+                "bundle_root": self.bundle_dir(),
+                "bundle_count": records.len(),
+            }),
+            Err(err) => json!({
+                "schema": "wxstore.evidence.summary.v1",
+                "status": "error",
+                "root": self.root,
+                "error": err.to_string(),
+                "bundle_count": 0,
+            }),
+        }
+    }
+
+    fn bundles_json(&self) -> Result<Value> {
+        let records = self.bundle_records()?;
+        Ok(json!({
+            "schema": "wxstore.evidence.bundles.v1",
+            "status": if records.is_empty() { "empty" } else { "ready" },
+            "root": self.root,
+            "bundle_count": records.len(),
+            "bundles": records,
+        }))
+    }
+
+    fn bundle_json(&self, bundle_id: &str) -> Result<Value> {
+        validate_path_component("evidence bundle id", bundle_id)?;
+        let path = self.bundle_dir().join(format!("{bundle_id}.json"));
+        if !path.is_file() {
+            bail!("evidence bundle is missing: {}", path.display());
+        }
+        let mut value: Value = serde_json::from_slice(
+            &fs::read(&path).with_context(|| format!("read {}", path.display()))?,
+        )
+        .with_context(|| format!("parse {}", path.display()))?;
+        if let Some(object) = value.as_object_mut() {
+            object.insert("bundle_id".to_string(), json!(bundle_id));
+            object.insert("wxstore_path".to_string(), json!(display_path(&path)));
+        }
+        Ok(value)
+    }
+
+    fn bundle_records(&self) -> Result<Vec<Value>> {
+        let dir = self.bundle_dir();
+        if !dir.is_dir() {
+            return Ok(Vec::new());
+        }
+        let mut records = Vec::new();
+        for entry in fs::read_dir(&dir).with_context(|| format!("read {}", dir.display()))? {
+            let entry = entry.with_context(|| format!("read entry in {}", dir.display()))?;
+            let path = entry.path();
+            if !path.is_file() || path.extension().and_then(|ext| ext.to_str()) != Some("json") {
+                continue;
+            }
+            let Some(bundle_id) = path.file_stem().and_then(|value| value.to_str()) else {
+                continue;
+            };
+            if !safe_path_component(bundle_id) {
+                continue;
+            }
+            let value = fs::read(&path)
+                .ok()
+                .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok());
+            let artifact_count = value
+                .as_ref()
+                .and_then(|value| value.get("artifacts"))
+                .and_then(Value::as_array)
+                .map(Vec::len)
+                .unwrap_or(0);
+            records.push(json!({
+                "id": bundle_id,
+                "url": format!("/v1/evidence/bundles/{bundle_id}"),
+                "schema": value.as_ref().and_then(|value| value.get("schema")).and_then(Value::as_str),
+                "claim": value.as_ref().and_then(|value| value.get("claim")).and_then(Value::as_str),
+                "conclusion": value.as_ref().and_then(|value| value.get("conclusion")).and_then(Value::as_str),
+                "source": value.as_ref().and_then(|value| value.get("source")).and_then(Value::as_str),
+                "artifact_count": artifact_count,
+                "updated_at": value.as_ref().and_then(|value| value.get("updated_at")).and_then(Value::as_str),
+                "bytes": fs::metadata(&path).map(|meta| meta.len()).unwrap_or(0),
+            }));
+        }
+        records.sort_by(|a, b| {
+            a.get("id")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .cmp(b.get("id").and_then(Value::as_str).unwrap_or_default())
+        });
+        Ok(records)
+    }
+}
+
+impl ObservationLane {
+    fn open(root: &Path) -> Result<Self> {
+        if !root.is_dir() {
+            bail!("observations root does not exist: {}", root.display());
+        }
+        Ok(Self {
+            root: root.to_path_buf(),
+            object_cache: RwLock::new(ObservationObjectCache::default()),
+        })
+    }
+
+    fn index_path(&self) -> PathBuf {
+        self.root.join("index.json")
+    }
+
+    fn source_latest_path(&self, source_id: &str) -> PathBuf {
+        self.root
+            .join("sources")
+            .join(source_id)
+            .join("latest_observations.json")
+    }
+
+    fn index_json(&self) -> Result<Value> {
+        let path = self.index_path();
+        if !path.is_file() {
+            bail!("observation index is missing: {}", path.display());
+        }
+        serde_json::from_slice(
+            &fs::read(&path).with_context(|| format!("read {}", path.display()))?,
+        )
+        .with_context(|| format!("parse {}", path.display()))
+    }
+
+    fn source_records(&self) -> Result<Vec<Value>> {
+        let index = self.index_json()?;
+        Ok(index
+            .get("records")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default())
+    }
+
+    fn lane_manifest_json(&self) -> Value {
+        let summary = self.summary_json();
+        json!({
+            "schema": "wxstore.lane.v1",
+            "id": "direct_observations",
+            "status": summary.get("status").cloned().unwrap_or_else(|| json!("unavailable")),
+            "role": "direct_source_surface_observation_lane",
+            "root": self.root,
+            "source_count": summary.get("source_count").cloned().unwrap_or_else(|| json!(0)),
+            "observation_count": summary.get("observation_count").cloned().unwrap_or_else(|| json!(0)),
+        })
+    }
+
+    fn summary_json(&self) -> Value {
+        match self.source_records() {
+            Ok(records) => {
+                let observation_count = records
+                    .iter()
+                    .filter_map(|record| record.get("observation_count").and_then(Value::as_u64))
+                    .sum::<u64>();
+                let raw_record_count = records
+                    .iter()
+                    .filter_map(|record| record.get("raw_record_count").and_then(Value::as_u64))
+                    .sum::<u64>();
+                json!({
+                    "schema": "wxstore.observations.summary.v1",
+                    "status": if records.is_empty() { "empty" } else { "ready" },
+                    "root": self.root,
+                    "source_count": records.len(),
+                    "observation_count": observation_count,
+                    "raw_record_count": raw_record_count,
+                })
+            }
+            Err(err) => json!({
+                "schema": "wxstore.observations.summary.v1",
+                "status": "error",
+                "root": self.root,
+                "error": err.to_string(),
+                "source_count": 0,
+                "observation_count": 0,
+                "raw_record_count": 0,
+            }),
+        }
+    }
+
+    fn sources_json(&self) -> Result<Value> {
+        let records = self.source_records()?;
+        Ok(json!({
+            "schema": "wxstore.observations.sources.v1",
+            "status": if records.is_empty() { "empty" } else { "ready" },
+            "root": self.root,
+            "source_count": records.len(),
+            "observation_count": records.iter().filter_map(|record| record.get("observation_count").and_then(Value::as_u64)).sum::<u64>(),
+            "sources": records,
+        }))
+    }
+
+    fn source_json(&self, source_id: &str) -> Result<Value> {
+        validate_path_component("observation source id", source_id)?;
+        let path = self.source_latest_path(source_id);
+        if !path.is_file() {
+            bail!("observation source is missing: {}", path.display());
+        }
+        let mut value: Value = serde_json::from_slice(
+            &fs::read(&path).with_context(|| format!("read {}", path.display()))?,
+        )
+        .with_context(|| format!("parse {}", path.display()))?;
+        if let Some(object) = value.as_object_mut() {
+            object.insert("source_id".to_string(), json!(source_id));
+            object.insert("wxstore_path".to_string(), json!(display_path(&path)));
+        }
+        Ok(value)
+    }
+
+    fn weather_objects(&self) -> Result<ObservationObjectSnapshot> {
+        let records = self.source_records()?;
+        let fingerprint = self.weather_objects_fingerprint(&records);
+        if let Ok(cache) = self.object_cache.read() {
+            if cache.fingerprint == fingerprint {
+                return Ok(ObservationObjectSnapshot {
+                    objects: cache.objects.clone(),
+                    errors: cache.errors.clone(),
+                });
+            }
+        }
+
+        let mut objects = Vec::new();
+        let mut errors = Vec::new();
+        for record in records {
+            let source_id = record.get("id").and_then(Value::as_str).unwrap_or_default();
+            let source_kind = record
+                .get("kind")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            match self.source_json(source_id) {
+                Ok(source) => {
+                    let items = source.get("observations").and_then(Value::as_array);
+                    objects.push(direct_observation_source_object(
+                        source_id,
+                        source_kind,
+                        &record,
+                        items,
+                    ));
+                    if let Some(items) = items {
+                        for item in items {
+                            objects.push(direct_observation_station_object(
+                                source_id,
+                                source_kind,
+                                item,
+                            ));
+                        }
+                    }
+                }
+                Err(err) => {
+                    objects.push(direct_observation_source_object(
+                        source_id,
+                        source_kind,
+                        &record,
+                        None,
+                    ));
+                    errors.push(json!({
+                        "lane": "direct_observations",
+                        "source": source_id,
+                        "error": err.to_string()
+                    }));
+                }
+            }
+        }
+
+        if let Ok(mut cache) = self.object_cache.write() {
+            cache.fingerprint = fingerprint;
+            cache.objects = objects.clone();
+            cache.errors = errors.clone();
+        }
+        Ok(ObservationObjectSnapshot { objects, errors })
+    }
+
+    fn weather_objects_fingerprint(&self, records: &[Value]) -> String {
+        let mut parts = Vec::with_capacity(records.len() + 1);
+        parts.push(format!("index:{}", file_cache_token(&self.index_path())));
+        for record in records {
+            if let Some(source_id) = record.get("id").and_then(Value::as_str) {
+                parts.push(format!(
+                    "{source_id}:{}",
+                    file_cache_token(&self.source_latest_path(source_id))
+                ));
+            }
+        }
+        parts.join("|")
+    }
+}
+
+impl MesoanalysisInnovationLane {
+    fn open(root: &Path) -> Result<Self> {
+        if !root.is_dir() {
+            bail!(
+                "mesoanalysis innovation index root does not exist: {}",
+                root.display()
+            );
+        }
+        Ok(Self {
+            root: root.to_path_buf(),
+        })
+    }
+
+    fn manifest_path(&self) -> PathBuf {
+        self.root.join("manifest.json")
+    }
+
+    fn station_index_path(&self) -> PathBuf {
+        self.root.join("station_index.jsonl")
+    }
+
+    fn source_index_path(&self) -> PathBuf {
+        self.root.join("source_index.jsonl")
+    }
+
+    fn station_watchlist_path(&self) -> PathBuf {
+        self.root.join("station_watchlist.json")
+    }
+
+    fn source_watchlist_path(&self) -> PathBuf {
+        self.root.join("source_watchlist.json")
+    }
+
+    fn manifest_json(&self) -> Result<Value> {
+        let path = self.manifest_path();
+        if !path.is_file() {
+            bail!(
+                "mesoanalysis innovation manifest is missing: {}",
+                path.display()
+            );
+        }
+        serde_json::from_slice(
+            &fs::read(&path).with_context(|| format!("read {}", path.display()))?,
+        )
+        .with_context(|| format!("parse {}", path.display()))
+    }
+
+    fn lane_manifest_json(&self) -> Value {
+        let summary = self.summary_json();
+        json!({
+            "schema": "wxstore.lane.v1",
+            "id": "mesoanalysis_innovation",
+            "status": summary.get("status").cloned().unwrap_or_else(|| json!("unavailable")),
+            "role": "surface_mesoanalysis_innovation_history_index",
+            "root": self.root,
+            "history_case_count": summary.get("history_case_count").cloned().unwrap_or_else(|| json!(0)),
+            "station_series_count": summary.get("station_series_count").cloned().unwrap_or_else(|| json!(0)),
+            "source_series_count": summary.get("source_series_count").cloned().unwrap_or_else(|| json!(0)),
+            "endpoints": {
+                "status": "/v1/mesoanalysis/innovation/status",
+                "query": "/v1/mesoanalysis/innovation/query",
+                "watchlist": "/v1/mesoanalysis/innovation/watchlist"
+            }
+        })
+    }
+
+    fn summary_json(&self) -> Value {
+        match self.manifest_json() {
+            Ok(manifest) => {
+                let station_index_present = self.station_index_path().is_file();
+                let source_index_present = self.source_index_path().is_file();
+                let station_watchlist_present = self.station_watchlist_path().is_file();
+                let source_watchlist_present = self.source_watchlist_path().is_file();
+                let history_case_count = manifest
+                    .get("history_case_count")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(0);
+                let station_series_count = manifest
+                    .get("station_series_count")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(0);
+                let source_series_count = manifest
+                    .get("source_series_count")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(0);
+                json!({
+                    "schema": "wxstore.surface_mesoanalysis.innovation_status.v1",
+                    "status": if station_index_present && source_index_present { "ready" } else { "incomplete" },
+                    "root": self.root,
+                    "manifest_path": display_path(&self.manifest_path()),
+                    "station_index_path": display_path(&self.station_index_path()),
+                    "source_index_path": display_path(&self.source_index_path()),
+                    "station_watchlist_path": display_path(&self.station_watchlist_path()),
+                    "source_watchlist_path": display_path(&self.source_watchlist_path()),
+                    "station_index_present": station_index_present,
+                    "source_index_present": source_index_present,
+                    "station_watchlist_present": station_watchlist_present,
+                    "source_watchlist_present": source_watchlist_present,
+                    "history_case_count": history_case_count,
+                    "station_series_count": station_series_count,
+                    "source_series_count": source_series_count,
+                    "manifest": manifest,
+                })
+            }
+            Err(err) => json!({
+                "schema": "wxstore.surface_mesoanalysis.innovation_status.v1",
+                "status": "error",
+                "root": self.root,
+                "error": err.to_string(),
+                "history_case_count": 0,
+                "station_series_count": 0,
+                "source_series_count": 0,
+            }),
+        }
+    }
+
+    fn query_json(&self, query: &MesoanalysisInnovationQuery) -> Result<Value> {
+        let manifest = self.manifest_json()?;
+        let top = mesoanalysis_innovation_top(query);
+        let mut station_records = if mesoanalysis_innovation_include_station(query) {
+            read_jsonl_values(&self.station_index_path())?
+                .into_iter()
+                .filter(|record| mesoanalysis_innovation_station_matches(record, query))
+                .collect::<Vec<_>>()
+        } else {
+            Vec::new()
+        };
+        let mut source_records = if mesoanalysis_innovation_include_source(query) {
+            read_jsonl_values(&self.source_index_path())?
+                .into_iter()
+                .filter(|record| mesoanalysis_innovation_source_matches(record, query))
+                .collect::<Vec<_>>()
+        } else {
+            Vec::new()
+        };
+        sort_mesoanalysis_innovation_records(&mut station_records);
+        sort_mesoanalysis_innovation_records(&mut source_records);
+        let station_match_count = station_records.len();
+        let source_match_count = source_records.len();
+        station_records.truncate(top);
+        source_records.truncate(top);
+        Ok(json!({
+            "schema": "wxstore.surface_mesoanalysis.innovation_query.v1",
+            "status": if station_match_count == 0 && source_match_count == 0 { "empty" } else { "ready" },
+            "root": self.root,
+            "generated_at": utc_now_string(),
+            "query": mesoanalysis_innovation_query_json(query, top),
+            "manifest": manifest,
+            "station_match_count": station_match_count,
+            "source_match_count": source_match_count,
+            "station_records": station_records,
+            "source_records": source_records,
+        }))
+    }
+
+    fn watchlist_json(&self, query: &MesoanalysisInnovationQuery) -> Result<Value> {
+        let manifest = self.manifest_json()?;
+        let top = mesoanalysis_innovation_top(query);
+        let mut station_items = if mesoanalysis_innovation_include_station(query) {
+            read_json_array_values(&self.station_watchlist_path())?
+                .into_iter()
+                .filter(|record| mesoanalysis_innovation_station_matches(record, query))
+                .collect::<Vec<_>>()
+        } else {
+            Vec::new()
+        };
+        let mut source_items = if mesoanalysis_innovation_include_source(query) {
+            read_json_array_values(&self.source_watchlist_path())?
+                .into_iter()
+                .filter(|record| mesoanalysis_innovation_source_matches(record, query))
+                .collect::<Vec<_>>()
+        } else {
+            Vec::new()
+        };
+        sort_mesoanalysis_innovation_records(&mut station_items);
+        sort_mesoanalysis_innovation_records(&mut source_items);
+        let station_match_count = station_items.len();
+        let source_match_count = source_items.len();
+        station_items.truncate(top);
+        source_items.truncate(top);
+        Ok(json!({
+            "schema": "wxstore.surface_mesoanalysis.innovation_watchlist.v1",
+            "status": if station_match_count == 0 && source_match_count == 0 { "empty" } else { "ready" },
+            "root": self.root,
+            "generated_at": utc_now_string(),
+            "query": mesoanalysis_innovation_query_json(query, top),
+            "manifest": manifest,
+            "station_match_count": station_match_count,
+            "source_match_count": source_match_count,
+            "station_items": station_items,
+            "source_items": source_items,
+        }))
+    }
+}
+
+fn read_jsonl_values(path: &Path) -> Result<Vec<Value>> {
+    if !path.is_file() {
+        bail!("JSONL index is missing: {}", path.display());
+    }
+    let text = fs::read_to_string(path).with_context(|| format!("read {}", path.display()))?;
+    let mut records = Vec::new();
+    for (line_index, line) in text.lines().enumerate() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        let value: Value = serde_json::from_str(line)
+            .with_context(|| format!("parse {} line {}", path.display(), line_index + 1))?;
+        records.push(value);
+    }
+    Ok(records)
+}
+
+fn read_json_array_values(path: &Path) -> Result<Vec<Value>> {
+    if !path.is_file() {
+        return Ok(Vec::new());
+    }
+    let value: Value = serde_json::from_slice(
+        &fs::read(path).with_context(|| format!("read {}", path.display()))?,
+    )
+    .with_context(|| format!("parse {}", path.display()))?;
+    value
+        .as_array()
+        .cloned()
+        .ok_or_else(|| anyhow!("{} must contain a JSON array", path.display()))
+}
+
+fn mesoanalysis_innovation_top(query: &MesoanalysisInnovationQuery) -> usize {
+    query
+        .top
+        .unwrap_or(MESO_INNOVATION_DEFAULT_TOP)
+        .min(MESO_INNOVATION_MAX_TOP)
+}
+
+fn mesoanalysis_innovation_include_station(query: &MesoanalysisInnovationQuery) -> bool {
+    let kind = query.kind.as_deref().unwrap_or("all").to_ascii_lowercase();
+    !matches!(kind.as_str(), "source" | "sources")
+}
+
+fn mesoanalysis_innovation_include_source(query: &MesoanalysisInnovationQuery) -> bool {
+    let kind = query.kind.as_deref().unwrap_or("all").to_ascii_lowercase();
+    !matches!(kind.as_str(), "station" | "stations")
+}
+
+fn mesoanalysis_innovation_query_json(query: &MesoanalysisInnovationQuery, top: usize) -> Value {
+    json!({
+        "kind": query.kind.as_deref(),
+        "station": query.station.as_deref(),
+        "station_key": query.station_key.as_deref(),
+        "station_id": query.station_id.as_deref(),
+        "source": query.source.as_deref(),
+        "variable": query.variable.as_deref(),
+        "min_case_count": query.min_case_count,
+        "q": query.q.as_deref(),
+        "top": top,
+        "max_top": MESO_INNOVATION_MAX_TOP,
+    })
+}
+
+fn mesoanalysis_innovation_station_matches(
+    record: &Value,
+    query: &MesoanalysisInnovationQuery,
+) -> bool {
+    if let Some(station) = query.station.as_deref() {
+        if !mesoanalysis_innovation_string_matches_any(
+            record,
+            &["station_key", "station_id"],
+            station,
+        ) {
+            return false;
+        }
+    }
+    if let Some(station_key) = query.station_key.as_deref() {
+        if !mesoanalysis_innovation_string_matches_any(record, &["station_key"], station_key) {
+            return false;
+        }
+    }
+    if let Some(station_id) = query.station_id.as_deref() {
+        if !mesoanalysis_innovation_string_matches_any(record, &["station_id"], station_id) {
+            return false;
+        }
+    }
+    mesoanalysis_innovation_common_matches(record, query)
+}
+
+fn mesoanalysis_innovation_source_matches(
+    record: &Value,
+    query: &MesoanalysisInnovationQuery,
+) -> bool {
+    if query.station.is_some() || query.station_key.is_some() || query.station_id.is_some() {
+        return false;
+    }
+    mesoanalysis_innovation_common_matches(record, query)
+}
+
+fn mesoanalysis_innovation_common_matches(
+    record: &Value,
+    query: &MesoanalysisInnovationQuery,
+) -> bool {
+    if let Some(source) = query.source.as_deref() {
+        if !mesoanalysis_innovation_string_matches_any(record, &["source"], source) {
+            return false;
+        }
+    }
+    if let Some(variable) = query.variable.as_deref() {
+        if !mesoanalysis_innovation_string_matches_any(record, &["variable"], variable) {
+            return false;
+        }
+    }
+    if let Some(min_case_count) = query.min_case_count {
+        if mesoanalysis_innovation_record_number(record, &["case_count"]).unwrap_or(0.0)
+            < min_case_count as f64
+        {
+            return false;
+        }
+    }
+    if let Some(q) = query.q.as_deref() {
+        let q = q.trim();
+        if !q.is_empty()
+            && !serde_json::to_string(record)
+                .unwrap_or_default()
+                .to_ascii_lowercase()
+                .contains(&q.to_ascii_lowercase())
+        {
+            return false;
+        }
+    }
+    true
+}
+
+fn mesoanalysis_innovation_string_matches_any(record: &Value, keys: &[&str], needle: &str) -> bool {
+    let needle = needle.trim();
+    keys.iter().any(|key| {
+        record
+            .get(*key)
+            .and_then(Value::as_str)
+            .is_some_and(|value| value.eq_ignore_ascii_case(needle))
+    })
+}
+
+fn sort_mesoanalysis_innovation_records(records: &mut [Value]) {
+    records.sort_by(|a, b| {
+        let rank = mesoanalysis_innovation_rank(b)
+            .partial_cmp(&mesoanalysis_innovation_rank(a))
+            .unwrap_or(Ordering::Equal);
+        if rank == Ordering::Equal {
+            mesoanalysis_innovation_label(a).cmp(&mesoanalysis_innovation_label(b))
+        } else {
+            rank
+        }
+    });
+}
+
+fn mesoanalysis_innovation_rank(record: &Value) -> f64 {
+    mesoanalysis_innovation_record_number(record, &["watchlist", "severity_score"])
+        .or_else(|| mesoanalysis_innovation_record_number(record, &["severity_score"]))
+        .or_else(|| mesoanalysis_innovation_record_number(record, &["mean_abs_analysis_error"]))
+        .or_else(|| mesoanalysis_innovation_record_number(record, &["mean_candidate_mae"]))
+        .or_else(|| mesoanalysis_innovation_record_number(record, &["case_count"]))
+        .unwrap_or(0.0)
+}
+
+fn mesoanalysis_innovation_label(record: &Value) -> String {
+    ["station_key", "station_id", "source", "variable", "reason"]
+        .iter()
+        .filter_map(|key| record.get(*key).and_then(Value::as_str))
+        .collect::<Vec<_>>()
+        .join(":")
+}
+
+fn mesoanalysis_innovation_record_number(record: &Value, path: &[&str]) -> Option<f64> {
+    let mut current = record;
+    for key in path {
+        current = current.get(*key)?;
+    }
+    current.as_f64()
 }
 
 impl SatelliteTileLane {
@@ -11316,6 +12168,9 @@ async fn readyz(State(state): State<Arc<AppState>>) -> (StatusCode, Json<Value>)
         state.diagnostic.as_deref(),
         state.spatial.as_deref(),
         state.static_plots.as_deref(),
+        state.evidence.as_deref(),
+        state.observations.as_deref(),
+        state.mesoanalysis_innovation.as_deref(),
         state.satellite_tiles.as_deref(),
         state.radar_tiles.as_deref(),
     );
@@ -11336,6 +12191,9 @@ async fn status(State(state): State<Arc<AppState>>) -> Json<Value> {
         state.diagnostic.as_deref(),
         state.spatial.as_deref(),
         state.static_plots.as_deref(),
+        state.evidence.as_deref(),
+        state.observations.as_deref(),
+        state.mesoanalysis_innovation.as_deref(),
         state.satellite_tiles.as_deref(),
         state.radar_tiles.as_deref(),
         Some(state.cache_stats()),
@@ -11467,6 +12325,14 @@ async fn models(State(state): State<Arc<AppState>>) -> Json<Value> {
         .static_plots
         .as_deref()
         .map(StaticPlotLane::overview_json);
+    let evidence = state
+        .evidence
+        .as_deref()
+        .map(EvidenceBundleLane::summary_json);
+    let observations = state
+        .observations
+        .as_deref()
+        .map(ObservationLane::summary_json);
     let profile_loaded = state
         .profile
         .as_deref()
@@ -11484,12 +12350,32 @@ async fn models(State(state): State<Arc<AppState>>) -> Json<Value> {
         "profile_loaded": profile_loaded,
         "spatial_loaded": spatial.unwrap_or_else(|| json!({"status": "unavailable"})),
         "static_plots_loaded": static_plots.unwrap_or_else(|| json!({"status": "unavailable"})),
+        "evidence_bundles_loaded": evidence.unwrap_or_else(|| json!({"status": "unavailable"})),
+        "direct_observations_loaded": observations.unwrap_or_else(|| json!({"status": "unavailable"})),
         "science_engine_scope": {
             "current_profile_lane": ["hrrr"],
             "current_spatial_surface_lanes": state.spatial.as_deref().map(SpatialLane::model_ids).unwrap_or_default(),
             "designed_for": ["hrrr", "gfs", "nam", "rap", "rrfs", "ecmwf_ifs", "ecmwf_ens", "ai_model_outputs"]
         }
     }))
+}
+
+async fn weather_objects(
+    State(state): State<Arc<AppState>>,
+    Query(query): Query<WeatherObjectQuery>,
+) -> Result<impl IntoResponse, ApiError> {
+    Ok((
+        no_store_headers(),
+        Json(weather_objects_index(
+            &query,
+            state.spatial.as_deref(),
+            state.static_plots.as_deref(),
+            state.evidence.as_deref(),
+            state.observations.as_deref(),
+            state.satellite_tiles.as_deref(),
+            state.radar_tiles.as_deref(),
+        )),
+    ))
 }
 
 async fn static_plots(
@@ -11500,6 +12386,99 @@ async fn static_plots(
         return Err(not_found("static plots root is not configured"));
     };
     Ok((no_store_headers(), Json(static_plots.catalog_json(&query))))
+}
+
+async fn evidence_bundles(
+    State(state): State<Arc<AppState>>,
+) -> Result<impl IntoResponse, ApiError> {
+    let Some(evidence) = state.evidence.as_deref() else {
+        return Err(not_found("evidence root is not configured"));
+    };
+    Ok((
+        no_store_headers(),
+        Json(evidence.bundles_json().map_err(bad_anyhow)?),
+    ))
+}
+
+async fn evidence_bundle(
+    State(state): State<Arc<AppState>>,
+    AxumPath(bundle_id): AxumPath<String>,
+) -> Result<impl IntoResponse, ApiError> {
+    let Some(evidence) = state.evidence.as_deref() else {
+        return Err(not_found("evidence root is not configured"));
+    };
+    match evidence.bundle_json(&bundle_id) {
+        Ok(bundle) => Ok((no_store_headers(), Json(bundle))),
+        Err(err) if err.to_string().contains("is missing") => Err(not_found(err.to_string())),
+        Err(err) => Err(bad_anyhow(err)),
+    }
+}
+
+async fn observation_sources(
+    State(state): State<Arc<AppState>>,
+) -> Result<impl IntoResponse, ApiError> {
+    let Some(observations) = state.observations.as_deref() else {
+        return Err(not_found("observations root is not configured"));
+    };
+    Ok((
+        no_store_headers(),
+        Json(observations.sources_json().map_err(bad_anyhow)?),
+    ))
+}
+
+async fn observation_source(
+    State(state): State<Arc<AppState>>,
+    AxumPath(source_id): AxumPath<String>,
+) -> Result<impl IntoResponse, ApiError> {
+    let Some(observations) = state.observations.as_deref() else {
+        return Err(not_found("observations root is not configured"));
+    };
+    match observations.source_json(&source_id) {
+        Ok(source) => Ok((no_store_headers(), Json(source))),
+        Err(err) if err.to_string().contains("is missing") => Err(not_found(err.to_string())),
+        Err(err) => Err(bad_anyhow(err)),
+    }
+}
+
+async fn mesoanalysis_innovation_status(
+    State(state): State<Arc<AppState>>,
+) -> Result<impl IntoResponse, ApiError> {
+    let Some(lane) = state.mesoanalysis_innovation.as_deref() else {
+        return Err(not_found(
+            "mesoanalysis innovation index root is not configured",
+        ));
+    };
+    Ok((no_store_headers(), Json(lane.summary_json())))
+}
+
+async fn mesoanalysis_innovation_query(
+    State(state): State<Arc<AppState>>,
+    Query(query): Query<MesoanalysisInnovationQuery>,
+) -> Result<impl IntoResponse, ApiError> {
+    let Some(lane) = state.mesoanalysis_innovation.as_deref() else {
+        return Err(not_found(
+            "mesoanalysis innovation index root is not configured",
+        ));
+    };
+    Ok((
+        no_store_headers(),
+        Json(lane.query_json(&query).map_err(bad_anyhow)?),
+    ))
+}
+
+async fn mesoanalysis_innovation_watchlist(
+    State(state): State<Arc<AppState>>,
+    Query(query): Query<MesoanalysisInnovationQuery>,
+) -> Result<impl IntoResponse, ApiError> {
+    let Some(lane) = state.mesoanalysis_innovation.as_deref() else {
+        return Err(not_found(
+            "mesoanalysis innovation index root is not configured",
+        ));
+    };
+    Ok((
+        no_store_headers(),
+        Json(lane.watchlist_json(&query).map_err(bad_anyhow)?),
+    ))
 }
 
 async fn satellite_layers(
@@ -13568,11 +14547,1206 @@ async fn binary_response_for_point(
     ))
 }
 
+const WEATHER_OBJECT_DEFAULT_LIMIT: usize = 500;
+const WEATHER_OBJECT_MAX_LIMIT: usize = 10_000;
+
+struct WeatherObjectAccumulator<'a> {
+    query: &'a WeatherObjectQuery,
+    offset: usize,
+    limit: usize,
+    matched_count: usize,
+    objects: Vec<Value>,
+}
+
+impl<'a> WeatherObjectAccumulator<'a> {
+    fn new(query: &'a WeatherObjectQuery) -> Self {
+        Self {
+            query,
+            offset: query.offset.unwrap_or(0),
+            limit: query
+                .limit
+                .unwrap_or(WEATHER_OBJECT_DEFAULT_LIMIT)
+                .min(WEATHER_OBJECT_MAX_LIMIT),
+            matched_count: 0,
+            objects: Vec::new(),
+        }
+    }
+
+    fn consider(&mut self, object: Value) {
+        if !weather_object_matches(&object, self.query) {
+            return;
+        }
+        self.matched_count += 1;
+        if self.matched_count <= self.offset || self.objects.len() >= self.limit {
+            return;
+        }
+        self.objects.push(object);
+    }
+}
+
+fn weather_objects_index(
+    query: &WeatherObjectQuery,
+    spatial: Option<&SpatialLane>,
+    static_plots: Option<&StaticPlotLane>,
+    evidence: Option<&EvidenceBundleLane>,
+    observations: Option<&ObservationLane>,
+    satellite_tiles: Option<&SatelliteTileLane>,
+    radar_tiles: Option<&RadarTileLane>,
+) -> Value {
+    let mut acc = WeatherObjectAccumulator::new(query);
+    let mut lanes = Vec::new();
+    let mut errors = Vec::new();
+
+    if let Some(evidence) = evidence {
+        lanes.push("evidence_bundles");
+        match evidence.bundle_records() {
+            Ok(records) => {
+                for record in records {
+                    let id = record.get("id").and_then(Value::as_str).unwrap_or_default();
+                    acc.consider(json!({
+                        "schema": "wxstore.weather_object.v1",
+                        "id": format!("evidence_bundle:{id}"),
+                        "kind": "evidence_bundle",
+                        "lane": "evidence_bundles",
+                        "source": record.get("source").cloned().unwrap_or_else(|| json!(null)),
+                        "label": record.get("claim").cloned().unwrap_or_else(|| json!(id)),
+                        "updated_at": record.get("updated_at").cloned().unwrap_or_else(|| json!(null)),
+                        "url": record.get("url").cloned().unwrap_or_else(|| json!(format!("/v1/evidence/bundles/{id}"))),
+                        "metadata": record,
+                    }));
+                }
+            }
+            Err(err) => errors.push(json!({"lane": "evidence_bundles", "error": err.to_string()})),
+        }
+    }
+
+    if let Some(observations) = observations {
+        lanes.push("direct_observations");
+        match observations.weather_objects() {
+            Ok(snapshot) => {
+                for object in snapshot.objects {
+                    acc.consider(object);
+                }
+                errors.extend(snapshot.errors);
+            }
+            Err(err) => {
+                errors.push(json!({"lane": "direct_observations", "error": err.to_string()}))
+            }
+        }
+    }
+
+    if let Some(static_plots) = static_plots {
+        lanes.push("static_plots");
+        match static_plots.manifests() {
+            Ok(records) => {
+                for record in records {
+                    let identity = static_plot_record_identity(&record);
+                    let plot_variant = static_plot_variant_key(&identity);
+                    let valid_time = static_plot_valid_time(&identity);
+                    let ensemble_statistic = identity.ensemble_stat.clone();
+                    for (artifact_index, artifact) in record.manifest.artifacts.iter().enumerate() {
+                        let path =
+                            resolve_static_artifact_path(&record.manifest, &artifact.relative_path);
+                        let relative_path = relative_path_string(&static_plots.root, &path);
+                        let encoded_path = url_encode_query_component(&relative_path);
+                        let threshold = static_plot_artifact_threshold(artifact);
+                        let url = format!(
+                            "/v1/static-plots/artifacts/{}/{}?path={}",
+                            record.id, artifact_index, encoded_path
+                        );
+                        acc.consider(json!({
+                            "schema": "wxstore.weather_object.v1",
+                            "id": format!("static_plot_artifact:{}:{artifact_index}", record.id),
+                            "kind": "static_plot_artifact",
+                            "lane": "static_plots",
+                            "model": identity.model,
+                            "run": record.manifest.run_label,
+                            "date": identity.date_yyyymmdd,
+                            "cycle_utc": identity.cycle_utc,
+                            "forecast_hour": identity.forecast_hour,
+                            "valid_time": valid_time,
+                            "source": identity.source,
+                            "domain": identity.domain_slug,
+                            "member": identity.member,
+                            "ensemble_kind": identity.ensemble_kind,
+                            "ensemble_stat": identity.ensemble_stat,
+                            "ensemble_statistic": ensemble_statistic,
+                            "projection_variant": plot_variant,
+                            "product": artifact.artifact_key,
+                            "threshold": threshold,
+                            "state": artifact.state,
+                            "label": artifact.artifact_key,
+                            "url": url,
+                            "path": relative_path,
+                            "exists": path.is_file(),
+                            "metadata": {
+                                "manifest_id": record.id,
+                                "manifest_path": relative_path_string(&static_plots.root, &record.path),
+                                "detail": artifact.detail,
+                                "content_identity": artifact.content_identity,
+                                "input_fetch_keys": artifact.input_fetch_keys,
+                            }
+                        }));
+                    }
+                }
+            }
+            Err(err) => errors.push(json!({"lane": "static_plots", "error": err.to_string()})),
+        }
+    }
+
+    if let Some(spatial) = spatial {
+        lanes.push("surface_spatial");
+        for model in spatial.model_ids() {
+            for run in spatial.runs_for_model(&model) {
+                let mut member_options = vec![None];
+                member_options.extend(spatial.members_for(&model, &run).into_iter().map(Some));
+                for member in member_options {
+                    let member_ref = member.as_deref();
+                    let variables = spatial
+                        .variables_for(&model, &run, member_ref)
+                        .unwrap_or_default();
+                    for variable in variables {
+                        let hours = spatial
+                            .available_hours_for(&model, &run, member_ref, &variable)
+                            .unwrap_or_default();
+                        let valid_times = valid_times_from_run_id(&run, &hours);
+                        let mut url = format!(
+                            "/v1/layers?model={}&run={}&variable={}",
+                            url_encode_query_component(&model),
+                            url_encode_query_component(&run),
+                            url_encode_query_component(&variable)
+                        );
+                        if let Some(member) = member_ref {
+                            url.push_str("&member=");
+                            url.push_str(&url_encode_query_component(member));
+                        }
+                        acc.consider(json!({
+                            "schema": "wxstore.weather_object.v1",
+                            "id": format!(
+                                "model_grid_field:{}:{}:{}:{}",
+                                model,
+                                run,
+                                member_ref.unwrap_or("deterministic"),
+                                variable
+                            ),
+                            "kind": "model_grid_field",
+                            "lane": "surface_spatial",
+                            "model": model,
+                            "run": run,
+                            "member": member_ref,
+                            "member_key": member_ref.unwrap_or("deterministic"),
+                            "product": variable,
+                            "forecast_hours": hours,
+                            "valid_times": valid_times,
+                            "url": url,
+                            "metadata": {
+                                "format": "wxa_or_zarr",
+                                "variables_url": format!(
+                                    "/v1/variables?model={}&run={}",
+                                    url_encode_query_component(&model),
+                                    url_encode_query_component(&run)
+                                ),
+                                "sample_url_template": "/v1/sample?model={model}&run={run}&variable={product}&forecast_hour={hour}&lat={lat}&lon={lon}"
+                            }
+                        }));
+                        for (hour, valid_time) in hours.iter().copied().zip(valid_times.iter()) {
+                            let mut field_url = format!(
+                                "/v1/grid?model={}&run={}&variable={}&forecast_hour={hour}",
+                                url_encode_query_component(&model),
+                                url_encode_query_component(&run),
+                                url_encode_query_component(&variable)
+                            );
+                            if let Some(member) = member_ref {
+                                field_url.push_str("&member=");
+                                field_url.push_str(&url_encode_query_component(member));
+                            }
+                            acc.consider(json!({
+                                "schema": "wxstore.weather_object.v1",
+                                "id": format!(
+                                    "model_grid_field:{}:{}:{}:{}:f{hour:03}",
+                                    model,
+                                    run,
+                                    member_ref.unwrap_or("deterministic"),
+                                    variable
+                                ),
+                                "kind": "model_grid_field",
+                                "lane": "surface_spatial",
+                                "model": model,
+                                "run": run,
+                                "member": member_ref,
+                                "member_key": member_ref.unwrap_or("deterministic"),
+                                "product": variable,
+                                "forecast_hour": hour,
+                                "valid_time": valid_time,
+                                "label": format!("{variable} f{hour:03}"),
+                                "url": field_url,
+                                "metadata": {
+                                    "format": "wxa_or_zarr",
+                                    "product_url": url,
+                                    "sample_url_template": "/v1/sample?model={model}&run={run}&variable={product}&forecast_hour={hour}&lat={lat}&lon={lon}"
+                                }
+                            }));
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    if let Some(satellite_tiles) = satellite_tiles {
+        lanes.push("satellite_tiles");
+        match satellite_tiles.layers_json() {
+            Ok(layers) => {
+                if let Some(items) = layers.get("layers").and_then(Value::as_array) {
+                    for item in items {
+                        let id = item.get("id").and_then(Value::as_str).unwrap_or_default();
+                        acc.consider(json!({
+                            "schema": "wxstore.weather_object.v1",
+                            "id": format!("satellite_layer:{id}"),
+                            "kind": "satellite_layer",
+                            "lane": "satellite_tiles",
+                            "source": item.get("latest").and_then(|latest| latest.get("source")).cloned().unwrap_or_else(|| json!(null)),
+                            "label": id,
+                            "url": item.get("frames_url").cloned().unwrap_or_else(|| json!(format!("/v1/satellite/layers/{id}/frames.json"))),
+                            "metadata": item,
+                        }));
+                        match satellite_tiles.frames_json(id) {
+                            Ok(frames) => {
+                                if let Some(frames) = frames.get("frames").and_then(Value::as_array)
+                                {
+                                    for frame in frames {
+                                        acc.consider(satellite_frame_weather_object(
+                                            id, item, frame,
+                                        ));
+                                    }
+                                }
+                            }
+                            Err(err) => errors.push(json!({
+                                "lane": "satellite_tiles",
+                                "layer": id,
+                                "error": err.to_string()
+                            })),
+                        }
+                    }
+                }
+            }
+            Err(err) => errors.push(json!({"lane": "satellite_tiles", "error": err.to_string()})),
+        }
+    }
+
+    if let Some(radar_tiles) = radar_tiles {
+        lanes.push("radar_tiles");
+        match radar_tiles.layers_json() {
+            Ok(layers) => {
+                if let Some(items) = layers.get("layers").and_then(Value::as_array) {
+                    for item in items {
+                        let id = item.get("id").and_then(Value::as_str).unwrap_or_default();
+                        let latest = item.get("latest");
+                        acc.consider(json!({
+                            "schema": "wxstore.weather_object.v1",
+                            "id": format!("radar_layer:{id}"),
+                            "kind": "radar_layer",
+                            "lane": "radar_tiles",
+                            "source": latest.and_then(|latest| latest.get("source_key_or_url")).cloned().unwrap_or_else(|| json!("nexrad_level2")),
+                            "label": id,
+                            "product": latest.and_then(|latest| latest.get("product")).cloned().unwrap_or_else(|| json!(null)),
+                            "valid_time": latest.and_then(|latest| latest.get("scan_time_utc")).cloned().unwrap_or_else(|| json!(null)),
+                            "url": item.get("frames_url").cloned().unwrap_or_else(|| json!(format!("/v1/radar/layers/{id}/frames.json"))),
+                            "metadata": item,
+                        }));
+                        match radar_tiles.frames_json(id) {
+                            Ok(frames) => {
+                                if let Some(frames) = frames.get("frames").and_then(Value::as_array)
+                                {
+                                    for frame in frames {
+                                        acc.consider(radar_frame_weather_object(id, item, frame));
+                                        if let Some(tilts) =
+                                            frame.get("tilts").and_then(Value::as_array)
+                                        {
+                                            for tilt in tilts {
+                                                acc.consider(radar_tilt_weather_object(
+                                                    id, item, frame, tilt,
+                                                ));
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                            Err(err) => errors.push(json!({
+                                "lane": "radar_tiles",
+                                "layer": id,
+                                "error": err.to_string()
+                            })),
+                        }
+                    }
+                }
+            }
+            Err(err) => errors.push(json!({"lane": "radar_tiles", "error": err.to_string()})),
+        }
+    }
+
+    json!({
+        "schema": "wxstore.weather_objects.v1",
+        "status": if errors.is_empty() { "ready" } else { "partial" },
+        "lanes": lanes,
+        "query": {
+            "kind": query.kind,
+            "lane": query.lane,
+            "category": query.category,
+            "model": query.model,
+            "run": query.run,
+            "product": query.product,
+            "member": query.member,
+            "forecast_hour": query.forecast_hour,
+            "valid_time": query.valid_time,
+            "frame": query.frame,
+            "tilt": query.tilt,
+            "threshold": query.threshold,
+            "ensemble_stat": query.ensemble_stat,
+            "ensemble_statistic": query.ensemble_stat,
+            "source": query.source,
+            "source_kind": query.source_kind,
+            "network": query.network,
+            "parameter": query.parameter,
+            "quality_tier": query.quality_tier,
+            "max_age_minutes": query.max_age_minutes,
+            "q": query.q,
+            "bbox": query.bbox,
+            "lat": query.lat,
+            "lon": query.lon,
+            "radius_km": query.radius_km,
+            "limit": acc.limit,
+            "offset": acc.offset,
+        },
+        "matched_object_count": acc.matched_count,
+        "returned_object_count": acc.objects.len(),
+        "objects": acc.objects,
+        "errors": errors,
+    })
+}
+
+fn static_plot_valid_time(identity: &StaticPlotIdentity) -> Option<String> {
+    let date = identity.date_yyyymmdd.as_deref()?;
+    let cycle_utc = identity.cycle_utc?;
+    let forecast_hour = identity.forecast_hour?;
+    let date = chrono::NaiveDate::parse_from_str(date, "%Y%m%d").ok()?;
+    let cycle = date.and_hms_opt(u32::from(cycle_utc), 0, 0)?;
+    let valid = cycle + chrono::Duration::hours(i64::from(forecast_hour));
+    Some(
+        chrono::DateTime::<chrono::Utc>::from_naive_utc_and_offset(valid, chrono::Utc)
+            .to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+    )
+}
+
+fn static_plot_artifact_threshold(artifact: &StaticPlotArtifact) -> Option<Value> {
+    artifact
+        .content_identity
+        .as_ref()
+        .and_then(weather_object_first_threshold_value)
+}
+
+fn satellite_frame_weather_object(layer_id: &str, layer: &Value, frame: &Value) -> Value {
+    let frame_id = frame.get("id").and_then(Value::as_str).unwrap_or_default();
+    let product =
+        weather_object_first_value(frame, &["product", "channel", "band"]).or_else(|| {
+            layer.get("latest").and_then(|latest| {
+                weather_object_first_value(latest, &["product", "channel", "band"])
+            })
+        });
+    let source = weather_object_first_value(frame, &["source", "source_key", "source_key_or_url"])
+        .or_else(|| {
+            layer.get("latest").and_then(|latest| {
+                weather_object_first_value(latest, &["source", "source_key", "source_key_or_url"])
+            })
+        });
+    let valid_time =
+        weather_object_first_value(frame, &["valid_time", "scan_time_utc", "timestamp", "time"]);
+    let url = weather_object_first_value(frame, &["tile_url_template", "url_template", "url"])
+        .or_else(|| layer.get("frames_url").cloned())
+        .unwrap_or_else(|| json!(format!("/v1/satellite/layers/{layer_id}/frames.json")));
+    json!({
+        "schema": "wxstore.weather_object.v1",
+        "id": format!("satellite_frame:{layer_id}:{frame_id}"),
+        "kind": "satellite_frame",
+        "lane": "satellite_tiles",
+        "source": source.unwrap_or_else(|| json!(null)),
+        "product": product.unwrap_or_else(|| json!(null)),
+        "frame": frame_id,
+        "valid_time": valid_time.unwrap_or_else(|| json!(null)),
+        "label": frame.get("label").cloned().unwrap_or_else(|| json!(frame_id)),
+        "url": url,
+        "metadata": {
+            "layer": layer,
+            "frame": frame,
+        },
+    })
+}
+
+fn radar_frame_weather_object(layer_id: &str, layer: &Value, frame: &Value) -> Value {
+    let frame_id = frame.get("id").and_then(Value::as_str).unwrap_or_default();
+    let product = weather_object_first_value(frame, &["product"]);
+    let source = weather_object_first_value(frame, &["source_key_or_url", "source", "source_key"])
+        .unwrap_or_else(|| json!("nexrad_level2"));
+    let valid_time =
+        weather_object_first_value(frame, &["valid_time", "scan_time_utc", "timestamp"]);
+    let url = weather_object_first_value(frame, &["tile_url_template", "url_template", "url"])
+        .or_else(|| layer.get("frames_url").cloned())
+        .unwrap_or_else(|| json!(format!("/v1/radar/layers/{layer_id}/frames.json")));
+    json!({
+        "schema": "wxstore.weather_object.v1",
+        "id": format!("radar_frame:{layer_id}:{frame_id}"),
+        "kind": "radar_frame",
+        "lane": "radar_tiles",
+        "source": source,
+        "product": product.unwrap_or_else(|| json!(null)),
+        "frame": frame_id,
+        "valid_time": valid_time.unwrap_or_else(|| json!(null)),
+        "label": frame.get("label").cloned().unwrap_or_else(|| json!(frame_id)),
+        "url": url,
+        "metadata": {
+            "layer": layer,
+            "frame": frame,
+        },
+    })
+}
+
+fn radar_tilt_weather_object(layer_id: &str, layer: &Value, frame: &Value, tilt: &Value) -> Value {
+    let frame_id = frame.get("id").and_then(Value::as_str).unwrap_or_default();
+    let tilt_id = tilt.get("id").and_then(Value::as_str).unwrap_or_default();
+    let product = weather_object_first_value(tilt, &["product"])
+        .or_else(|| weather_object_first_value(frame, &["product"]));
+    let source = weather_object_first_value(tilt, &["source_key_or_url", "source", "source_key"])
+        .or_else(|| {
+            weather_object_first_value(frame, &["source_key_or_url", "source", "source_key"])
+        })
+        .unwrap_or_else(|| json!("nexrad_level2"));
+    let valid_time =
+        weather_object_first_value(tilt, &["valid_time", "scan_time_utc", "timestamp"]).or_else(
+            || weather_object_first_value(frame, &["valid_time", "scan_time_utc", "timestamp"]),
+        );
+    let url = weather_object_first_value(
+        tilt,
+        &[
+            "tile_url_template",
+            "numeric_sidecar_url",
+            "url_template",
+            "url",
+        ],
+    )
+    .or_else(|| {
+        weather_object_first_value(
+            frame,
+            &[
+                "tile_url_template",
+                "numeric_sidecar_url",
+                "url_template",
+                "url",
+            ],
+        )
+    })
+    .or_else(|| layer.get("frames_url").cloned())
+    .unwrap_or_else(|| json!(format!("/v1/radar/layers/{layer_id}/frames.json")));
+    json!({
+        "schema": "wxstore.weather_object.v1",
+        "id": format!("radar_tilt:{layer_id}:{frame_id}:{tilt_id}"),
+        "kind": "radar_tilt",
+        "lane": "radar_tiles",
+        "source": source,
+        "product": product.unwrap_or_else(|| json!(null)),
+        "frame": frame_id,
+        "tilt": tilt_id,
+        "valid_time": valid_time.unwrap_or_else(|| json!(null)),
+        "label": tilt.get("label").cloned().unwrap_or_else(|| json!(format!("{frame_id} {tilt_id}"))),
+        "url": url,
+        "metadata": {
+            "layer": layer,
+            "frame": frame,
+            "tilt": tilt,
+        },
+    })
+}
+
+fn weather_object_first_value(object: &Value, keys: &[&str]) -> Option<Value> {
+    keys.iter()
+        .filter_map(|key| object.get(*key))
+        .find(|value| !value.is_null())
+        .cloned()
+}
+
+fn weather_object_matches(object: &Value, query: &WeatherObjectQuery) -> bool {
+    for (filter, key) in [
+        (query.kind.as_deref(), "kind"),
+        (query.lane.as_deref(), "lane"),
+        (query.category.as_deref(), "category"),
+        (query.model.as_deref(), "model"),
+        (query.run.as_deref(), "run"),
+        (query.valid_time.as_deref(), "valid_time"),
+        (query.frame.as_deref(), "frame"),
+        (query.tilt.as_deref(), "tilt"),
+        (query.source.as_deref(), "source"),
+        (query.source_kind.as_deref(), "source_kind"),
+    ] {
+        if let Some(filter) = normalized_optional_query(filter) {
+            let Some(value) = weather_object_string_field(object, key) else {
+                return false;
+            };
+            if value.to_ascii_lowercase() != filter {
+                return false;
+            }
+        }
+    }
+    if let Some(product) = normalized_optional_query(query.product.as_deref()) {
+        if !weather_object_product_matches(object, &product) {
+            return false;
+        }
+    }
+    if let Some(member) = normalized_optional_query(query.member.as_deref()) {
+        if !weather_object_member_matches(object, &member) {
+            return false;
+        }
+    }
+    if let Some(ensemble_stat) = normalized_optional_query(query.ensemble_stat.as_deref()) {
+        if !weather_object_ensemble_stat_matches(object, &ensemble_stat) {
+            return false;
+        }
+    }
+    if let Some(forecast_hour) = query.forecast_hour {
+        if !weather_object_forecast_hour_matches(object, forecast_hour) {
+            return false;
+        }
+    }
+    if let Some(threshold) = normalized_optional_query(query.threshold.as_deref()) {
+        if !weather_object_threshold_matches(object, &threshold) {
+            return false;
+        }
+    }
+    if let Some(network) = normalized_optional_query(query.network.as_deref()) {
+        if !weather_object_network_matches(object, &network) {
+            return false;
+        }
+    }
+    if let Some(parameter) = normalized_optional_query(query.parameter.as_deref()) {
+        if !weather_object_parameter_matches(object, &parameter) {
+            return false;
+        }
+    }
+    if let Some(quality_tier) = query.quality_tier {
+        if !weather_object_quality_tier_matches(object, quality_tier) {
+            return false;
+        }
+    }
+    if query.max_age_minutes.is_some() && !weather_object_max_age_matches(object, query) {
+        return false;
+    }
+    if !weather_object_spatial_matches(object, query) {
+        return false;
+    }
+    if let Some(q) = normalized_optional_query(query.q.as_deref()) {
+        object.to_string().to_ascii_lowercase().contains(&q)
+    } else {
+        true
+    }
+}
+
+fn direct_observation_source_object(
+    source_id: &str,
+    source_kind: &str,
+    record: &Value,
+    items: Option<&Vec<Value>>,
+) -> Value {
+    json!({
+        "schema": "wxstore.weather_object.v1",
+        "id": format!("observation_source:{source_id}"),
+        "kind": "observation_source",
+        "category": direct_observation_object_category(source_kind),
+        "lane": "direct_observations",
+        "source": source_id,
+        "source_kind": source_kind,
+        "quality_tier": direct_observation_quality_tier(source_id, source_kind, None),
+        "station_count": items.map(|items| items.len()).unwrap_or(0),
+        "parameters": items
+            .map(|items| weather_object_source_parameters(items))
+            .unwrap_or_default(),
+        "label": record.get("source_name").cloned().unwrap_or_else(|| json!(source_id)),
+        "updated_at": record.get("fetched_at").cloned().unwrap_or_else(|| json!(null)),
+        "url": format!("/v1/observations/sources/{source_id}"),
+        "metadata": record,
+    })
+}
+
+fn direct_observation_station_object(source_id: &str, source_kind: &str, item: &Value) -> Value {
+    let station_id = item
+        .get("station_id")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    let object_kind = direct_observation_object_kind(source_kind);
+    json!({
+        "schema": "wxstore.weather_object.v1",
+        "id": format!("{object_kind}:{source_id}:{station_id}"),
+        "kind": object_kind,
+        "category": direct_observation_object_category(source_kind),
+        "lane": "direct_observations",
+        "source": source_id,
+        "source_kind": source_kind,
+        "network": item.get("network").cloned().unwrap_or_else(|| json!(null)),
+        "quality_tier": direct_observation_quality_tier(
+            source_id,
+            source_kind,
+            item.get("network").and_then(Value::as_str),
+        ),
+        "station_id": station_id,
+        "station_name": item.get("station_name").cloned().unwrap_or_else(|| json!(station_id)),
+        "state": item.get("state").cloned().unwrap_or_else(|| json!(null)),
+        "parameters": weather_object_available_parameters(item),
+        "latitude": item.get("latitude").cloned().unwrap_or_else(|| json!(null)),
+        "longitude": item.get("longitude").cloned().unwrap_or_else(|| json!(null)),
+        "valid_time": item.get("timestamp").cloned().unwrap_or_else(|| json!(null)),
+        "label": item.get("station_name").cloned().unwrap_or_else(|| json!(station_id)),
+        "url": format!("/v1/observations/sources/{source_id}"),
+        "metadata": item,
+    })
+}
+
+fn weather_object_product_matches(object: &Value, product: &str) -> bool {
+    let product = normalized_static_plot_product_key(product);
+    weather_object_string_field_from_keys(object, &["product"])
+        .map(|value| normalized_static_plot_product_key(&value) == product)
+        .unwrap_or(false)
+}
+
+fn weather_object_member_matches(object: &Value, member: &str) -> bool {
+    weather_object_string_field_from_keys(object, &["member", "member_key", "ensemble_key"])
+        .map(|value| value == member)
+        .unwrap_or(false)
+}
+
+fn weather_object_ensemble_stat_matches(object: &Value, ensemble_stat: &str) -> bool {
+    weather_object_string_field_from_keys(object, &["ensemble_stat", "ensemble_statistic"])
+        .map(|value| value == ensemble_stat)
+        .unwrap_or(false)
+}
+
+fn weather_object_forecast_hour_matches(object: &Value, forecast_hour: u32) -> bool {
+    weather_object_u32_field_from_keys(object, &["forecast_hour"])
+        .map(|value| value == forecast_hour)
+        .unwrap_or(false)
+}
+
+fn weather_object_threshold_matches(object: &Value, threshold: &str) -> bool {
+    let mut candidates = Vec::new();
+    weather_object_collect_threshold_values(object, &mut candidates);
+    candidates
+        .iter()
+        .any(|value| weather_object_value_exact_matches(value, threshold))
+}
+
+fn weather_object_string_field_from_keys(object: &Value, keys: &[&str]) -> Option<String> {
+    keys.iter()
+        .find_map(|key| weather_object_string_field(object, key))
+        .or_else(|| {
+            object.get("metadata").and_then(|metadata| {
+                keys.iter()
+                    .find_map(|key| weather_object_string_field(metadata, key))
+            })
+        })
+}
+
+fn weather_object_u32_field_from_keys(object: &Value, keys: &[&str]) -> Option<u32> {
+    keys.iter()
+        .find_map(|key| weather_object_u32_field(object, key))
+        .or_else(|| {
+            object.get("metadata").and_then(|metadata| {
+                keys.iter()
+                    .find_map(|key| weather_object_u32_field(metadata, key))
+            })
+        })
+}
+
+fn weather_object_u32_field(object: &Value, key: &str) -> Option<u32> {
+    match object.get(key)? {
+        Value::Number(value) => value.as_u64().and_then(|value| u32::try_from(value).ok()),
+        Value::String(value) => {
+            let value = value.trim();
+            let value = value
+                .strip_prefix('f')
+                .or_else(|| value.strip_prefix('F'))
+                .unwrap_or(value);
+            value.parse::<u32>().ok()
+        }
+        _ => None,
+    }
+}
+
+fn weather_object_first_threshold_value(object: &Value) -> Option<Value> {
+    let mut candidates = Vec::new();
+    weather_object_collect_threshold_values(object, &mut candidates);
+    candidates.into_iter().next()
+}
+
+fn weather_object_collect_threshold_values(object: &Value, out: &mut Vec<Value>) {
+    for key in [
+        "threshold",
+        "threshold_value",
+        "value_threshold",
+        "contour_threshold",
+    ] {
+        if let Some(value) = object.get(key).filter(|value| !value.is_null()) {
+            out.push(value.clone());
+        }
+    }
+    if let Some(values) = object.get("thresholds").and_then(Value::as_array) {
+        out.extend(values.iter().filter(|value| !value.is_null()).cloned());
+    }
+    for key in ["metadata", "content_identity"] {
+        if let Some(value) = object.get(key).filter(|value| value.is_object()) {
+            weather_object_collect_threshold_values(value, out);
+        }
+    }
+}
+
+fn weather_object_value_exact_matches(value: &Value, filter: &str) -> bool {
+    let filter_number = filter.parse::<f64>().ok();
+    match value {
+        Value::String(value) => {
+            let normalized = normalized_optional_query(Some(value)).unwrap_or_default();
+            normalized == filter
+                || filter_number
+                    .zip(value.trim().parse::<f64>().ok())
+                    .is_some_and(|(a, b)| (a - b).abs() <= f64::EPSILON)
+        }
+        Value::Number(value) => value.as_f64().is_some_and(|value| {
+            filter_number
+                .map(|filter| (value - filter).abs() <= f64::EPSILON)
+                .unwrap_or_else(|| value.to_string() == filter)
+        }),
+        Value::Bool(value) => value.to_string() == filter,
+        _ => false,
+    }
+}
+
+fn weather_object_network_matches(object: &Value, network: &str) -> bool {
+    weather_object_string_field(object, "network")
+        .or_else(|| {
+            object
+                .get("metadata")
+                .and_then(|metadata| weather_object_string_field(metadata, "network"))
+        })
+        .or_else(|| {
+            weather_object_string_field(object, "station_id").and_then(|station_id| {
+                station_id
+                    .split_once(':')
+                    .map(|(prefix, _)| prefix.to_string())
+            })
+        })
+        .is_some_and(|value| value == network)
+}
+
+fn weather_object_quality_tier_matches(object: &Value, quality_tier: u8) -> bool {
+    if !(1..=5).contains(&quality_tier) {
+        return false;
+    }
+    weather_object_number_field(object, "quality_tier")
+        .map(|value| value as u8 == quality_tier && value.fract() == 0.0)
+        .unwrap_or(false)
+}
+
+fn weather_object_parameter_matches(object: &Value, parameter: &str) -> bool {
+    if weather_object_parameter_list_matches(object, parameter) {
+        return true;
+    }
+    let Some(metadata) = object.get("metadata") else {
+        return false;
+    };
+    let fields = weather_object_parameter_fields(parameter);
+    if fields.is_empty() {
+        return weather_object_meaningful_field(metadata, parameter);
+    }
+    fields
+        .iter()
+        .any(|field| weather_object_meaningful_field(metadata, field))
+}
+
+fn weather_object_parameter_list_matches(object: &Value, parameter: &str) -> bool {
+    let Some(parameters) = object.get("parameters").and_then(Value::as_array) else {
+        return false;
+    };
+    let query_fields = weather_object_parameter_fields(parameter);
+    parameters.iter().filter_map(Value::as_str).any(|existing| {
+        if existing.eq_ignore_ascii_case(parameter) {
+            return true;
+        }
+        if query_fields.is_empty() {
+            return false;
+        }
+        let existing_fields = weather_object_parameter_fields(&existing.to_ascii_lowercase());
+        existing_fields
+            .iter()
+            .any(|field| query_fields.iter().any(|query_field| query_field == field))
+    })
+}
+
+fn weather_object_available_parameters(metadata: &Value) -> Vec<&'static str> {
+    weather_object_canonical_parameters()
+        .iter()
+        .copied()
+        .filter(|parameter| {
+            weather_object_parameter_fields(parameter)
+                .iter()
+                .any(|field| weather_object_meaningful_field(metadata, field))
+        })
+        .collect()
+}
+
+fn weather_object_source_parameters(items: &[Value]) -> Vec<&'static str> {
+    let mut parameters = BTreeSet::new();
+    for item in items {
+        parameters.extend(weather_object_available_parameters(item));
+    }
+    parameters.into_iter().collect()
+}
+
+fn weather_object_canonical_parameters() -> &'static [&'static str] {
+    &[
+        "temperature",
+        "air_temperature",
+        "temperature_extremes",
+        "water_temperature",
+        "soil_temperature",
+        "road_temperature",
+        "dewpoint",
+        "humidity",
+        "wind",
+        "pressure",
+        "pressure_tendency",
+        "visibility",
+        "weather",
+        "precipitation",
+        "snow",
+        "soil",
+        "solar",
+        "air_quality",
+        "pm25",
+        "pm10",
+        "ozone",
+        "wave_height",
+        "streamflow",
+        "stage",
+        "stage_streamflow",
+        "water_level",
+        "tide",
+        "reservoir",
+        "road_surface",
+    ]
+}
+
+fn weather_object_parameter_fields(parameter: &str) -> &'static [&'static str] {
+    match parameter {
+        "temperature" | "temp" => &[
+            "temperature_f",
+            "temperature_max_today_f",
+            "temperature_min_today_f",
+        ],
+        "air_temperature" | "air_temp" | "t2m" => &["temperature_f"],
+        "temperature_extremes" | "daily_temperature" => {
+            &["temperature_max_today_f", "temperature_min_today_f"]
+        }
+        "water_temperature" | "water_temp" | "sst" => &["water_temperature_f"],
+        "soil_temperature" | "soil_temp" => &["soil_temperature_4in_f"],
+        "road_temperature" | "road_surface_temperature" | "pavement_temperature" => {
+            &["road_surface_temperature_f"]
+        }
+        "dewpoint" | "dew_point" | "td" => &["dewpoint_f"],
+        "humidity" | "rh" | "relative_humidity" => &["relative_humidity_pct"],
+        "wind" | "wind_speed" | "wind_gust" | "gust" => {
+            &["wind_speed_kts", "wind_gust_kts", "wind_direction_deg"]
+        }
+        "pressure" | "station_pressure" | "altimeter" | "mslp" => &[
+            "station_pressure_mb",
+            "sea_level_pressure_mb",
+            "altimeter_inhg",
+        ],
+        "pressure_tendency" | "barometer_tendency" => &["pressure_tendency_mb"],
+        "visibility" | "ceiling" | "flight_category" => {
+            &["visibility_miles", "ceiling_ft", "cloud_cover"]
+        }
+        "weather" | "conditions" => &["weather_conditions"],
+        "precip" | "precipitation" | "rain" | "rainfall" => {
+            &["precipitation_1hr_in", "precipitation_accum_in"]
+        }
+        "snow" | "snowpack" | "swe" => &["snow_depth_in", "snow_water_equivalent_in"],
+        "soil" | "soil_moisture" => &["soil_temperature_4in_f", "soil_moisture_pct"],
+        "solar" | "radiation" | "solar_radiation" => &["solar_radiation_wm2"],
+        "air_quality" | "aq" | "aqi" => &[
+            "air_quality_index",
+            "pm25_ugm3",
+            "pm25_aqi",
+            "pm10_ugm3",
+            "pm10_aqi",
+            "ozone_ppb",
+            "ozone_aqi",
+        ],
+        "pm25" | "pm2_5" => &["pm25_ugm3", "pm25_aqi"],
+        "pm10" => &["pm10_ugm3", "pm10_aqi"],
+        "ozone" => &["ozone_ppb", "ozone_aqi"],
+        "wave" | "waves" | "wave_height" => &[
+            "wave_height_ft",
+            "dominant_wave_period_s",
+            "average_wave_period_s",
+            "wave_direction_deg",
+        ],
+        "streamflow" | "flow" | "discharge" => &["streamflow_cfs"],
+        "stage" | "gage_height" | "stream_stage" => &["gage_height_ft"],
+        "stage_streamflow" | "river" => &["gage_height_ft", "streamflow_cfs"],
+        "water_level" => &["water_level_ft"],
+        "tide" => &["tide_ft"],
+        "reservoir" => &["reservoir_elevation_ft"],
+        "road" | "road_surface" | "pavement" => {
+            &["road_surface_temperature_f", "road_surface_status"]
+        }
+        _ => &[],
+    }
+}
+
+fn weather_object_meaningful_field(object: &Value, key: &str) -> bool {
+    match object.get(key) {
+        Some(Value::Number(value)) => value.as_f64().is_some_and(f64::is_finite),
+        Some(Value::String(value)) => !value.trim().is_empty(),
+        Some(Value::Bool(_)) => true,
+        Some(Value::Array(values)) => !values.is_empty(),
+        Some(Value::Object(values)) => !values.is_empty(),
+        _ => false,
+    }
+}
+
+fn weather_object_max_age_matches(object: &Value, query: &WeatherObjectQuery) -> bool {
+    let Some(max_age_minutes) = query.max_age_minutes else {
+        return true;
+    };
+    if !max_age_minutes.is_finite() || max_age_minutes < 0.0 {
+        return false;
+    }
+    let Some(valid_time) = weather_object_valid_time(object) else {
+        return false;
+    };
+    let age_seconds = chrono::Utc::now()
+        .signed_duration_since(valid_time)
+        .num_seconds()
+        .max(0) as f64;
+    age_seconds <= max_age_minutes * 60.0
+}
+
+fn weather_object_valid_time(object: &Value) -> Option<chrono::DateTime<chrono::Utc>> {
+    let raw = object
+        .get("valid_time")
+        .and_then(Value::as_str)
+        .or_else(|| object.get("updated_at").and_then(Value::as_str))
+        .or_else(|| {
+            object
+                .get("metadata")
+                .and_then(|metadata| metadata.get("timestamp"))
+                .and_then(Value::as_str)
+        })?;
+    chrono::DateTime::parse_from_rfc3339(raw)
+        .ok()
+        .map(|value| value.with_timezone(&chrono::Utc))
+}
+
+fn direct_observation_object_kind(source_kind: &str) -> &'static str {
+    match source_kind {
+        "marine_current_observation" => "marine_observation",
+        "hydro_current_observation" => "hydro_observation",
+        "hydro_forecast_status" => "hydro_forecast_observation",
+        "flash_flood_current_observation" => "flash_flood_observation",
+        "coastal_meteorology_current" => "coastal_meteorology_observation",
+        "coastal_water_current" => "coastal_water_observation",
+        "air_quality_current_observation" => "air_quality_observation",
+        "raws_fire_danger_daily" => "fire_danger_observation",
+        "coop_daily_climate" => "climate_observation",
+        _ => "surface_observation",
+    }
+}
+
+fn direct_observation_object_category(source_kind: &str) -> &'static str {
+    match source_kind {
+        "marine_current_observation" | "coastal_meteorology_current" => "ocean",
+        "hydro_current_observation"
+        | "hydro_forecast_status"
+        | "flash_flood_current_observation"
+        | "coastal_water_current" => "water",
+        "air_quality_current_observation" => "air_quality",
+        "raws_current_weather" | "raws_fire_danger_daily" => "fire",
+        "coop_daily_climate" => "climate",
+        _ => "weather",
+    }
+}
+
+fn direct_observation_quality_tier(
+    source_id: &str,
+    source_kind: &str,
+    network: Option<&str>,
+) -> u8 {
+    let source_id = source_id.to_ascii_lowercase();
+    let network = network.unwrap_or_default().to_ascii_lowercase();
+    match source_kind {
+        "asos_awos_metar"
+        | "marine_current_observation"
+        | "hydro_forecast_status"
+        | "coastal_water_current"
+        | "coastal_meteorology_current"
+        | "air_quality_current_observation"
+        | "snotel_hourly"
+        | "scan_hourly" => 1,
+        "hydro_current_observation" => {
+            if source_id.starts_with("usgs_") || source_id.starts_with("noaa_") {
+                1
+            } else {
+                3
+            }
+        }
+        "mesonet_current_5min"
+        | "mesonet_5min"
+        | "mesonet_current_15min"
+        | "mesonet_hourly_ag_weather"
+        | "raws_current_weather" => 2,
+        "rwis_current" | "flash_flood_current_observation" => 3,
+        "raws_fire_danger_daily" | "coop_daily_climate" => 4,
+        _ => {
+            if matches!(
+                network.as_str(),
+                "asos" | "awos" | "metar" | "ndbc" | "co-ops" | "co-ops_met" | "airnow"
+            ) {
+                1
+            } else if network.contains("mesonet") {
+                2
+            } else if network.is_empty() {
+                5
+            } else {
+                3
+            }
+        }
+    }
+}
+
+fn weather_object_spatial_matches(object: &Value, query: &WeatherObjectQuery) -> bool {
+    if let Some(bbox) = normalized_optional_query(query.bbox.as_deref()) {
+        let Some((min_lon, min_lat, max_lon, max_lat)) = parse_weather_object_bbox(&bbox) else {
+            return false;
+        };
+        let Some((lat, lon)) = weather_object_coordinates(object) else {
+            return false;
+        };
+        if lat < min_lat || lat > max_lat {
+            return false;
+        }
+        let lon = normalize_lon(lon);
+        let min_lon = normalize_lon(min_lon);
+        let max_lon = normalize_lon(max_lon);
+        if min_lon <= max_lon {
+            if lon < min_lon || lon > max_lon {
+                return false;
+            }
+        } else if lon < min_lon && lon > max_lon {
+            return false;
+        }
+    }
+
+    if query.lat.is_some() || query.lon.is_some() || query.radius_km.is_some() {
+        let (Some(query_lat), Some(query_lon)) = (query.lat, query.lon) else {
+            return false;
+        };
+        if !query_lat.is_finite() || !query_lon.is_finite() || !(-90.0..=90.0).contains(&query_lat)
+        {
+            return false;
+        }
+        let radius_km = query.radius_km.unwrap_or(50.0);
+        if !radius_km.is_finite() || radius_km < 0.0 {
+            return false;
+        }
+        let Some((lat, lon)) = weather_object_coordinates(object) else {
+            return false;
+        };
+        if weather_object_distance_km(query_lat, query_lon, lat, lon) > radius_km {
+            return false;
+        }
+    }
+
+    true
+}
+
+fn parse_weather_object_bbox(value: &str) -> Option<(f64, f64, f64, f64)> {
+    let parts = value
+        .split(',')
+        .map(str::trim)
+        .map(str::parse::<f64>)
+        .collect::<Result<Vec<_>, _>>()
+        .ok()?;
+    if parts.len() != 4 || parts.iter().any(|value| !value.is_finite()) {
+        return None;
+    }
+    let min_lon = parts[0];
+    let max_lon = parts[2];
+    let min_lat = parts[1].min(parts[3]);
+    let max_lat = parts[1].max(parts[3]);
+    if !(-90.0..=90.0).contains(&min_lat)
+        || !(-90.0..=90.0).contains(&max_lat)
+        || !(-180.0..=180.0).contains(&min_lon)
+        || !(-180.0..=180.0).contains(&max_lon)
+    {
+        return None;
+    }
+    Some((min_lon, min_lat, max_lon, max_lat))
+}
+
+fn weather_object_coordinates(object: &Value) -> Option<(f64, f64)> {
+    let lat = weather_object_number_field(object, "latitude").or_else(|| {
+        object
+            .get("metadata")
+            .and_then(|metadata| weather_object_number_field(metadata, "latitude"))
+    })?;
+    let lon = weather_object_number_field(object, "longitude").or_else(|| {
+        object
+            .get("metadata")
+            .and_then(|metadata| weather_object_number_field(metadata, "longitude"))
+    })?;
+    (lat.is_finite() && lon.is_finite() && (-90.0..=90.0).contains(&lat)).then_some((lat, lon))
+}
+
+fn weather_object_distance_km(from_lat: f64, from_lon: f64, to_lat: f64, to_lon: f64) -> f64 {
+    let from_lat = from_lat.to_radians();
+    let to_lat = to_lat.to_radians();
+    let dlat = to_lat - from_lat;
+    let dlon = normalized_lon_delta(to_lon - from_lon).to_radians();
+    let half_dlat = (dlat / 2.0).sin();
+    let half_dlon = (dlon / 2.0).sin();
+    let haversine = half_dlat * half_dlat + from_lat.cos() * to_lat.cos() * half_dlon * half_dlon;
+    let central_angle = 2.0 * haversine.clamp(0.0, 1.0).sqrt().asin();
+    RADAR_EARTH_AUTHALIC_RADIUS_M * central_angle / 1000.0
+}
+
+fn weather_object_number_field(object: &Value, key: &str) -> Option<f64> {
+    match object.get(key)? {
+        Value::Number(value) => value.as_f64(),
+        Value::String(value) => value.trim().parse::<f64>().ok(),
+        _ => None,
+    }
+}
+
+fn weather_object_string_field(object: &Value, key: &str) -> Option<String> {
+    match object.get(key)? {
+        Value::String(value) => Some(value.to_ascii_lowercase()),
+        Value::Number(value) => Some(value.to_string()),
+        _ => None,
+    }
+}
+
 fn store_status(
     profile: Option<&ProfileLane>,
     diagnostic: Option<&DiagnosticLane>,
     spatial: Option<&SpatialLane>,
     static_plots: Option<&StaticPlotLane>,
+    evidence: Option<&EvidenceBundleLane>,
+    observations: Option<&ObservationLane>,
+    mesoanalysis_innovation: Option<&MesoanalysisInnovationLane>,
     satellite_tiles: Option<&SatelliteTileLane>,
     radar_tiles: Option<&RadarTileLane>,
     cache: Option<CacheStats>,
@@ -13588,6 +15762,9 @@ fn store_status(
         .unwrap_or(false);
     let spatial_ready = spatial.map(|_| !spatial_models.is_empty()).unwrap_or(true);
     let static_plots_ready = static_plots.is_some();
+    let evidence_ready = evidence.is_some();
+    let observations_ready = observations.is_some();
+    let mesoanalysis_innovation_ready = mesoanalysis_innovation.is_some();
     let satellite_ready = satellite_tiles.is_some();
     let radar_ready = radar_tiles.is_some();
     let ok = if spatial.is_some() {
@@ -13596,6 +15773,8 @@ fn store_status(
         static_plots_ready
     } else if satellite_tiles.is_some() || radar_tiles.is_some() {
         satellite_ready || radar_ready
+    } else if evidence.is_some() || observations.is_some() || mesoanalysis_innovation.is_some() {
+        true
     } else {
         profile_ready
     };
@@ -13613,6 +15792,9 @@ fn store_status(
                 "unavailable"
             },
             "static_plots": if static_plots_ready { "ready" } else { "unavailable" },
+            "evidence_bundles": if evidence_ready { "ready" } else { "unavailable" },
+            "direct_observations": if observations_ready { "ready" } else { "unavailable" },
+            "mesoanalysis_innovation": if mesoanalysis_innovation_ready { "ready" } else { "unavailable" },
             "satellite_tiles": if satellite_ready { "ready" } else { "unavailable" },
             "radar_tiles": if radar_ready { "ready" } else { "unavailable" },
             "spatial_models": spatial_models
@@ -13625,11 +15807,14 @@ fn store_status(
             "diag_scalar_basic": diagnostic.map(DiagnosticLane::lane_manifest_json).unwrap_or_else(|| json!({"status": "unavailable"})),
             "surface_spatial": spatial.map(SpatialLane::lane_manifest_json).unwrap_or_else(|| json!({"status": "unavailable"})),
             "static_plots": static_plots.map(StaticPlotLane::lane_manifest_json).unwrap_or_else(|| json!({"status": "unavailable"})),
+            "evidence_bundles": evidence.map(EvidenceBundleLane::lane_manifest_json).unwrap_or_else(|| json!({"status": "unavailable"})),
+            "direct_observations": observations.map(ObservationLane::lane_manifest_json).unwrap_or_else(|| json!({"status": "unavailable"})),
+            "mesoanalysis_innovation": mesoanalysis_innovation.map(MesoanalysisInnovationLane::lane_manifest_json).unwrap_or_else(|| json!({"status": "unavailable"})),
             "satellite_tiles": satellite_tiles.map(SatelliteTileLane::lane_manifest_json).unwrap_or_else(|| json!({"status": "unavailable"})),
             "radar_tiles": radar_tiles.map(RadarTileLane::lane_manifest_json).unwrap_or_else(|| json!({"status": "unavailable"})),
             "archive": archive.map(ArchiveLane::status_json).unwrap_or_else(|| json!({"status": "unavailable"}))
         },
-        "monitoring": monitoring_status(profile, diagnostic, spatial, static_plots, &cache_stats),
+        "monitoring": monitoring_status(profile, diagnostic, spatial, static_plots, evidence, observations, mesoanalysis_innovation, &cache_stats),
         "cache": cache_stats
     })
 }
@@ -13639,6 +15824,9 @@ fn readiness_status(
     diagnostic: Option<&DiagnosticLane>,
     spatial: Option<&SpatialLane>,
     static_plots: Option<&StaticPlotLane>,
+    evidence: Option<&EvidenceBundleLane>,
+    observations: Option<&ObservationLane>,
+    mesoanalysis_innovation: Option<&MesoanalysisInnovationLane>,
     satellite_tiles: Option<&SatelliteTileLane>,
     radar_tiles: Option<&RadarTileLane>,
 ) -> Value {
@@ -13659,6 +15847,8 @@ fn readiness_status(
         true
     } else if satellite_tiles.is_some() || radar_tiles.is_some() {
         satellite_ready || radar_ready
+    } else if evidence.is_some() || observations.is_some() || mesoanalysis_innovation.is_some() {
+        true
     } else {
         profile_ready
     };
@@ -13676,6 +15866,9 @@ fn readiness_status(
                 "unavailable"
             },
             "static_plots": if static_plots.is_some() { "ready" } else { "unavailable" },
+            "evidence_bundles": if evidence.is_some() { "ready" } else { "unavailable" },
+            "direct_observations": if observations.is_some() { "ready" } else { "unavailable" },
+            "mesoanalysis_innovation": if mesoanalysis_innovation.is_some() { "ready" } else { "unavailable" },
             "satellite_tiles": if satellite_ready { "ready" } else { "unavailable" },
             "radar_tiles": if radar_ready { "ready" } else { "unavailable" },
             "spatial_models": spatial_models
@@ -13700,6 +15893,9 @@ fn monitoring_status(
     diagnostic: Option<&DiagnosticLane>,
     spatial: Option<&SpatialLane>,
     static_plots: Option<&StaticPlotLane>,
+    evidence: Option<&EvidenceBundleLane>,
+    observations: Option<&ObservationLane>,
+    mesoanalysis_innovation: Option<&MesoanalysisInnovationLane>,
     cache: &CacheStats,
 ) -> Value {
     let profile_hours = profile
@@ -13731,6 +15927,24 @@ fn monitoring_status(
     let static_plot_summary = static_plots
         .map(StaticPlotLane::summary_json)
         .unwrap_or_else(|| json!({"status": "unavailable", "coverage": []}));
+    let evidence_summary = evidence
+        .map(EvidenceBundleLane::summary_json)
+        .unwrap_or_else(|| json!({"status": "unavailable", "bundle_count": 0}));
+    let observation_summary = observations
+        .map(ObservationLane::summary_json)
+        .unwrap_or_else(
+            || json!({"status": "unavailable", "source_count": 0, "observation_count": 0}),
+        );
+    let innovation_summary = mesoanalysis_innovation
+        .map(MesoanalysisInnovationLane::summary_json)
+        .unwrap_or_else(|| {
+            json!({
+                "status": "unavailable",
+                "history_case_count": 0,
+                "station_series_count": 0,
+                "source_series_count": 0
+            })
+        });
     json!({
         "schema": "wxstore.monitoring.v1",
         "generated_at": utc_now_string(),
@@ -13769,6 +15983,26 @@ fn monitoring_status(
             "failed_count": static_plot_summary.get("failed_count").cloned().unwrap_or_else(|| json!(0)),
             "coverage": static_plot_summary.get("coverage").cloned().unwrap_or_else(|| json!([]))
         },
+        "evidence_bundles": {
+            "status": evidence_summary.get("status").cloned().unwrap_or_else(|| json!("unavailable")),
+            "root": evidence_summary.get("root").cloned().unwrap_or_else(|| json!(null)),
+            "bundle_root": evidence_summary.get("bundle_root").cloned().unwrap_or_else(|| json!(null)),
+            "bundle_count": evidence_summary.get("bundle_count").cloned().unwrap_or_else(|| json!(0))
+        },
+        "direct_observations": {
+            "status": observation_summary.get("status").cloned().unwrap_or_else(|| json!("unavailable")),
+            "root": observation_summary.get("root").cloned().unwrap_or_else(|| json!(null)),
+            "source_count": observation_summary.get("source_count").cloned().unwrap_or_else(|| json!(0)),
+            "observation_count": observation_summary.get("observation_count").cloned().unwrap_or_else(|| json!(0)),
+            "raw_record_count": observation_summary.get("raw_record_count").cloned().unwrap_or_else(|| json!(0))
+        },
+        "mesoanalysis_innovation": {
+            "status": innovation_summary.get("status").cloned().unwrap_or_else(|| json!("unavailable")),
+            "root": innovation_summary.get("root").cloned().unwrap_or_else(|| json!(null)),
+            "history_case_count": innovation_summary.get("history_case_count").cloned().unwrap_or_else(|| json!(0)),
+            "station_series_count": innovation_summary.get("station_series_count").cloned().unwrap_or_else(|| json!(0)),
+            "source_series_count": innovation_summary.get("source_series_count").cloned().unwrap_or_else(|| json!(0))
+        },
         "timing": {
             "surface_spatial_ingest": spatial_monitoring.get("ingest_timing").cloned().unwrap_or_else(|| json!([])),
             "surface_spatial_export": spatial_monitoring.get("export_timing").cloned().unwrap_or_else(|| json!([]))
@@ -13780,7 +16014,7 @@ fn monitoring_status(
         },
         "api_health": {
             "livez": "configured",
-            "readyz": if profile.is_some() || spatial.is_some() || static_plots.is_some() { "configured" } else { "profile_unavailable" },
+            "readyz": if profile.is_some() || spatial.is_some() || static_plots.is_some() || evidence.is_some() || observations.is_some() || mesoanalysis_innovation.is_some() { "configured" } else { "profile_unavailable" },
             "sample_api": if spatial.is_some() { "configured" } else { "unavailable" },
             "tile_api": if spatial.is_some() { "configured" } else { "unavailable" },
             "tilejson_api": if spatial.is_some() { "configured" } else { "unavailable" }
@@ -19007,6 +21241,1515 @@ mod tests {
             bytes.extend_from_slice(&value.to_le_bytes());
         }
         fs::write(path, bytes).expect("write f32 values");
+    }
+
+    #[test]
+    fn evidence_bundle_lane_lists_and_loads_bundle_files() {
+        let root = temp_test_root("evidence_bundle_lane");
+        let bundle_dir = root.join("bundles");
+        fs::create_dir_all(&bundle_dir).expect("create bundle dir");
+        fs::write(
+            bundle_dir.join("case-001.json"),
+            serde_json::to_vec_pretty(&json!({
+                "schema": "rustwx-runner.evidence.bundle.v1",
+                "id": "case-001",
+                "claim": "Dryline initiation requires a boundary and sounding check",
+                "conclusion": "unknown",
+                "updated_at": "2026-05-11T00:00:00Z",
+                "artifacts": [
+                    {"role": "feature_record", "path": "dryline_feature_record.json"},
+                    {"role": "sounding", "path": "sample_sounding_diagnostics.json"}
+                ]
+            }))
+            .expect("serialize bundle"),
+        )
+        .expect("write bundle");
+
+        let lane = EvidenceBundleLane::open(&root).expect("open evidence lane");
+        let bundles = lane.bundles_json().expect("list bundles");
+        assert_eq!(bundles["bundle_count"], 1);
+        assert_eq!(bundles["bundles"][0]["id"], "case-001");
+        assert_eq!(bundles["bundles"][0]["artifact_count"], 2);
+        assert_eq!(
+            bundles["bundles"][0]["url"],
+            "/v1/evidence/bundles/case-001"
+        );
+
+        let bundle = lane.bundle_json("case-001").expect("load bundle");
+        assert_eq!(bundle["bundle_id"], "case-001");
+        assert_eq!(
+            bundle["claim"],
+            "Dryline initiation requires a boundary and sounding check"
+        );
+        assert!(bundle["wxstore_path"]
+            .as_str()
+            .is_some_and(|path| path.ends_with("case-001.json")));
+        assert!(lane.bundle_json("../case-001").is_err());
+
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn evidence_only_status_is_ready() {
+        let root = temp_test_root("evidence_only_status");
+        fs::create_dir_all(root.join("bundles")).expect("create bundle dir");
+        let evidence = EvidenceBundleLane::open(&root).expect("open evidence lane");
+
+        let status = store_status(
+            None,
+            None,
+            None,
+            None,
+            Some(&evidence),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        );
+        let ready = readiness_status(
+            None,
+            None,
+            None,
+            None,
+            Some(&evidence),
+            None,
+            None,
+            None,
+            None,
+        );
+
+        assert_eq!(status["ok"], true);
+        assert_eq!(status["readiness"]["evidence_bundles"], "ready");
+        assert_eq!(status["monitoring"]["evidence_bundles"]["bundle_count"], 0);
+        assert_eq!(ready["ok"], true);
+
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn observation_lane_serves_sources_and_latest_observations() {
+        let root = temp_test_root("observation_lane");
+        let source_dir = root.join("sources").join("aviation_weather_metar_conus");
+        fs::create_dir_all(&source_dir).expect("create observation source dir");
+        fs::write(
+            root.join("index.json"),
+            serde_json::to_vec_pretty(&json!({
+                "schema": "rustwx-runner.observations.index.v1",
+                "updated_at": "2026-05-12T05:17:14Z",
+                "records": [{
+                    "schema": "rustwx-runner.observations.mirror.v1",
+                    "id": "aviation_weather_metar_conus",
+                    "kind": "asos_awos_metar",
+                    "source_name": "Aviation Weather Center METAR Cache CONUS",
+                    "fetched_at": "2026-05-12T05:17:13Z",
+                    "status": "ok",
+                    "raw_record_count": 2,
+                    "observation_count": 1,
+                    "skipped_count": 1
+                }]
+            }))
+            .expect("serialize observation index"),
+        )
+        .expect("write observation index");
+        fs::write(
+            source_dir.join("latest_observations.json"),
+            serde_json::to_vec_pretty(&json!({
+                "schema": "rustwx-runner.observations.normalized.v1",
+                "source": "aviation_weather_metar_conus",
+                "observation_count": 1,
+                "observations": [{
+                    "schema": "rustwx-runner.observation.v1",
+                    "station_id": "KOUN",
+                    "station_name": "Norman/Univ Oklahoma Arpt",
+                    "state": "OK",
+                    "timestamp": "2026-05-12T05:15:00Z",
+                    "temperature_f": 77.0
+                }]
+            }))
+            .expect("serialize observations"),
+        )
+        .expect("write latest observations");
+
+        let observations = ObservationLane::open(&root).expect("open observation lane");
+        let summary = observations.summary_json();
+        assert_eq!(summary["status"], "ready");
+        assert_eq!(summary["source_count"], 1);
+        assert_eq!(summary["observation_count"], 1);
+        let sources = observations
+            .sources_json()
+            .expect("list observation sources");
+        assert_eq!(sources["sources"][0]["id"], "aviation_weather_metar_conus");
+        let source = observations
+            .source_json("aviation_weather_metar_conus")
+            .expect("load observation source");
+        assert_eq!(source["observations"][0]["station_id"], "KOUN");
+        assert!(observations.source_json("../bad").is_err());
+
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn mesoanalysis_innovation_lane_queries_station_source_and_watchlists() {
+        let root = temp_test_root("mesoanalysis_innovation_lane");
+        fs::write(
+            root.join("manifest.json"),
+            serde_json::to_vec_pretty(&json!({
+                "schema": "rustwx.surface_mesoanalysis.innovation_wxstore_index.v1",
+                "generated_at": "2026-05-13T06:49:53Z",
+                "history_case_count": 3,
+                "station_series_count": 2,
+                "source_series_count": 1,
+                "query_policy": {
+                    "station_keys": ["station_key", "station_id", "source"],
+                    "source_keys": ["source"],
+                    "variable_key": "variable"
+                }
+            }))
+            .expect("serialize manifest"),
+        )
+        .expect("write manifest");
+        fs::write(
+            root.join("station_index.jsonl"),
+            [
+                serde_json::to_string(&json!({
+                    "station_key": "aviation_weather_metar_conus::KP69",
+                    "station_id": "KP69",
+                    "source": "aviation_weather_metar_conus",
+                    "variable": "temperature_c",
+                    "case_count": 3,
+                    "mean_abs_analysis_error": 5.45,
+                    "watchlist": {
+                        "severity_score": 7.36,
+                        "reason": "persistent_station_bias"
+                    }
+                }))
+                .expect("serialize station record"),
+                serde_json::to_string(&json!({
+                    "station_key": "aviation_weather_metar_conus::KOUN",
+                    "station_id": "KOUN",
+                    "source": "aviation_weather_metar_conus",
+                    "variable": "temperature_c",
+                    "case_count": 3,
+                    "mean_abs_analysis_error": 0.25
+                }))
+                .expect("serialize station record"),
+            ]
+            .join("\n"),
+        )
+        .expect("write station index");
+        fs::write(
+            root.join("source_index.jsonl"),
+            serde_json::to_string(&json!({
+                "source": "aviation_weather_metar_conus",
+                "variable": "wind_speed_ms",
+                "case_count": 3,
+                "mean_candidate_minus_background_mae": 0.013,
+                "watchlist": {
+                    "severity_score": 1.31,
+                    "reason": "source_mean_worse_than_background"
+                }
+            }))
+            .expect("serialize source record"),
+        )
+        .expect("write source index");
+        fs::write(
+            root.join("station_watchlist.json"),
+            serde_json::to_vec_pretty(&json!([{
+                "station_key": "aviation_weather_metar_conus::KP69",
+                "station_id": "KP69",
+                "source": "aviation_weather_metar_conus",
+                "variable": "temperature_c",
+                "case_count": 3,
+                "severity_score": 7.36,
+                "reason": "persistent_station_bias"
+            }]))
+            .expect("serialize station watchlist"),
+        )
+        .expect("write station watchlist");
+        fs::write(
+            root.join("source_watchlist.json"),
+            serde_json::to_vec_pretty(&json!([{
+                "source": "aviation_weather_metar_conus",
+                "variable": "wind_speed_ms",
+                "case_count": 3,
+                "severity_score": 1.31,
+                "reason": "source_mean_worse_than_background"
+            }]))
+            .expect("serialize source watchlist"),
+        )
+        .expect("write source watchlist");
+
+        let lane = MesoanalysisInnovationLane::open(&root).expect("open innovation lane");
+        let status = lane.summary_json();
+        assert_eq!(status["status"], "ready");
+        assert_eq!(status["history_case_count"], 3);
+
+        let station_report = lane
+            .query_json(&MesoanalysisInnovationQuery {
+                station: Some("KP69".to_string()),
+                variable: Some("temperature_c".to_string()),
+                ..Default::default()
+            })
+            .expect("query station");
+        assert_eq!(
+            station_report["schema"],
+            "wxstore.surface_mesoanalysis.innovation_query.v1"
+        );
+        assert_eq!(station_report["station_match_count"], 1);
+        assert_eq!(station_report["source_match_count"], 0);
+        assert_eq!(
+            station_report["station_records"][0]["station_key"],
+            "aviation_weather_metar_conus::KP69"
+        );
+
+        let source_report = lane
+            .query_json(&MesoanalysisInnovationQuery {
+                kind: Some("source".to_string()),
+                source: Some("aviation_weather_metar_conus".to_string()),
+                variable: Some("wind_speed_ms".to_string()),
+                min_case_count: Some(2),
+                ..Default::default()
+            })
+            .expect("query source");
+        assert_eq!(source_report["station_match_count"], 0);
+        assert_eq!(source_report["source_match_count"], 1);
+        assert_eq!(
+            source_report["source_records"][0]["watchlist"]["reason"],
+            "source_mean_worse_than_background"
+        );
+
+        let watchlist = lane
+            .watchlist_json(&MesoanalysisInnovationQuery {
+                kind: Some("station".to_string()),
+                top: Some(1),
+                ..Default::default()
+            })
+            .expect("query watchlist");
+        assert_eq!(watchlist["station_match_count"], 1);
+        assert_eq!(watchlist["source_match_count"], 0);
+        assert_eq!(watchlist["station_items"][0]["station_id"], "KP69");
+
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn weather_object_index_lists_direct_surface_observations() {
+        let root = temp_test_root("weather_objects_observations");
+        let source_dir = root.join("sources").join("aviation_weather_metar_conus");
+        fs::create_dir_all(&source_dir).expect("create observation source dir");
+        fs::write(
+            root.join("index.json"),
+            serde_json::to_vec_pretty(&json!({
+                "schema": "rustwx-runner.observations.index.v1",
+                "updated_at": "2026-05-12T05:17:14Z",
+                "records": [{
+                    "id": "aviation_weather_metar_conus",
+                    "kind": "asos_awos_metar",
+                    "source_name": "Aviation Weather Center METAR Cache CONUS",
+                    "fetched_at": "2026-05-12T05:17:13Z",
+                    "status": "ok",
+                    "observation_count": 1,
+                    "raw_record_count": 2
+                }]
+            }))
+            .expect("serialize observation index"),
+        )
+        .expect("write observation index");
+        fs::write(
+            source_dir.join("latest_observations.json"),
+            serde_json::to_vec_pretty(&json!({
+                "schema": "rustwx-runner.observations.normalized.v1",
+                "source": "aviation_weather_metar_conus",
+                "observations": [{
+                    "station_id": "KOUN",
+                    "station_name": "Norman/Univ Oklahoma Arpt",
+                    "state": "OK",
+                    "latitude": 35.24359,
+                    "longitude": -97.47133,
+                    "timestamp": "2026-05-12T05:15:00Z",
+                    "temperature_f": 77.0
+                }]
+            }))
+            .expect("serialize observations"),
+        )
+        .expect("write latest observations");
+        let observations = ObservationLane::open(&root).expect("open observation lane");
+
+        let index = weather_objects_index(
+            &WeatherObjectQuery {
+                kind: Some("surface_observation".to_string()),
+                q: Some("norman".to_string()),
+                ..WeatherObjectQuery::default()
+            },
+            None,
+            None,
+            None,
+            Some(&observations),
+            None,
+            None,
+        );
+
+        assert_eq!(index["matched_object_count"], 1);
+        assert_eq!(index["objects"][0]["station_id"], "KOUN");
+        assert_eq!(index["objects"][0]["latitude"], 35.24359);
+        assert_eq!(index["objects"][0]["longitude"], -97.47133);
+        assert_eq!(
+            index["objects"][0]["source"],
+            "aviation_weather_metar_conus"
+        );
+
+        let source_index = weather_objects_index(
+            &WeatherObjectQuery {
+                kind: Some("observation_source".to_string()),
+                source: Some("aviation_weather_metar_conus".to_string()),
+                parameter: Some("temperature".to_string()),
+                ..WeatherObjectQuery::default()
+            },
+            None,
+            None,
+            None,
+            Some(&observations),
+            None,
+            None,
+        );
+        assert_eq!(source_index["matched_object_count"], 1);
+        assert_eq!(source_index["objects"][0]["station_count"], 1);
+        assert_eq!(source_index["objects"][0]["quality_tier"], 1);
+        let source_parameters = source_index["objects"][0]["parameters"]
+            .as_array()
+            .expect("source parameters");
+        assert!(source_parameters
+            .iter()
+            .any(|value| value.as_str() == Some("temperature")));
+        assert!(!source_parameters
+            .iter()
+            .any(|value| value.as_str() == Some("wind")));
+
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn weather_object_direct_observation_cache_tracks_latest_file_changes() {
+        let root = temp_test_root("weather_objects_observation_cache");
+        let source_dir = root.join("sources").join("aviation_weather_metar_conus");
+        fs::create_dir_all(&source_dir).expect("create observation source dir");
+        fs::write(
+            root.join("index.json"),
+            serde_json::to_vec_pretty(&json!({
+                "schema": "rustwx-runner.observations.index.v1",
+                "updated_at": "2026-05-12T05:17:14Z",
+                "records": [{
+                    "id": "aviation_weather_metar_conus",
+                    "kind": "asos_awos_metar",
+                    "source_name": "Aviation Weather Center METAR Cache CONUS",
+                    "fetched_at": "2026-05-12T05:17:13Z",
+                    "status": "ok",
+                    "observation_count": 1,
+                    "raw_record_count": 1
+                }]
+            }))
+            .expect("serialize observation index"),
+        )
+        .expect("write observation index");
+        let latest_path = source_dir.join("latest_observations.json");
+        fs::write(
+            &latest_path,
+            serde_json::to_vec_pretty(&json!({
+                "schema": "rustwx-runner.observations.normalized.v1",
+                "source": "aviation_weather_metar_conus",
+                "observations": [{
+                    "station_id": "KOUN",
+                    "station_name": "Norman/Univ Oklahoma Arpt",
+                    "state": "OK",
+                    "latitude": 35.24359,
+                    "longitude": -97.47133,
+                    "timestamp": "2026-05-12T05:15:00Z",
+                    "temperature_f": 77.0
+                }]
+            }))
+            .expect("serialize first observations"),
+        )
+        .expect("write first observations");
+        let observations = ObservationLane::open(&root).expect("open observation lane");
+
+        let initial = weather_objects_index(
+            &WeatherObjectQuery {
+                kind: Some("observation_source".to_string()),
+                parameter: Some("wind".to_string()),
+                ..WeatherObjectQuery::default()
+            },
+            None,
+            None,
+            None,
+            Some(&observations),
+            None,
+            None,
+        );
+        assert_eq!(initial["matched_object_count"], 0);
+
+        fs::write(
+            &latest_path,
+            serde_json::to_vec_pretty(&json!({
+                "schema": "rustwx-runner.observations.normalized.v1",
+                "source": "aviation_weather_metar_conus",
+                "observations": [{
+                    "station_id": "KOUN",
+                    "station_name": "Norman/Univ Oklahoma Arpt",
+                    "state": "OK",
+                    "latitude": 35.24359,
+                    "longitude": -97.47133,
+                    "timestamp": "2026-05-12T05:20:00Z",
+                    "temperature_f": 77.0,
+                    "wind_speed_kts": 18.0,
+                    "raw_observation": "cache invalidation fixture with extra length"
+                }]
+            }))
+            .expect("serialize updated observations"),
+        )
+        .expect("write updated observations");
+
+        let updated = weather_objects_index(
+            &WeatherObjectQuery {
+                kind: Some("observation_source".to_string()),
+                parameter: Some("wind".to_string()),
+                ..WeatherObjectQuery::default()
+            },
+            None,
+            None,
+            None,
+            Some(&observations),
+            None,
+            None,
+        );
+        assert_eq!(updated["matched_object_count"], 1);
+        assert_eq!(updated["objects"][0]["station_count"], 1);
+        assert!(updated["objects"][0]["parameters"]
+            .as_array()
+            .expect("updated source parameters")
+            .iter()
+            .any(|value| value.as_str() == Some("wind")));
+
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn weather_object_index_types_hydro_and_marine_observations() {
+        let root = temp_test_root("weather_objects_typed_observations");
+        let usgs_dir = root.join("sources").join("usgs_nwis_ok");
+        let nwps_dir = root.join("sources").join("noaa_nwps_river_forecasts");
+        let flash_dir = root.join("sources").join("maricopa_fcd_alert");
+        let ndbc_dir = root.join("sources").join("ndbc_marine");
+        let coops_met_dir = root.join("sources").join("noaa_coops_meteorology");
+        let coops_dir = root.join("sources").join("noaa_coops_water_level");
+        let aq_dir = root.join("sources").join("epa_airnow_monitors");
+        fs::create_dir_all(&usgs_dir).expect("create USGS source dir");
+        fs::create_dir_all(&nwps_dir).expect("create NWPS source dir");
+        fs::create_dir_all(&flash_dir).expect("create Maricopa FCD source dir");
+        fs::create_dir_all(&ndbc_dir).expect("create NDBC source dir");
+        fs::create_dir_all(&coops_met_dir).expect("create CO-OPS met source dir");
+        fs::create_dir_all(&coops_dir).expect("create CO-OPS source dir");
+        fs::create_dir_all(&aq_dir).expect("create AQ source dir");
+        fs::write(
+            root.join("index.json"),
+            serde_json::to_vec_pretty(&json!({
+                "schema": "rustwx-runner.observations.index.v1",
+                "updated_at": "2026-05-12T12:06:48Z",
+                "records": [
+                    {
+                        "id": "usgs_nwis_ok",
+                        "kind": "hydro_current_observation",
+                        "source_name": "USGS NWIS Instantaneous Values OK",
+                        "fetched_at": "2026-05-12T12:06:48Z",
+                        "status": "ok",
+                        "observation_count": 1,
+                        "raw_record_count": 3
+                    },
+                    {
+                        "id": "noaa_nwps_river_forecasts",
+                        "kind": "hydro_forecast_status",
+                        "source_name": "NOAA NWPS River Forecast Status",
+                        "fetched_at": "2026-05-12T14:38:00Z",
+                        "status": "ok",
+                        "observation_count": 1,
+                        "raw_record_count": 1
+                    },
+                    {
+                        "id": "maricopa_fcd_alert",
+                        "kind": "flash_flood_current_observation",
+                        "source_name": "Maricopa County Flood Control ALERT Rain and Stream Gauges",
+                        "fetched_at": "2026-05-12T14:45:00Z",
+                        "status": "ok",
+                        "observation_count": 1,
+                        "raw_record_count": 2
+                    },
+                    {
+                        "id": "ndbc_marine",
+                        "kind": "marine_current_observation",
+                        "source_name": "NOAA NDBC Latest Marine Observations",
+                        "fetched_at": "2026-05-12T11:46:39Z",
+                        "status": "ok",
+                        "observation_count": 1,
+                        "raw_record_count": 1
+                    },
+                    {
+                        "id": "noaa_coops_meteorology",
+                        "kind": "coastal_meteorology_current",
+                        "source_name": "NOAA CO-OPS Latest Meteorology",
+                        "fetched_at": "2026-05-12T15:30:00Z",
+                        "status": "ok",
+                        "observation_count": 1,
+                        "raw_record_count": 3
+                    },
+                    {
+                        "id": "noaa_coops_water_level",
+                        "kind": "coastal_water_current",
+                        "source_name": "NOAA CO-OPS Latest Water Levels",
+                        "fetched_at": "2026-05-12T12:12:00Z",
+                        "status": "ok",
+                        "observation_count": 1,
+                        "raw_record_count": 1
+                    },
+                    {
+                        "id": "epa_airnow_monitors",
+                        "kind": "air_quality_current_observation",
+                        "source_name": "EPA AirNow Current Monitor Data",
+                        "fetched_at": "2026-05-12T12:00:00Z",
+                        "status": "ok",
+                        "observation_count": 1,
+                        "raw_record_count": 1
+                    }
+                ]
+            }))
+            .expect("serialize observation index"),
+        )
+        .expect("write observation index");
+        fs::write(
+            usgs_dir.join("latest_observations.json"),
+            serde_json::to_vec_pretty(&json!({
+                "schema": "rustwx-runner.observations.normalized.v1",
+                "source": "usgs_nwis_ok",
+                "observations": [{
+                    "station_id": "USGS:07148400",
+                    "station_name": "Salt Fork Arkansas River nr Alva, OK",
+                    "state": "OK",
+                    "latitude": 36.815,
+                    "longitude": -98.648,
+                    "timestamp": "2026-05-12T11:30:00Z",
+                    "streamflow_cfs": 44.6
+                }]
+            }))
+            .expect("serialize USGS observations"),
+        )
+        .expect("write USGS observations");
+        fs::write(
+            ndbc_dir.join("latest_observations.json"),
+            serde_json::to_vec_pretty(&json!({
+                "schema": "rustwx-runner.observations.normalized.v1",
+                "source": "ndbc_marine",
+                "observations": [{
+                    "station_id": "NDBC:46029",
+                    "station_name": "Columbia River Bar",
+                    "state": "MARINE",
+                    "latitude": 46.148,
+                    "longitude": -124.508,
+                    "timestamp": "2026-05-12T11:10:00Z",
+                    "water_temperature_f": 55.9
+                }]
+            }))
+            .expect("serialize NDBC observations"),
+        )
+        .expect("write NDBC observations");
+        fs::write(
+            nwps_dir.join("latest_observations.json"),
+            serde_json::to_vec_pretty(&json!({
+                "schema": "rustwx-runner.observations.normalized.v1",
+                "source": "noaa_nwps_river_forecasts",
+                "observations": [{
+                    "station_id": "NWPS:ABBG1",
+                    "station_name": "Ocmulgee River at Abbeville",
+                    "state": "GA",
+                    "latitude": 31.9967,
+                    "longitude": -83.2792,
+                    "timestamp": "2026-05-12T18:00:00Z",
+                    "gage_height_ft": 5.5,
+                    "streamflow_cfs": 3460.0,
+                    "weather_conditions": "no_flooding"
+                }]
+            }))
+            .expect("serialize NWPS observations"),
+        )
+        .expect("write NWPS observations");
+        fs::write(
+            flash_dir.join("latest_observations.json"),
+            serde_json::to_vec_pretty(&json!({
+                "schema": "rustwx-runner.observations.normalized.v1",
+                "source": "maricopa_fcd_alert",
+                "observations": [{
+                    "station_id": "FCDMC:RAIN:1200",
+                    "station_name": "Humboldt Mountain",
+                    "state": "AZ",
+                    "latitude": 33.98075,
+                    "longitude": -111.79794,
+                    "timestamp": "2026-05-12T06:00:00Z",
+                    "precipitation_1hr_in": 0.16,
+                    "precipitation_accum_in": 5.28,
+                    "weather_conditions": "flash_flood_rain_signal"
+                }]
+            }))
+            .expect("serialize Maricopa FCD observations"),
+        )
+        .expect("write Maricopa FCD observations");
+        fs::write(
+            coops_dir.join("latest_observations.json"),
+            serde_json::to_vec_pretty(&json!({
+                "schema": "rustwx-runner.observations.normalized.v1",
+                "source": "noaa_coops_water_level",
+                "observations": [{
+                    "station_id": "COOPS:9414290",
+                    "station_name": "San Francisco",
+                    "state": "CA",
+                    "latitude": 37.8063,
+                    "longitude": -122.4659,
+                    "timestamp": "2026-05-12T12:12:00Z",
+                    "water_level_ft": 2.882
+                }]
+            }))
+            .expect("serialize CO-OPS observations"),
+        )
+        .expect("write CO-OPS observations");
+        fs::write(
+            coops_met_dir.join("latest_observations.json"),
+            serde_json::to_vec_pretty(&json!({
+                "schema": "rustwx-runner.observations.normalized.v1",
+                "source": "noaa_coops_meteorology",
+                "observations": [{
+                    "station_id": "COOPS_MET:9414290",
+                    "station_name": "San Francisco",
+                    "state": "CA",
+                    "latitude": 37.8063,
+                    "longitude": -122.4659,
+                    "timestamp": "2026-05-12T15:30:00Z",
+                    "temperature_f": 52.0,
+                    "wind_speed_kts": 7.8,
+                    "wind_direction_deg": 248.0,
+                    "wind_gust_kts": 11.1,
+                    "station_pressure_mb": 1014.9
+                }]
+            }))
+            .expect("serialize CO-OPS met observations"),
+        )
+        .expect("write CO-OPS met observations");
+        fs::write(
+            aq_dir.join("latest_observations.json"),
+            serde_json::to_vec_pretty(&json!({
+                "schema": "rustwx-runner.observations.normalized.v1",
+                "source": "epa_airnow_monitors",
+                "observations": [{
+                    "station_id": "AIRNOW:010730023",
+                    "station_name": "NO. BHAM",
+                    "state": "AL",
+                    "latitude": 33.5531,
+                    "longitude": -86.815,
+                    "timestamp": "2026-05-12T12:00:00Z",
+                    "air_quality_index": 35.0,
+                    "pm25_ugm3": 6.8,
+                    "pm25_aqi": 32.0,
+                    "ozone_ppb": 34.0,
+                    "ozone_aqi": 35.0
+                }]
+            }))
+            .expect("serialize AQ observations"),
+        )
+        .expect("write AQ observations");
+        let observations = ObservationLane::open(&root).expect("open observation lane");
+
+        let hydro = weather_objects_index(
+            &WeatherObjectQuery {
+                kind: Some("hydro_observation".to_string()),
+                q: Some("07148400".to_string()),
+                ..WeatherObjectQuery::default()
+            },
+            None,
+            None,
+            None,
+            Some(&observations),
+            None,
+            None,
+        );
+        assert_eq!(hydro["matched_object_count"], 1);
+        assert_eq!(
+            hydro["objects"][0]["id"],
+            "hydro_observation:usgs_nwis_ok:USGS:07148400"
+        );
+        assert_eq!(hydro["objects"][0]["category"], "water");
+        assert_eq!(hydro["objects"][0]["quality_tier"], 1);
+
+        let hydro_forecast = weather_objects_index(
+            &WeatherObjectQuery {
+                kind: Some("hydro_forecast_observation".to_string()),
+                q: Some("NWPS:ABBG1".to_string()),
+                ..WeatherObjectQuery::default()
+            },
+            None,
+            None,
+            None,
+            Some(&observations),
+            None,
+            None,
+        );
+        assert_eq!(hydro_forecast["matched_object_count"], 1);
+        assert_eq!(
+            hydro_forecast["objects"][0]["id"],
+            "hydro_forecast_observation:noaa_nwps_river_forecasts:NWPS:ABBG1"
+        );
+        assert_eq!(hydro_forecast["objects"][0]["category"], "water");
+
+        let flash_flood = weather_objects_index(
+            &WeatherObjectQuery {
+                kind: Some("flash_flood_observation".to_string()),
+                q: Some("FCDMC:RAIN:1200".to_string()),
+                ..WeatherObjectQuery::default()
+            },
+            None,
+            None,
+            None,
+            Some(&observations),
+            None,
+            None,
+        );
+        assert_eq!(flash_flood["matched_object_count"], 1);
+        assert_eq!(
+            flash_flood["objects"][0]["id"],
+            "flash_flood_observation:maricopa_fcd_alert:FCDMC:RAIN:1200"
+        );
+        assert_eq!(flash_flood["objects"][0]["category"], "water");
+        assert_eq!(flash_flood["objects"][0]["quality_tier"], 3);
+
+        let marine = weather_objects_index(
+            &WeatherObjectQuery {
+                kind: Some("marine_observation".to_string()),
+                q: Some("46029".to_string()),
+                ..WeatherObjectQuery::default()
+            },
+            None,
+            None,
+            None,
+            Some(&observations),
+            None,
+            None,
+        );
+        assert_eq!(marine["matched_object_count"], 1);
+        assert_eq!(marine["objects"][0]["category"], "ocean");
+
+        let coastal = weather_objects_index(
+            &WeatherObjectQuery {
+                kind: Some("coastal_water_observation".to_string()),
+                q: Some("9414290".to_string()),
+                ..WeatherObjectQuery::default()
+            },
+            None,
+            None,
+            None,
+            Some(&observations),
+            None,
+            None,
+        );
+        assert_eq!(coastal["matched_object_count"], 1);
+        assert_eq!(
+            coastal["objects"][0]["id"],
+            "coastal_water_observation:noaa_coops_water_level:COOPS:9414290"
+        );
+        assert_eq!(coastal["objects"][0]["category"], "water");
+
+        let coastal_met = weather_objects_index(
+            &WeatherObjectQuery {
+                kind: Some("coastal_meteorology_observation".to_string()),
+                q: Some("COOPS_MET:9414290".to_string()),
+                ..WeatherObjectQuery::default()
+            },
+            None,
+            None,
+            None,
+            Some(&observations),
+            None,
+            None,
+        );
+        assert_eq!(coastal_met["matched_object_count"], 1);
+        assert_eq!(
+            coastal_met["objects"][0]["id"],
+            "coastal_meteorology_observation:noaa_coops_meteorology:COOPS_MET:9414290"
+        );
+        assert_eq!(coastal_met["objects"][0]["category"], "ocean");
+        assert_eq!(coastal_met["objects"][0]["quality_tier"], 1);
+
+        let aq = weather_objects_index(
+            &WeatherObjectQuery {
+                kind: Some("air_quality_observation".to_string()),
+                q: Some("010730023".to_string()),
+                ..WeatherObjectQuery::default()
+            },
+            None,
+            None,
+            None,
+            Some(&observations),
+            None,
+            None,
+        );
+        assert_eq!(aq["matched_object_count"], 1);
+        assert_eq!(
+            aq["objects"][0]["id"],
+            "air_quality_observation:epa_airnow_monitors:AIRNOW:010730023"
+        );
+        assert_eq!(aq["objects"][0]["category"], "air_quality");
+
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn weather_object_index_filters_direct_surface_observations_spatially() {
+        let root = temp_test_root("weather_objects_spatial_observations");
+        let source_dir = root.join("sources").join("aviation_weather_metar_conus");
+        fs::create_dir_all(&source_dir).expect("create observation source dir");
+        fs::write(
+            root.join("index.json"),
+            serde_json::to_vec_pretty(&json!({
+                "schema": "rustwx-runner.observations.index.v1",
+                "updated_at": "2026-05-12T05:17:14Z",
+                "records": [{
+                    "id": "aviation_weather_metar_conus",
+                    "kind": "asos_awos_metar",
+                    "source_name": "Aviation Weather Center METAR Cache CONUS",
+                    "fetched_at": "2026-05-12T05:17:13Z",
+                    "status": "ok",
+                    "observation_count": 2,
+                    "raw_record_count": 2
+                }]
+            }))
+            .expect("serialize observation index"),
+        )
+        .expect("write observation index");
+        fs::write(
+            source_dir.join("latest_observations.json"),
+            serde_json::to_vec_pretty(&json!({
+                "schema": "rustwx-runner.observations.normalized.v1",
+                "source": "aviation_weather_metar_conus",
+                "observations": [
+                    {
+                        "station_id": "KOUN",
+                        "station_name": "Norman/Univ Oklahoma Arpt",
+                        "state": "OK",
+                        "latitude": 35.24359,
+                        "longitude": -97.47133,
+                        "timestamp": "2026-05-12T05:15:00Z"
+                    },
+                    {
+                        "station_id": "KLAX",
+                        "station_name": "Los Angeles Intl",
+                        "state": "CA",
+                        "latitude": "33.9382",
+                        "longitude": "-118.3866",
+                        "timestamp": "2026-05-12T05:15:00Z"
+                    }
+                ]
+            }))
+            .expect("serialize observations"),
+        )
+        .expect("write latest observations");
+        let observations = ObservationLane::open(&root).expect("open observation lane");
+
+        let bbox = weather_objects_index(
+            &WeatherObjectQuery {
+                kind: Some("surface_observation".to_string()),
+                bbox: Some("-98,35,-97,36".to_string()),
+                ..WeatherObjectQuery::default()
+            },
+            None,
+            None,
+            None,
+            Some(&observations),
+            None,
+            None,
+        );
+        assert_eq!(bbox["matched_object_count"], 1);
+        assert_eq!(bbox["objects"][0]["station_id"], "KOUN");
+
+        let radius = weather_objects_index(
+            &WeatherObjectQuery {
+                kind: Some("surface_observation".to_string()),
+                lat: Some(35.24),
+                lon: Some(-97.47),
+                radius_km: Some(25.0),
+                ..WeatherObjectQuery::default()
+            },
+            None,
+            None,
+            None,
+            Some(&observations),
+            None,
+            None,
+        );
+        assert_eq!(radius["matched_object_count"], 1);
+        assert_eq!(radius["objects"][0]["station_id"], "KOUN");
+
+        let lax_radius = weather_objects_index(
+            &WeatherObjectQuery {
+                kind: Some("surface_observation".to_string()),
+                lat: Some(33.94),
+                lon: Some(-118.39),
+                radius_km: Some(10.0),
+                ..WeatherObjectQuery::default()
+            },
+            None,
+            None,
+            None,
+            Some(&observations),
+            None,
+            None,
+        );
+        assert_eq!(lax_radius["matched_object_count"], 1);
+        assert_eq!(lax_radius["objects"][0]["station_id"], "KLAX");
+
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn weather_object_index_filters_direct_observation_facets() {
+        let root = temp_test_root("weather_objects_observation_facets");
+        let metar_dir = root.join("sources").join("aviation_weather_metar_conus");
+        let ndbc_dir = root.join("sources").join("ndbc_marine");
+        fs::create_dir_all(&metar_dir).expect("create METAR source dir");
+        fs::create_dir_all(&ndbc_dir).expect("create NDBC source dir");
+        fs::write(
+            root.join("index.json"),
+            serde_json::to_vec_pretty(&json!({
+                "schema": "rustwx-runner.observations.index.v1",
+                "updated_at": "2026-05-12T05:17:14Z",
+                "records": [
+                    {
+                        "id": "aviation_weather_metar_conus",
+                        "kind": "asos_awos_metar",
+                        "source_name": "Aviation Weather Center METAR Cache CONUS",
+                        "fetched_at": "2026-05-12T05:17:13Z",
+                        "status": "ok",
+                        "observation_count": 2,
+                        "raw_record_count": 2
+                    },
+                    {
+                        "id": "ndbc_marine",
+                        "kind": "marine_current_observation",
+                        "source_name": "NOAA NDBC Latest Marine Observations",
+                        "fetched_at": "2026-05-12T11:46:39Z",
+                        "status": "ok",
+                        "observation_count": 1,
+                        "raw_record_count": 1
+                    }
+                ]
+            }))
+            .expect("serialize observation index"),
+        )
+        .expect("write observation index");
+
+        let fresh_time = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+        let old_time = (chrono::Utc::now() - chrono::Duration::hours(4))
+            .to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+        fs::write(
+            metar_dir.join("latest_observations.json"),
+            serde_json::to_vec_pretty(&json!({
+                "schema": "rustwx-runner.observations.normalized.v1",
+                "source": "aviation_weather_metar_conus",
+                "observations": [
+                    {
+                        "station_id": "KOUN",
+                        "station_name": "Norman/Univ Oklahoma Arpt",
+                        "state": "OK",
+                        "latitude": 35.24359,
+                        "longitude": -97.47133,
+                        "network": "ASOS_AWOS",
+                        "timestamp": fresh_time,
+                        "temperature_f": 77.0,
+                        "dewpoint_f": 68.0,
+                        "wind_speed_kts": 18.0,
+                        "wind_gust_kts": 26.0
+                    },
+                    {
+                        "station_id": "KOLD",
+                        "station_name": "Old Observation",
+                        "state": "OK",
+                        "latitude": 35.0,
+                        "longitude": -97.0,
+                        "network": "ASOS_AWOS",
+                        "timestamp": old_time,
+                        "temperature_f": 76.0,
+                        "wind_speed_kts": 12.0
+                    }
+                ]
+            }))
+            .expect("serialize METAR observations"),
+        )
+        .expect("write METAR observations");
+        fs::write(
+            ndbc_dir.join("latest_observations.json"),
+            serde_json::to_vec_pretty(&json!({
+                "schema": "rustwx-runner.observations.normalized.v1",
+                "source": "ndbc_marine",
+                "observations": [{
+                    "station_id": "NDBC:46029",
+                    "station_name": "Columbia River Bar",
+                    "state": "MARINE",
+                    "latitude": 46.148,
+                    "longitude": -124.508,
+                    "network": "NDBC",
+                    "timestamp": fresh_time,
+                    "wave_height_ft": 7.2,
+                    "water_temperature_f": 55.9
+                }]
+            }))
+            .expect("serialize NDBC observations"),
+        )
+        .expect("write NDBC observations");
+        let observations = ObservationLane::open(&root).expect("open observation lane");
+
+        let fresh_wind = weather_objects_index(
+            &WeatherObjectQuery {
+                kind: Some("surface_observation".to_string()),
+                category: Some("weather".to_string()),
+                network: Some("ASOS_AWOS".to_string()),
+                parameter: Some("wind".to_string()),
+                quality_tier: Some(1),
+                max_age_minutes: Some(60.0),
+                ..WeatherObjectQuery::default()
+            },
+            None,
+            None,
+            None,
+            Some(&observations),
+            None,
+            None,
+        );
+        assert_eq!(fresh_wind["matched_object_count"], 1);
+        assert_eq!(fresh_wind["objects"][0]["station_id"], "KOUN");
+        assert_eq!(fresh_wind["objects"][0]["network"], "ASOS_AWOS");
+        assert_eq!(fresh_wind["objects"][0]["quality_tier"], 1);
+        assert_eq!(fresh_wind["query"]["parameter"], "wind");
+        assert_eq!(fresh_wind["query"]["quality_tier"], 1);
+        assert_eq!(fresh_wind["query"]["max_age_minutes"], 60.0);
+        let fresh_wind_parameters = fresh_wind["objects"][0]["parameters"]
+            .as_array()
+            .expect("fresh wind parameters");
+        assert!(fresh_wind_parameters
+            .iter()
+            .any(|value| value.as_str() == Some("temperature")));
+        assert!(fresh_wind_parameters
+            .iter()
+            .any(|value| value.as_str() == Some("dewpoint")));
+        assert!(fresh_wind_parameters
+            .iter()
+            .any(|value| value.as_str() == Some("wind")));
+        assert!(!fresh_wind_parameters
+            .iter()
+            .any(|value| value.as_str() == Some("wave_height")));
+
+        let direct_field = weather_objects_index(
+            &WeatherObjectQuery {
+                kind: Some("surface_observation".to_string()),
+                parameter: Some("wind_speed_kts".to_string()),
+                max_age_minutes: Some(60.0),
+                ..WeatherObjectQuery::default()
+            },
+            None,
+            None,
+            None,
+            Some(&observations),
+            None,
+            None,
+        );
+        assert_eq!(direct_field["matched_object_count"], 1);
+        assert_eq!(direct_field["objects"][0]["station_id"], "KOUN");
+
+        let wave = weather_objects_index(
+            &WeatherObjectQuery {
+                kind: Some("marine_observation".to_string()),
+                category: Some("ocean".to_string()),
+                parameter: Some("wave_height".to_string()),
+                quality_tier: Some(1),
+                network: Some("ndbc".to_string()),
+                ..WeatherObjectQuery::default()
+            },
+            None,
+            None,
+            None,
+            Some(&observations),
+            None,
+            None,
+        );
+        assert_eq!(wave["matched_object_count"], 1);
+        assert_eq!(
+            wave["objects"][0]["id"],
+            "marine_observation:ndbc_marine:NDBC:46029"
+        );
+
+        let ocean_temperature = weather_objects_index(
+            &WeatherObjectQuery {
+                category: Some("ocean".to_string()),
+                parameter: Some("temperature".to_string()),
+                ..WeatherObjectQuery::default()
+            },
+            None,
+            None,
+            None,
+            Some(&observations),
+            None,
+            None,
+        );
+        assert_eq!(ocean_temperature["matched_object_count"], 0);
+
+        let water_temperature = weather_objects_index(
+            &WeatherObjectQuery {
+                kind: Some("marine_observation".to_string()),
+                category: Some("ocean".to_string()),
+                parameter: Some("water_temperature".to_string()),
+                ..WeatherObjectQuery::default()
+            },
+            None,
+            None,
+            None,
+            Some(&observations),
+            None,
+            None,
+        );
+        assert_eq!(water_temperature["matched_object_count"], 1);
+        assert_eq!(
+            water_temperature["objects"][0]["id"],
+            "marine_observation:ndbc_marine:NDBC:46029"
+        );
+        let water_temperature_parameters = water_temperature["objects"][0]["parameters"]
+            .as_array()
+            .expect("water temperature parameters");
+        assert!(water_temperature_parameters
+            .iter()
+            .any(|value| value.as_str() == Some("water_temperature")));
+        assert!(water_temperature_parameters
+            .iter()
+            .any(|value| value.as_str() == Some("wave_height")));
+        assert!(!water_temperature_parameters
+            .iter()
+            .any(|value| value.as_str() == Some("temperature")));
+
+        let impossible = weather_objects_index(
+            &WeatherObjectQuery {
+                kind: Some("surface_observation".to_string()),
+                parameter: Some("wave_height".to_string()),
+                ..WeatherObjectQuery::default()
+            },
+            None,
+            None,
+            None,
+            Some(&observations),
+            None,
+            None,
+        );
+        assert_eq!(impossible["matched_object_count"], 0);
+
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn weather_object_index_lists_evidence_and_static_plot_artifacts() {
+        let evidence_root = temp_test_root("weather_objects_evidence");
+        let bundle_dir = evidence_root.join("bundles");
+        fs::create_dir_all(&bundle_dir).expect("create bundle dir");
+        fs::write(
+            bundle_dir.join("case-001.json"),
+            serde_json::to_vec_pretty(&json!({
+                "schema": "rustwx-runner.evidence.bundle.v1",
+                "id": "case-001",
+                "claim": "Dryline initiation evidence packet",
+                "conclusion": "mixed",
+                "source": "unit-test",
+                "updated_at": "2026-05-11T00:00:00Z",
+                "artifacts": []
+            }))
+            .expect("serialize bundle"),
+        )
+        .expect("write bundle");
+        let evidence = EvidenceBundleLane::open(&evidence_root).expect("open evidence lane");
+
+        let static_root = temp_test_root("weather_objects_static");
+        let output_root = static_root.join("plots");
+        fs::create_dir_all(&output_root).expect("create plot output root");
+        fs::write(output_root.join("theta_e.png"), b"png").expect("write artifact");
+        fs::write(
+            static_root.join("hrrr_run_manifest.json"),
+            serde_json::to_vec_pretty(&json!({
+                "run_kind": "hrrr_non_ecape_hour",
+                "run_label": "hrrr_20260511_00z_f001_conus",
+                "output_root": output_root,
+                "model": "hrrr",
+                "date_yyyymmdd": "20260511",
+                "cycle_utc": 0,
+                "forecast_hour": 1,
+                "source": "nomads",
+                "domain_slug": "conus",
+                "state": "complete",
+                "artifacts": [{
+                    "artifact_key": "theta_e",
+                    "relative_path": "theta_e.png",
+                    "state": "complete",
+                    "input_fetch_keys": ["hrrr.t00z.wrfsfcf01"]
+                }]
+            }))
+            .expect("serialize static manifest"),
+        )
+        .expect("write static manifest");
+        let static_plots = StaticPlotLane::open(&static_root).expect("open static lane");
+
+        let index = weather_objects_index(
+            &WeatherObjectQuery {
+                limit: Some(10),
+                ..WeatherObjectQuery::default()
+            },
+            None,
+            Some(&static_plots),
+            Some(&evidence),
+            None,
+            None,
+            None,
+        );
+        let objects = index["objects"].as_array().expect("objects array");
+        assert_eq!(index["matched_object_count"], 2);
+        assert!(objects.iter().any(|object| {
+            object["kind"] == "evidence_bundle"
+                && object["id"] == "evidence_bundle:case-001"
+                && object["source"] == "unit-test"
+        }));
+        assert!(objects.iter().any(|object| {
+            object["kind"] == "static_plot_artifact"
+                && object["model"] == "hrrr"
+                && object["product"] == "theta_e"
+                && object["exists"] == true
+        }));
+
+        let hrrr_static = weather_objects_index(
+            &WeatherObjectQuery {
+                kind: Some("static_plot_artifact".to_string()),
+                model: Some("hrrr".to_string()),
+                q: Some("theta".to_string()),
+                ..WeatherObjectQuery::default()
+            },
+            None,
+            Some(&static_plots),
+            Some(&evidence),
+            None,
+            None,
+            None,
+        );
+        assert_eq!(hrrr_static["matched_object_count"], 1);
+        assert_eq!(hrrr_static["objects"][0]["product"], "theta_e");
+
+        fs::remove_dir_all(evidence_root).ok();
+        fs::remove_dir_all(static_root).ok();
+    }
+
+    #[test]
+    fn weather_object_index_filters_model_grid_hour_metadata() {
+        let root = temp_test_root("weather_objects_spatial_grid_facets");
+        let data_dir = root
+            .join("hrrr")
+            .join("20260430_23z")
+            .join("members")
+            .join("001")
+            .join("temperature_2m.zarr")
+            .join("data");
+        fs::create_dir_all(&data_dir).expect("create spatial zarr fixture");
+        fs::write(data_dir.join(".zarray"), br#"{"zarr_format":2}"#).expect("write zarray");
+        fs::write(data_dir.join("0.0.0"), b"").expect("write f000 chunk marker");
+        fs::write(data_dir.join("1.0.0"), b"").expect("write f001 chunk marker");
+        let spatial = SpatialLane::open(&root).expect("open spatial lane");
+
+        let index = weather_objects_index(
+            &WeatherObjectQuery {
+                kind: Some("model_grid_field".to_string()),
+                product: Some("temperature_2m".to_string()),
+                member: Some("001".to_string()),
+                forecast_hour: Some(1),
+                valid_time: Some("2026-05-01T00:00:00Z".to_string()),
+                ..WeatherObjectQuery::default()
+            },
+            Some(&spatial),
+            None,
+            None,
+            None,
+            None,
+            None,
+        );
+
+        assert_eq!(index["matched_object_count"], 1);
+        assert_eq!(index["objects"][0]["product"], "temperature_2m");
+        assert_eq!(index["objects"][0]["member"], "001");
+        assert_eq!(index["objects"][0]["forecast_hour"], 1);
+        assert_eq!(index["objects"][0]["valid_time"], "2026-05-01T00:00:00Z");
+
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn weather_object_index_filters_static_artifact_deep_facets() {
+        let root = temp_test_root("weather_objects_static_deep_facets");
+        let output_root = root.join("plots");
+        fs::create_dir_all(&output_root).expect("create plot output root");
+        fs::write(output_root.join("theta_e.png"), b"png").expect("write artifact");
+        fs::write(
+            root.join("hrrr_run_manifest.json"),
+            serde_json::to_vec_pretty(&json!({
+                "run_kind": "hrrr_non_ecape_hour",
+                "run_label": "hrrr_20260511_00z_f003_conus",
+                "output_root": output_root,
+                "model": "hrrr",
+                "date_yyyymmdd": "20260511",
+                "cycle_utc": 0,
+                "forecast_hour": 3,
+                "domain_slug": "conus",
+                "ensemble_stat": "p90",
+                "state": "complete",
+                "artifacts": [{
+                    "artifact_key": "theta_e",
+                    "relative_path": "theta_e.png",
+                    "state": "complete",
+                    "content_identity": {
+                        "threshold": 0.75
+                    }
+                }]
+            }))
+            .expect("serialize static manifest"),
+        )
+        .expect("write static manifest");
+        let static_plots = StaticPlotLane::open(&root).expect("open static lane");
+
+        let index = weather_objects_index(
+            &WeatherObjectQuery {
+                kind: Some("static_plot_artifact".to_string()),
+                product: Some("theta_e".to_string()),
+                forecast_hour: Some(3),
+                valid_time: Some("2026-05-11T03:00:00Z".to_string()),
+                threshold: Some("0.75".to_string()),
+                ensemble_stat: Some("p90".to_string()),
+                ..WeatherObjectQuery::default()
+            },
+            None,
+            Some(&static_plots),
+            None,
+            None,
+            None,
+            None,
+        );
+
+        assert_eq!(index["matched_object_count"], 1);
+        assert_eq!(index["objects"][0]["product"], "theta_e");
+        assert_eq!(index["objects"][0]["forecast_hour"], 3);
+        assert_eq!(index["objects"][0]["valid_time"], "2026-05-11T03:00:00Z");
+        assert_eq!(index["objects"][0]["threshold"], 0.75);
+        assert_eq!(index["objects"][0]["ensemble_statistic"], "p90");
+        assert_eq!(index["query"]["ensemble_statistic"], "p90");
+
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn weather_object_index_filters_satellite_frames_and_radar_tilts() {
+        let satellite_root = temp_test_root("weather_objects_satellite_frames");
+        let satellite_layer_id = "goes_east_conus_ch13";
+        let satellite_layer_root = satellite_root.join(satellite_layer_id);
+        fs::create_dir_all(&satellite_layer_root).expect("create satellite layer");
+        fs::write(
+            satellite_layer_root.join("frames.json"),
+            serde_json::to_vec_pretty(&json!({
+                "frames": [{
+                    "id": "20260511T010000Z",
+                    "product": "ch13",
+                    "source": "goes-east",
+                    "scan_time_utc": "2026-05-11T01:00:00Z",
+                    "url_template": "goes_east_conus_ch13/frames/20260511T010000Z/{z}/{x}/{y}.png"
+                }]
+            }))
+            .expect("serialize satellite frames"),
+        )
+        .expect("write satellite frames");
+        let satellite_tiles =
+            SatelliteTileLane::open(&satellite_root).expect("open satellite lane");
+
+        let radar_root = temp_test_root("weather_objects_radar_tilts");
+        let radar_layer_id = "nexrad_level2_ktlx_ref";
+        let radar_layer_root = radar_root.join(radar_layer_id);
+        fs::create_dir_all(&radar_layer_root).expect("create radar layer");
+        fs::write(
+            radar_layer_root.join("frames.json"),
+            serde_json::to_vec_pretty(&json!({
+                "frames": [{
+                    "id": "20260511T010000Z",
+                    "product": "ref",
+                    "source_key_or_url": "s3://noaa-nexrad-level2/2026/05/11/KTLX/KTLX20260511_010000_V06",
+                    "scan_time_utc": "2026-05-11T01:00:00Z",
+                    "url_template": "nexrad_level2_ktlx_ref/frames/20260511T010000Z/{z}/{x}/{y}.png",
+                    "tilts": [{
+                        "id": "sweep00_el0p44",
+                        "elevation_deg": 0.44,
+                        "url_template": "nexrad_level2_ktlx_ref/frames/20260511T010000Z/sweep00_el0p44/{z}/{x}/{y}.png"
+                    }]
+                }]
+            }))
+            .expect("serialize radar frames"),
+        )
+        .expect("write radar frames");
+        let radar_tiles = RadarTileLane::open(&radar_root).expect("open radar lane");
+
+        let satellite_index = weather_objects_index(
+            &WeatherObjectQuery {
+                kind: Some("satellite_frame".to_string()),
+                product: Some("ch13".to_string()),
+                frame: Some("20260511T010000Z".to_string()),
+                valid_time: Some("2026-05-11T01:00:00Z".to_string()),
+                ..WeatherObjectQuery::default()
+            },
+            None,
+            None,
+            None,
+            None,
+            Some(&satellite_tiles),
+            None,
+        );
+        assert_eq!(satellite_index["matched_object_count"], 1);
+        assert_eq!(satellite_index["objects"][0]["frame"], "20260511T010000Z");
+
+        let radar_index = weather_objects_index(
+            &WeatherObjectQuery {
+                kind: Some("radar_tilt".to_string()),
+                product: Some("ref".to_string()),
+                frame: Some("20260511T010000Z".to_string()),
+                tilt: Some("sweep00_el0p44".to_string()),
+                valid_time: Some("2026-05-11T01:00:00Z".to_string()),
+                ..WeatherObjectQuery::default()
+            },
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some(&radar_tiles),
+        );
+        assert_eq!(radar_index["matched_object_count"], 1);
+        assert_eq!(radar_index["objects"][0]["tilt"], "sweep00_el0p44");
+        assert_eq!(radar_index["objects"][0]["product"], "ref");
+
+        fs::remove_dir_all(satellite_root).ok();
+        fs::remove_dir_all(radar_root).ok();
+    }
+
+    #[test]
+    fn inspect_args_profile_store_is_optional_for_non_profile_lanes() {
+        use clap::CommandFactory;
+        InspectArgs::command().debug_assert();
     }
 
     fn static_plot_test_manifest(run_label: &str) -> StaticPlotRunManifest {
