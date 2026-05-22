@@ -1,26 +1,34 @@
-# WxStore Benchmark Report
+# WxStore Benchmark Notes
 
-Date: 2026-04-29 local
+Date: 2026-04-29 local proof run
 
-## Built Service
+These numbers came from a local Windows workstation running a release build on
+`127.0.0.1:8897`. They are useful for regression comparison, but they are not a
+hosted-service SLO.
 
-`C:\Users\drew\wxstore` is a clean Rust service for the private WxStore direction:
+## Service Shape
 
-- no Open-Meteo file dependency;
-- no Open-Meteo code dependency;
-- no service dependency on a CLI crate;
-- run/lane/field manifests;
-- canonical immutable gridpoint endpoints;
-- Open-Meteo-shaped point forecast output for surface/spatial fields;
-- compact JSON temporal sounding output;
-- custom binary point payloads;
-- native WXA dense2d spatial product materialization and serving;
-- full-grid binary map-source extraction;
-- read-only multi-model Zarr spatial source adapter for data not yet materialized to WXA;
-- mmap/zstd reader for the custom point-temporal pressure-profile lane;
-- precomputed diagnostic lane integration.
+The benchmarked build served:
 
-## Loaded Data
+- native WXA dense2d spatial products;
+- read-only Zarr-v2 spatial source fallback where WXA was not materialized;
+- HRRR point-temporal `.wxp` pressure-profile stores;
+- precomputed diagnostic stores;
+- Mapbox-compatible raster tile endpoints;
+- point forecast, sample, grid, and temporal sounding APIs.
+
+Example local command shape:
+
+```powershell
+.\target\release\wxstore.exe serve `
+  --profile-store C:\path\to\hrrr_profile_store `
+  --diagnostic-store C:\path\to\diagnostic_store `
+  --spatial-root C:\path\to\wxstore\data\spatial `
+  --host 127.0.0.1 `
+  --port 8897
+```
+
+## Loaded Proof Data
 
 Temporal sounding lane:
 
@@ -44,22 +52,13 @@ ecmwf_ifs:  20260411_12z, local sparse leads f000/f003
 ecmwf_ens:  20260412_00z, member 001, local sparse lead f003
 ```
 
-Native WXA product files were materialized from those local lanes for currently available dependencies. The ECMWF local files are sparse because that is what is present on disk. The API advertises available hours through `/v1/variables`.
-
-## Service Command
-
-```powershell
-C:\Users\drew\wxstore\target\release\wxstore.exe serve `
-  --profile-store C:\Users\drew\orwx-wx-profile-nvme\hrrr_20260429_06z_f000_f048_core_chunk8 `
-  --diagnostic-store C:\Users\drew\rustwx\proof\aether_temporal_profile_mvp\diagnostic_conus_20260429_06z_f000_f048 `
-  --spatial-root C:\Users\drew\open-rust-wx\data\spatial `
-  --host 127.0.0.1 `
-  --port 8897
-```
+Native WXA product files were materialized from the local lanes available during
+the proof run. Sparse ECMWF coverage reflects local disk availability, not an
+API limitation.
 
 ## Smoke Tests
 
-All returned 200:
+Representative routes returned 200:
 
 ```text
 /v1/status
@@ -69,27 +68,11 @@ All returned 200:
 /v1/grid?model=hrrr&run=20260405_18z&variable=temperature_2m&forecast_hour=0&format=bin
 /v1/mapbox/layers/hrrr/20260405_18z/vpd_2m?hours=0-2&palette=magma&range=0,5
 /v1/mapbox/tiles/hrrr/20260405_18z/vpd_2m/f000/4/3/6.png?palette=magma&range=0,5
-/v1/mapbox/tiles/hrrr/hrrr_20260429_060000/500mb_temperature/f000/4/3/6.png?palette=temperature&range=-40,20
 /v1/point.bin?lat=35.22&lon=-97.44&hours=0-48&diagnostics=basic
 /v1/temporal-sounding?lat=35.22&lon=-97.44&hours=0-2&diagnostics=basic
 ```
 
-Surface forecast sample after unit normalization:
-
-```text
-HRRR / Oklahoma point / f000-f002:
-temperature_2m = 14.55, 15.39, 16.02 degC
-dew_point_2m   = 1.50, 1.11, 1.17 degC
-wind_gusts_10m = 8.95, 8.86, 8.67 m/s
-```
-
 ## Sequential HTTP Benchmarks
-
-Tool:
-
-```text
-C:\Users\drew\open-rust-wx\target\release\raw-http-bench.exe
-```
 
 Point forecast products:
 
@@ -119,7 +102,10 @@ Full-grid binary map-source products:
 | GFS WXA VPD grid `f000` | 300 | 16 | 0 | 1,046.4 | 14.76 ms | 21.47 ms | 23.76 ms | 3.96 MB |
 | HRRR WXA 24h max temp grid `f000` | 300 | 16 | 0 | 528.2 | 29.01 ms | 41.57 ms | 47.19 ms | 7.27 MB |
 
-## WXA Materialization Timing And Storage
+`latest-benchmark-results.json` is the machine-readable output from the latest
+run kept in this repository.
+
+## WXA Materialization
 
 | Model | Run | Member | Products | Hours | Product-hour grids | Time |
 | --- | --- | --- | --- | --- | ---: | ---: |
@@ -141,40 +127,23 @@ ECMWF IFS: 2.8 MiB
 ECMWF ENS: 1.4 MiB
 ```
 
-## Profile Lane Build Matrix
+## Storage Math
 
-All stores were built from the same HRRR `f000-f048` pressure-profile source.
-
-| Store | Chunk shape | Bytes | GiB | Build time | Random 48h binary req/s |
-| --- | --- | ---: | ---: | ---: | ---: |
-| `chunk50` | `y=1,x=50,levels=40,hours=49` | 16,734,724,023 | 15.59 | 253.2 s | 5,202.0 |
-| `chunk16` | `y=1,x=16,levels=40,hours=49` | 17,211,717,508 | 16.03 | 126.2 s | 7,188.9 |
-| `chunk8` | `y=1,x=8,levels=40,hours=49` | 17,981,715,436 | 16.75 | 111.2 s | 10,925.0 to 12,148.9 |
-
-`chunk8` remains the local winner for arbitrary point temporal soundings.
-
-## Interpretation
-
-The service now proves the combined product surface:
+HRRR CONUS:
 
 ```text
-surface point forecasts:
-  model/run/variable/hour -> nearest gridpoint -> Open-Meteo-shaped hourly JSON
-
-temporal soundings:
-  HRRR gridpoint -> all hours -> all pressure levels -> compact JSON or binary
-
-map/grid source:
-  model/run/variable/hour -> full f32 grid as binary
-
-Mapbox layers:
-  model/run/variable/frame/z/x/y -> transparent PNG raster tile
+grid cells: 1799 * 1059 = 1,905,141
+one raw f32 grid: 7.27 MiB
+49 forecast hours, one field raw f32: 356 MiB
+75 fields, 49h raw f32: ~26.1 GiB
+75 fields, 49h raw i16: ~13.0 GiB before compression
 ```
 
-The major product result is that surface forecast calls across the available local model families are all around `19k req/s` on this workstation after the spatial arrays are warm, and HRRR 48h binary temporal soundings are above `10k req/s` with the current diagnostic lane attached.
+This is only for scalar 2D map/grid fields. Temporal profile lanes are separate:
 
-`latest-benchmark-results.json` is the machine-readable output from the latest run.
-
-## Current Blocker For Complete Rustwx Product Coverage
-
-WxStore can now serve WXA spatial grids, temporal profile-derived pressure grids, and Mapbox raster layers. The remaining blocker for "all rustwx products except ECAPE" is upstream export plumbing: rustwx has internal `Field2D` producers for direct, derived, and windowed HRRR products, but the current public CLIs render PNG/report artifacts rather than exporting every product as raw f32 grids with manifests. A rustwx-side grid export builder is required to materialize the full catalog into WXA without reimplementing meteorology inside WxStore.
+```text
+current HRRR 5-var profile core .wxp: 16.75 GiB
+HRRR source VolumeStore has 11 pressure vars available
+all-11 pressure profile .wxp estimate: ~35-40 GiB
+native flat intermediate estimate: ~150 GiB, so it should not be retained
+```

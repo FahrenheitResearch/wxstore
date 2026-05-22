@@ -12868,7 +12868,7 @@ async fn products(State(state): State<Arc<AppState>>) -> Json<Value> {
         },
         "rustwx_hrrr_inventory": local_inventory.unwrap_or_else(|| json!({
             "status": "not_generated",
-            "command": "cargo run --release -p rustwx-cli --bin hrrr_capability_inventory -- --date 20260429 --forecast-hour 0 --out-dir C:\\\\Users\\\\drew\\\\wxstore\\\\rustwx-inventory"
+            "command": "cargo run --release -p rustwx-cli --bin hrrr_capability_inventory -- --date 20260429 --forecast-hour 0 --out-dir rustwx-inventory"
         }))
     }))
 }

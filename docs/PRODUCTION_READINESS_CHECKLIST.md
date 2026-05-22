@@ -5,12 +5,15 @@ Use this checklist before promoting a WxStore build or data refresh.
 ## Build And Configuration
 
 - Release binary is built from the intended commit: `cargo build --release`.
-- Runtime command is recorded with exact `--profile-store`, `--diagnostic-store`,
-  `--spatial-root`, `--host`, and `--port` values.
+- Runtime command is recorded with exact lane roots, `--host`, and `--port`
+  values.
 - Data roots are read-only for the serving process except for intentional cache
   or generated-output directories.
 - Local validation targets `127.0.0.1` or another explicitly local bind address.
-- No validation command points at Hetzner or any remote production host.
+- Public or shared deployments sit behind a trusted reverse proxy with
+  authentication, authorization, rate limiting, TLS, logging, and monitoring.
+- Public documentation reflects the exact model/run/product coverage being
+  served.
 
 ## Data Coverage
 
@@ -23,6 +26,8 @@ Use this checklist before promoting a WxStore build or data refresh.
   limited forecast hours.
 - WXA files include grid metadata sufficient for sample, forecast, tile, and
   wind-field endpoints.
+- Optional lanes return clear unavailable/not-configured responses when their
+  backing roots are absent.
 
 ## API Smoke
 
@@ -62,5 +67,5 @@ Use this checklist before promoting a WxStore build or data refresh.
 - Restart procedure is documented and tested locally.
 - Rollback artifact and previous data roots remain available until the new build
   is accepted.
-- Public documentation reflects the exact model/run/product coverage being
-  served.
+- Secrets, generated data, local proof artifacts, and environment files are not
+  committed to git.
