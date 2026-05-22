@@ -17329,20 +17329,74 @@ fn wxa_grid_metadata_compatible(existing: &Value, incoming: &Value) -> bool {
     }
 
     if existing_type == Some("curvilinear_latlon_sampled") {
-        return [
-            "type",
-            "nx",
-            "ny",
-            "bounds",
-            "corners",
-            "monotonic",
-            "sample_strategy",
-        ]
-        .iter()
-        .all(|key| existing.get(*key) == incoming.get(*key));
+        return sampled_curvilinear_grid_metadata_compatible(existing, incoming);
     }
 
     false
+}
+
+fn sampled_curvilinear_grid_metadata_compatible(existing: &Value, incoming: &Value) -> bool {
+    ["type", "sample_strategy", "monotonic"]
+        .iter()
+        .all(|key| existing.get(*key) == incoming.get(*key))
+        && ["nx", "ny"].iter().all(|key| {
+            existing.get(*key).and_then(Value::as_u64)
+                == incoming.get(*key).and_then(Value::as_u64)
+        })
+        && json_f64_array_close(existing.get("bounds"), incoming.get("bounds"), 1.0e-6)
+        && sampled_curvilinear_corners_close(
+            existing.get("corners"),
+            incoming.get("corners"),
+            2.0e-2,
+        )
+}
+
+fn json_f64_array_close(existing: Option<&Value>, incoming: Option<&Value>, tolerance: f64) -> bool {
+    let (Some(existing), Some(incoming)) = (existing, incoming) else {
+        return existing == incoming;
+    };
+    let (Some(existing), Some(incoming)) = (existing.as_array(), incoming.as_array()) else {
+        return false;
+    };
+    existing.len() == incoming.len()
+        && existing.iter().zip(incoming).all(|(existing, incoming)| {
+            match (existing.as_f64(), incoming.as_f64()) {
+                (Some(existing), Some(incoming)) => {
+                    (existing - incoming).abs() <= tolerance
+                }
+                _ => existing == incoming,
+            }
+        })
+}
+
+fn sampled_curvilinear_corners_close(
+    existing: Option<&Value>,
+    incoming: Option<&Value>,
+    tolerance: f64,
+) -> bool {
+    let (Some(existing), Some(incoming)) = (existing, incoming) else {
+        return existing == incoming;
+    };
+    ["top_left", "top_right", "bottom_left", "bottom_right"]
+        .iter()
+        .all(|corner| {
+            let (Some(existing), Some(incoming)) = (existing.get(*corner), incoming.get(*corner))
+            else {
+                return existing.get(*corner) == incoming.get(*corner);
+            };
+            ["x", "y"].iter().all(|key| existing.get(*key) == incoming.get(*key))
+                && ["lat", "lon"].iter().all(|key| {
+                    match (
+                        existing.get(*key).and_then(Value::as_f64),
+                        incoming.get(*key).and_then(Value::as_f64),
+                    ) {
+                        (Some(existing), Some(incoming)) => {
+                            (existing - incoming).abs() <= tolerance
+                        }
+                        _ => existing.get(*key) == incoming.get(*key),
+                    }
+                })
+        })
 }
 
 impl SpatialLane {
@@ -21241,6 +21295,45 @@ mod tests {
             bytes.extend_from_slice(&value.to_le_bytes());
         }
         fs::write(path, bytes).expect("write f32 values");
+    }
+
+    #[test]
+    fn sampled_curvilinear_wxa_metadata_allows_control_mesh_drift() {
+        let existing = json!({
+            "type": "curvilinear_latlon_sampled",
+            "nx": 1799,
+            "ny": 1059,
+            "bounds": [-134.09547424316406, 21.13812255859375, -60.91719436645508, 52.61565399169922],
+            "corners": {
+                "top_left": {"lat": 47.838623046875, "lon": -134.09547424316406, "x": 0, "y": 0},
+                "top_right": {"lat": 47.842193603515625, "lon": -60.91719436645508, "x": 1798, "y": 0},
+                "bottom_left": {"lat": 21.13812255859375, "lon": -122.7195281982422, "x": 0, "y": 1058},
+                "bottom_right": {"lat": 21.140546798706055, "lon": -72.28971862792969, "x": 1798, "y": 1058}
+            },
+            "monotonic": {
+                "top_lon_x": "increasing",
+                "bottom_lon_x": "increasing",
+                "left_lat_y": "decreasing",
+                "right_lat_y": "decreasing"
+            },
+            "sample_strategy": "sampled_control_mesh_nearest",
+            "sample": {"nx": 2, "ny": 2, "x": [0, 1798], "y": [0, 1058], "lat": [1.0, 2.0, 3.0, 4.0], "lon": [1.0, 2.0, 3.0, 4.0]}
+        });
+        let mut incoming = existing.clone();
+        incoming["corners"]["top_left"]["lat"] = json!(47.8387000000000);
+        incoming["sample"] = json!({
+            "nx": 3,
+            "ny": 3,
+            "x": [0, 899, 1798],
+            "y": [0, 529, 1058],
+            "lat": [1.0, 1.5, 2.0, 2.5, 3.0, 3.5, 4.0, 4.5, 5.0],
+            "lon": [1.0, 1.5, 2.0, 2.5, 3.0, 3.5, 4.0, 4.5, 5.0]
+        });
+
+        assert!(wxa_grid_metadata_compatible(&existing, &incoming));
+
+        incoming["corners"]["top_left"]["lat"] = json!(48.5);
+        assert!(!wxa_grid_metadata_compatible(&existing, &incoming));
     }
 
     #[test]
